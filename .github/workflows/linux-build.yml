@@ -1,0 +1,61 @@
+name: Linux Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux-build:
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:26.04
+
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      PIP_CACHE_DIR: ${{ github.workspace }}/.cache/pip
+      BUILD_JOBS: "2"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: .cache/pip
+          key: pip-${{ runner.os }}-${{ github.ref_name }}
+          restore-keys: |
+            pip-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends software-properties-common
+          add-apt-repository -y universe
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            cmake \
+            pkg-config \
+            python3 \
+            python3-venv \
+            libsdl3-dev \
+            libxtst-dev
+
+      - name: Set up Python environment
+        run: |
+          python3 -m venv .venv
+          .venv/bin/python -m pip install ziglang
+
+      - name: Check SDL3 version
+        run: pkg-config --modversion sdl3
+
+      - name: Build project
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel "$BUILD_JOBS"
+
+      - name: Build UI
+        run: .venv/bin/python ui/build_ui.py --jobs "$BUILD_JOBS"
