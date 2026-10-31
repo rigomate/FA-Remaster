@@ -2418,7 +2418,11 @@ Unit* CommandSourceUnit(Sim& sim, Unit* U) {
         ++n;
         total += c->count;
       }
-    if ((u == U && n > 0) || n > 1 || total > 1) return u;
+    // (0x611d1d..0x611d3d: U itself with a factory order; two orders; ONE order on a unit that repeats its queue
+    // (u+0x2a2); or a count above 1. Seen: MP1 16924, army 6's naval factory 0x60012b, done at 16917, assists
+    // 0x600129, which repeats its single frigate order (count 1): the original takes 0x600129 as the source and
+    // starts a frigate of its own at its guard's next turn; ours went past it to U and found nothing to build.)
+    if ((u == U && n > 0) || n > 1 || (n > 0 && u->repeatQueue) || total > 1) return u;
     visited.insert(u);
     u = FindUnit(sim, u->guardedId);
   }
