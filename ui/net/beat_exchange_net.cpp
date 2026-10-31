@@ -2,6 +2,7 @@
 #include "net/beat_exchange_net.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 
 #include "core/log.h"
@@ -77,11 +78,19 @@ void NetBeatExchange::SendLocal(uint32_t beat, const std::string& bytes) {
   Message m;
   while (split.Next(&m)) out.push_back(m);
   out.push_back(AdvanceMessage(1));
+  const bool alone = splitTo_ != 0xff && !bytes.empty();  // (SplitForTests)
   for (const Client& c : clients_)
-    for (const Message& msg : out) SendTo(c, msg);
+    if (!alone || c.who.client == splitTo_)
+      for (const Message& msg : out) SendTo(c, msg);
   localBeats_[beat] = bytes;
   sentBeats_ = beat;
   Local().available = beat;
+  if (alone) {
+    Pump();  // (what was written goes out, then nothing more)
+    frozen_ = true;
+    Logf(LogLevel::Info, "net: our beat %u went to client %d alone; this program is frozen (a test's switch)", beat, splitTo_);
+    return;
+  }
   Broadcast(MessageWriter().U8(local_).I32(static_cast<int32_t>(beat)).Done(kAck));
   Pump();  // (Poll also sends what was written: the UDP connector's Push)
 }
@@ -221,9 +230,11 @@ void NetBeatExchange::Process(Client& from, const Message& m) {
       }
       return;
     }
-    case kMaxSimRate:  // (0x53c2b2)
-      from.maxSP = r.I32();
+    case kMaxSimRate: {  // (0x53c2b2)
+      const int32_t value = r.I32();
+      if (r.Ok()) from.maxSP = value;
       return;
+    }
     case kDesyncParts:  // (ours)
       if (!from.local) desyncParts_.emplace_back(from.who.client, m.payload);
       return;
@@ -242,15 +253,24 @@ uint32_t NetBeatExchange::LastBeatOf(const Client& c) const {
 
 // IsReadyForBeat 0x53c3e0: client `c` has acknowledged every client's part of `beat` (a client left out is not
 // waited for; an ejected client only up to its last beat). A client that is out or ejected is ready for anything.
-// The original skips an ejected client from its last beat on (beat >= last, 0x53c44a); ours from the beat after it
-// (beat > last), so that its last beat too is held until everyone has it. INFERRED: the original's way lets a client
-// run that last beat with the ejected client's orders while another, who never got them, leaves it out (a desync
-// that can only happen with three or more clients); ours waits for the slower one's vote instead.
+// The original skips an ejected client from its last beat on (0x53c43f..0x53c44c: beat - GetMostExpiredEjectRequest
+// >= 0); ours from the beat after it (beat > last), so that its last beat too is held until everyone still in has it.
+// Why (read again for net6, and shown by ui/tests/net_game_*.lua's NET_GAME_SPLIT): with three clients A, B and X,
+// X stops after sending its beat n to A alone. A ejects X: last = n here (its beats in here, 0x53cc2a). The original's
+// A then runs beat n with X's orders without waiting for B's ACK of them; B, which has X's beats up to n - 1, votes
+// later with n - 1 and runs beat n without them: the two copies differ from beat n on (both run on: the checksum
+// finds it 50 beats later). Ours holds A at beat n until B's ACK of it, or B's vote, which brings A's last down to
+// n - 1: both leave X out from beat n. With two clients the case cannot arise (no third to be short of a beat).
+// MOHO64UI_NET_EJECT_RULE=original (a test's switch, read once) takes the original's rule, to show the desync.
 bool NetBeatExchange::ReadyForBeat(const Client& c, uint32_t beat) const {
+  static const bool originalRule = [] {
+    const char* v = std::getenv("MOHO64UI_NET_EJECT_RULE");
+    return v && std::strcmp(v, "original") == 0;
+  }();
   if (c.done || c.ejected) return true;
   for (const Client& of : clients_) {
     if (of.done) continue;
-    if (of.ejected && beat > LastBeatOf(of)) continue;
+    if (of.ejected && (originalRule ? beat >= LastBeatOf(of) : beat > LastBeatOf(of))) continue;
     auto it = c.acks.find(of.who.client);
     if (it == c.acks.end() || it->second < beat) return false;
   }
@@ -399,6 +419,19 @@ int NetBeatExchange::Rate() {
   return rate_;
 }
 
+int NetBeatExchange::RunRate() {
+  std::lock_guard<std::mutex> g(mu_);
+  int rate = rate_;
+  for (const Client& c : clients_)
+    if (!c.ejected && c.maxSP < rate) rate = c.maxSP;
+  return rate;
+}
+
+void NetBeatExchange::SendMaxSimRate(int value) {
+  std::lock_guard<std::mutex> g(mu_);
+  Broadcast(MessageWriter().I32(value).Done(kMaxSimRate));
+}
+
 std::vector<std::pair<uint8_t, int>> NetBeatExchange::TakeRateNotes() {
   std::lock_guard<std::mutex> g(mu_);
   std::vector<std::pair<uint8_t, int>> out;
@@ -468,6 +501,11 @@ void NetBeatExchange::Service() {
 void NetBeatExchange::FreezeForTests() {
   std::lock_guard<std::mutex> g(mu_);
   frozen_ = true;
+}
+
+void NetBeatExchange::SplitForTests(uint8_t client) {
+  std::lock_guard<std::mutex> g(mu_);
+  splitTo_ = client;
 }
 
 }  // namespace moho::net

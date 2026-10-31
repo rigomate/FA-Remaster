@@ -6,6 +6,12 @@
 -- 300 and quits after beat 310. Variants (net_game_host.lua's header):
 -- NET_GAME_EJECT: it stops answering after beat 150 (moho64ui_NetTestForTests("freeze")); NET_GAME_LOADING: before it
 -- is ready. Both then wait a while and quit. NET_GAME_RUN_TO: it runs on to that beat after its orders and quits.
+-- NET_GAME_MAXSP: from beat 120 it reports a maxSP of -3 (message 57), from beat 230 its own measure again.
+-- NET_GAME_THIRD (three programs): this file is the joiner (client 2) and, with NET_GAME_JOINER = 2, the second
+-- joiner "Joiner2" (client 3): army 3 ("player") or an observer ("observer": no army; it looks through army 1 and
+-- tells its commander to walk, which no copy carries out: its command source commands no army). With NET_GAME_EJECT the
+-- second joiner stops answering after beat 150 (NET_GAME_SPLIT: its next beat with an order goes to the host alone,
+-- then it stops) and the joiner votes it out once the host has.
 --   moho64ui --init <init.lua> --prefs <a copy> --stage frontend --no-world --lua ui/tests/net_game_join.lua
 --            --game-lua ui/tests/net_game_join.lua --replay-out <dir>/r --frames 2000000000 --log join.log
 -- Every check logs "TEST ok ..." or "TEST FAIL ..."; the last line is "TEST done: <n> failed".
@@ -25,6 +31,11 @@ local function WaitFor(cond, seconds)  -- (the PC's clock: the other program run
 end
 local EJECT, LOADING = rawget(_G, "NET_GAME_EJECT"), rawget(_G, "NET_GAME_LOADING")
 local RUN_TO = rawget(_G, "NET_GAME_RUN_TO")
+local MAXSP, THIRD, SPLIT = rawget(_G, "NET_GAME_MAXSP"), rawget(_G, "NET_GAME_THIRD"), rawget(_G, "NET_GAME_SPLIT")
+local SECOND = rawget(_G, "NET_GAME_JOINER") == 2  -- (the third program: "Joiner2", client 3)
+local NAME, ME = SECOND and "Joiner2" or "Joiner", SECOND and 3 or 2
+local OBSERVER = SECOND and THIRD == "observer"
+local CLIENTS = THIRD and 3 or 2
 -- ours after the desync dialog: a console line naming the parts of the state that differ (GameSession::NetCompareParts),
 -- the same on both programs but for the other's name. NET_GAME_DESYNC (both programs alike) picks the joiner's desync:
 -- nil, its line's part a2 changed with its checksum of beat 250 (the state itself left as it is: the fingerprints stay
@@ -58,7 +69,7 @@ if not inGame then
     local LobbyComm = import("/lua/ui/lobby/lobbyComm.lua")
     local lobby, welcome, failedWhy, launched = nil, nil, nil, false
     local function NewLobby()
-        lobby = LobbyComm.CreateLobbyComm("TCP", 0, "Joiner", nil, nil)
+        lobby = LobbyComm.CreateLobbyComm("TCP", 0, NAME, nil, nil)
         lobby.ConnectionToHostEstablished = function(self, localId, localName, hostId) welcome = localId end
         lobby.ConnectionFailed = function(self, reason) failedWhy = reason end
         lobby.DataReceived = function(self, data)
@@ -80,7 +91,11 @@ if not inGame then
             WaitFor(function() return welcome ~= nil or failedWhy ~= nil end, 10)
             if not welcome then WaitFor(function() return false end, 0.5) end
         until welcome or moho64ui_WallSeconds() > deadline
-        check("the host welcomes us", welcome, "1")
+        if THIRD then  -- (uid 1 or 2: the order the joiners came in)
+            check("the host welcomes us", welcome == "1" or welcome == "2", true)
+        else
+            check("the host welcomes us", welcome, "1")
+        end
         if not welcome then
             LOG("TEST done: " .. failed .. " failed")
             ExitApplication()
@@ -129,7 +144,7 @@ local function Noted(list, entry)
     for _, l in list do if l == entry then return true end end
     return false
 end
-if not EJECT and not RUN_TO then
+if not EJECT and not RUN_TO and not MAXSP and not THIRD then
     if DESYNC == "unit" then moho64ui_NetTestForTests("move", 250, "1")
     elseif DESYNC == "draw" then moho64ui_NetTestForTests("draw", 230)
     else moho64ui_NetTestForTests("corrupt", 250, "a2") end
@@ -141,13 +156,102 @@ ForkThread(function()  -- (the host's pause, seen here)
     end
 end)
 
+local function Observe()
+    -- an observer: client 3 with a command source of its own (GetSessionClients' 3), which commands no army
+    -- (CLobby::LaunchGame 0x7c38c0: its source is made, 0x7c497d, and put in no army's set); its beats go to everyone as
+    -- a player's do (the others wait for them)
+    check("an observer: no army", GetFocusArmy(), -1)
+    check("the commander comes", WaitFor(function() return GameTick() >= 60 end, 60), true)
+    -- it looks through army 1 and tells its commander to walk: whatever goes out under its source, no copy's sim
+    -- carries it out (Sim::IssueCommand 0x749290: not a source of that army's, no cheats)
+    SetFocusArmy(1)
+    check("looking through army 1", WaitFor(function() return GetFocusArmy() == 1 end, 10), true)
+    local cdr = GetArmyAvatars() and GetArmyAvatars()[1]
+    check("army 1's commander", cdr ~= nil, true)
+    if cdr then
+        local view = import("/lua/ui/game/worldview.lua").viewLeft
+        local c = cdr:GetPosition()
+        local cam = GetCamera("WorldCamera")
+        local s = cam:SaveSettings()
+        s.Focus = c
+        s.Zoom = 120
+        cam:RestoreSettings(s)
+        WaitSeconds(1)
+        SelectUnits({cdr})
+        LOG("TEST note: the observer selected " .. table.getn(GetSelectedUnits() or {}) .. " at tick " .. GameTick())
+        local target = {c[1] + 30, c[2], c[3] - 30}
+        local d0 = VDist2(c[1], c[3], target[1], target[3])
+        local at = view:Project(target)
+        moho64ui_MouseMove(at.x, at.y)
+        WaitFrames(2)
+        moho64ui_MouseButton("Right", true, at.x, at.y)
+        moho64ui_MouseButton("Right", false, at.x, at.y)
+        local orderTick = GameTick()
+        WaitFor(function() return GameTick() >= orderTick + 80 end, 60)
+        local p = cdr:GetPosition()
+        local toward = false
+        for _, o in cdr:GetCommandQueue() or {} do
+            if o.position and VDist2(o.position[1], o.position[3], target[1], target[3]) < 5 then toward = true end
+        end
+        check("the commander was not given our order", toward, false)
+        check("nor came nearer to our point", VDist2(p[1], p[3], target[1], target[3]) >= d0 - 1, true)
+        SelectUnits({})
+    end
+    SetFocusArmy(-1)
+    check("back to every army", WaitFor(function() return GetFocusArmy() == -1 end, 10), true)
+    if EJECT then  -- (the players vote the quiet observer out)
+        WaitFor(function() return GameTick() >= 150 end, 60)
+        LOG("TEST note: the observer stops answering at tick " .. GameTick())
+        moho64ui_NetTestForTests("freeze")
+        WaitFor(function() return false end, 30)
+    else
+        check("beat " .. RUN_TO .. " comes", WaitFor(function() return GameTick() >= RUN_TO end, RUN_TO / 10 * 3 + 60), true)
+        check("no desync", table.getn(desyncs), 0)
+        LOG("TEST note: the observer's game ends at tick " .. GameTick())
+        WaitFor(function() return false end, 2)
+    end
+    LOG("TEST done: " .. failed .. " failed")
+    ExitApplication()
+end
+
+-- the joiner's vote on the second joiner, who has gone quiet (NET_GAME_THIRD with NET_GAME_EJECT, the host's header)
+local function VoteOutTheThird()
+    check("the second joiner goes quiet", WaitFor(function()
+        local cl = GetSessionClients()
+        return cl[3] ~= nil and cl[3].connected and cl[3].quiet > 5000
+    end, 60), true)
+    local stood = GameTick()
+    check("the host's vote reaches us", WaitFor(function() return table.getn(GetSessionClients()[3].ejectedBy) >= 1 end, 60), true)
+    local cl = GetSessionClients()
+    check("from the host (client 1)", cl[3] and cl[3].ejectedBy[1], 1)
+    check("still connected here: we have not ejected it", cl[3] and cl[3].connected, true)
+    WaitFor(function() return false end, 2)
+    check("our game waits for the second joiner until we vote", GameTick(), stood)
+    EjectSessionClient(3)
+    check("ejected: no longer connected here", WaitFor(function() return GetSessionClients()[3].connected == false end, 5), true)
+    cl = GetSessionClients()
+    check("ejected by the host (client 1)", cl[3] and cl[3].ejectedBy[1], 1)
+    check("and by us (client 2)", cl[3] and cl[3].ejectedBy[2], 2)
+    check("the game runs on without it", WaitFor(function() return GameTick() >= stood + 60 end, 60), true)
+    check("beat 265 comes", WaitFor(function() return GameTick() >= 265 end, 60), true)
+    check("no desync", table.getn(desyncs), 0)
+    LOG("TEST note: the second joiner stood at tick " .. stood .. "; the joiner's game ends at tick " .. GameTick())
+    LOG("TEST done: " .. failed .. " failed")
+    WaitFor(function() return false end, 2)
+    ExitApplication()
+end
+
 ForkThread(function()
     check("a network game", SessionIsMultiplayer(), true)
-    check("the joiner's army", GetFocusArmy(), 2)
     local clients = GetSessionClients()
-    check("two clients", table.getn(clients), 2)
-    check("the joiner is client 2", clients[2] and clients[2].name, "Joiner")
-    check("and the one here", clients[2] and clients[2]['local'], true)
+    check(CLIENTS .. " clients", table.getn(clients), CLIENTS)
+    check("we are client " .. ME, clients[ME] and clients[ME].name, NAME)
+    check("and the one here", clients[ME] and clients[ME]['local'], true)
+    if OBSERVER then
+        check("speaking for source 3", clients[3] and clients[3].authorizedCommandSources[1], 3)
+        return Observe()
+    end
+    check("the joiner's army", GetFocusArmy(), ME)
     check("the commander comes", WaitFor(function() return GameTick() >= 60 end, 60), true)
     local view = import("/lua/ui/game/worldview.lua").viewLeft
     local cdr = GetArmyAvatars()[1]
@@ -182,11 +286,56 @@ ForkThread(function()
         end
         return false
     end, 30), true)
+    if MAXSP then
+        -- from beat 120 we report -3: both games run at -3; from beat 230 our own measure again
+        WaitFor(function() return GameTick() >= 120 end, 60)
+        moho64ui_NetTestForTests("maxsp", 0, "-3")
+        check("our game runs at -3 too", WaitFor(function() return GetSimRate() == -3 end, 5), true)
+        check("our entry shows it", WaitFor(function() return GetSessionClients()[2].maxSP == -3 end, 5), true)
+        check("the speed asked for stays 0", GetGameSpeed(), 0)
+        local t0 = GameTick()
+        WaitFrames(600)
+        local beats = GameTick() - t0
+        LOG("TEST note: " .. beats .. " beats in 600 frames at -3")
+        check("held down: at most 65 beats in 600 frames", beats <= 65, true)
+        WaitFor(function() return GameTick() >= 230 end, 120)
+        moho64ui_NetTestForTests("maxsp", 0, "")
+        check("measured again: we run at the speed asked for", WaitFor(function() return GetSimRate() == 0 end, 30), true)
+        check("beat 300 comes", WaitFor(function() return GameTick() >= 300 end, 120), true)
+        LOG("TEST note: the joiner's game ends at tick " .. GameTick())
+        LOG("TEST done: " .. failed .. " failed")
+        WaitFor(function() return false end, 2)
+        ExitApplication()
+        return
+    end
     if RUN_TO then
         check("beat " .. RUN_TO .. " comes", WaitFor(function() return GameTick() >= RUN_TO end, RUN_TO / 10 * 3 + 60), true)
+        check("no desync", table.getn(desyncs), 0)
         LOG("TEST note: the joiner's game ends at tick " .. GameTick() .. "; ping to the other " .. tostring(GetSessionClients()[1].ping) .. " ms")
         LOG("TEST done: " .. failed .. " failed")
         WaitFor(function() return false end, 2)
+        ExitApplication()
+        return
+    end
+    if EJECT and THIRD and not SECOND then
+        return VoteOutTheThird()
+    end
+    if EJECT and SPLIT then
+        -- our next beat with an order goes to the host alone, then we stop: the order, a walk
+        WaitFor(function() return GameTick() >= 150 end, 60)
+        moho64ui_NetTestForTests("split", 0, "0")
+        SelectUnits({cdr})
+        local q = cdr:GetPosition()
+        local w = view:Project({q[1] + 15, q[2], q[3] + 15})
+        moho64ui_MouseMove(w.x, w.y)
+        WaitFrames(2)
+        moho64ui_MouseButton("Right", true, w.x, w.y)
+        moho64ui_MouseButton("Right", false, w.x, w.y)
+        LOG("TEST note: the second joiner's last order at tick " .. GameTick() .. "; its beat goes to the host alone")
+        local frozeAt = GameTick()
+        WaitFor(function() return false end, 30)
+        check("frozen, its own game stands too", GameTick() <= frozeAt + 8, true)
+        LOG("TEST done: " .. failed .. " failed")
         ExitApplication()
         return
     end

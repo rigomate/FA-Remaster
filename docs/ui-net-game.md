@@ -34,7 +34,7 @@ engine-ref `command_stream.md` 1.1).
 | 54 EJECT | u8 client, i32 n | HandleIncomingEjectRequest 0x53f440: that client's AddOrUpdateEjectRequest(sender, n) (one per requester, the smaller n) | ProcessEject 0x53f2c0 |
 | 55 CHAT | the message's bytes | the interface's ReceiveChat (CWldUiInterface 0x88b880 -> 0x83ebd0: gamemain.ReceiveChat(sender's name, message)) | slot 8, 0x53c9a0 |
 | 56 SPEED | i32 serial, i32 rate | where +0x454: ApplyIncomingGameSpeedRequest 0x53e810 | SetSimRate 0x53e590 |
-| 57 | i32 | sender's +0xd4 | BroadcastIntParam 0x53e850; FAF's sim driver sends its measured rate (0x129004e) |
+| 57 | i32 | sender's +0xd4 | BroadcastIntParam 0x53e850: the sim driver's measured rate, when it changed (0x129004e; "maxSP" below) |
 | 202 / 203 | (connection error / end) | the client's Eject (slot 10) at once, then the interface's NoteDisconnect ("<LOC Engine0002>%s disconnected.", 0x88b9d0) (0x53c2c3) | the connection |
 
 ## When a beat runs (DoBeat 0x53ea30)
@@ -59,8 +59,15 @@ beats up to it (GetAvailableBeat slot 21). So a beat runs only when everyone sti
   original then ejects them all at once (202/203), going on alone.
 - Ours does the same (Chris, 2026-10-30: "Just keep faf behaviour"): a connection that ends ejects its client at once
   and prints "<LOC Engine0002>%s disconnected."; a client gone quiet with its link up waits for the dialog's vote.
-- Ours differs in one thing: an ejected client's last beat itself waits for everyone's ACK (the original skips it:
-  INFERRED to be a one-beat window for a desync with three or more players).
+- Ours differs in one thing: an ejected client's last beat itself waits for everyone's ACK (the original skips it).
+  Read again for net6 (IsReadyForBeat 0x53c3e0: for an ejected client, `beat - GetMostExpiredEjectRequest >= 0`
+  skips its ACK check, 0x53c43f..0x53c44c; GetMostExpiredEjectRequest 0x53cc20 is the smaller of its beats in here,
+  +0xa0, and every request's beat). With three clients A, B and X, where X's last beat n reached A but not B: A ejects
+  X with n; the original's A runs beat n with X's orders at once (it does not wait for B's ACK of them); B, voting
+  later with n - 1, runs beat n without them, and both run on apart. Only a third client can be short of the beat, so
+  two players never meet it. Measured (NET_GAME_SPLIT, below): ours leaves X out from beat n on both, fingerprints
+  equal; the original's rule (`MOHO64UI_NET_EJECT_RULE=original`, a test's switch) splits them at that beat. So ours
+  stays; not the original's way.
 
 ## Readiness and the waiting dialog (WLD_Frame 0x88cae0)
 
@@ -75,8 +82,69 @@ lets the game start.
 
 SetGameSpeed (0x88e360) -> SetSimRate (slot 13): where +0x454, SPEED {serial + 1, rate} broadcast. Every client takes
 a request whose serial is newer, or equal from a lower client (0x53e810), and tells the interface
-(uimain.NoteGameSpeedChanged(client + 1, rate), 0x83d670). GetGameSpeed = the rate asked for (slot 15, +0x450); the
-rate run (slot 14, 0x53e720) is the smaller of it and every client's 57 value.
+(uimain.NoteGameSpeedChanged(client + 1, rate), 0x83d670). GetGameSpeed (0x88e260) = the rate asked for (slot 15,
++0x450); the rate run (slot 14, GetSimRate 0x53e720: WLD_GetSimRate 0x88d0b0 paces the beats with it, and the Lua
+GetSimRate 0x843920 returns it) is the smaller of it and the 57 value of every client not ejected here (slot 1,
+0x53c960), this one's own among them. Ours: GamePace's `asked` and `rate` (maui/world_source.h), from
+NetBeatExchange::Rate / RunRate each frame.
+
+## maxSP: message 57 (net6, 2026-10-31)
+
+A measure of each PC's speed, so that the game runs no faster than its slowest client can (READ in GPG's sim driver,
+0x73da03..0x73dab5, and FAF's copy of it, 0x128ff9f..0x1290051, the same code):
+
+- After each dispatch (0x73d8c0 -> FAF's 0x128fde0: the client manager's UpdateStates hands the beat's messages to the
+  sim, the Advance among them, CDecoder::DecodeAdvance 0x6e4400, which runs the beat; then FinalizeSyncDispatchLocked
+  0x73dad0 makes the sync), unless the sim is paused (CSimDriver+0x68, set there from the sync: INFERRED that its two
+  fields, +0x250 != -1 or +0x270, are the pause), the dispatch's time in ms (a Timer from its start) goes into a ring of
+  25 floats (RollingFloat<25> at +0x1b8; when full the oldest goes: 24 kept). Their median (0x48bf00: sorted, the one
+  at count / 2) gives x = 1000 / median x 0.1 (single precision), and QuantizeSimRateSample (0x55ae10) = floor(10
+  log10 x). When it differs from the last sent (+0x228, 10 at the start, ctor 0x73b767) it is sent: BroadcastIntParam
+  0x53e850, type 57, one i32, to every client and to this one.
+- So beats of 100 ms send 0, 10 ms 10, 1 ms 20; a client sends nothing while its value stays 10, and the others show
+  50 for it until its first (CClientBase ctor 0x53be07; FAF's dialog shows it as `maxSP`).
+- The copies' values differ (each PC's own); their simulations never do: the speed is not in the sim's state. The rate
+  run follows a client's value a round trip later on the others.
+- Ours (GameSession::NetMaxSimRate): the beat's time from its orders taken (NetBeatOrders) to the end of its tick
+  (NetDigest, on whichever thread ran it); the original's span also holds the sync's making, which ours does after
+  (TakeBeatSync). The test game on Seton's measures 27-28 (beats of about 0.16 ms). A test's switch,
+  `moho64ui_NetTestForTests("maxsp", 0, "<n>")` ("": measured again), sends a value in place of the measure.
+- The original measures in a single-player game too (INFERRED from the shared code, not run: the same sim driver and
+  client manager, with one local client), so there the speed run follows the PC's own measure. Ours does not, yet
+  (GetSessionClients shows 50 there, GetSimRate the speed asked for).
+
+## Observers and three players (net6)
+
+- An observer is a client like a player's (READ, CLobby::LaunchGame 0x7c38c0): after the armies' owners it gets a
+  client index (AssignClientIndex 0x7c4e80, at 0x7c4949) and a command source of its own (AssignCommandSource 0x7c4f60,
+  at 0x7c497d), which no army's set holds (the armies' loop adds theirs, 0x7c46d3; the observers' loop adds
+  nothing). So it sends its beats as a player does, and the others wait for its ACKs: neither
+  IsReadyForBeat 0x53c3e0 nor EveryoneResponsiveSince 0x53ef30 looks at armies. Its unit orders reach every sim and
+  are dropped there (Sim::IssueCommand 0x749290: the source commands no army; ours CommandableUnits). A quiet observer
+  is voted out as a player is.
+- Ours made the clients and sources so already (GameSession::LaunchWith), but an observer's own orders named source 0
+  (the session's command source came from the focus army only, and an observer has none), so the lockstep dropped
+  them as not its own ("Client 2 claiming command source 0, but not authorized for it"). Fixed in net6: in a network
+  game the local client's own source. In the test the observer's stream then carries FAF's LuaSimCallbacks (5) under
+  its source (index 2; GetSessionClients' 3), which every sim runs alike; its right click with army 1's commander selected sent no IssueCommand (why our
+  interface gave none is not traced), and the commander was not ordered.
+
+## Tests (net6)
+
+`ui/tests/net_game_host.lua` / `net_game_join.lua` (the second joiner is net_game_join.lua with `NET_GAME_JOINER =
+2`), through the runner's variables:
+
+- `NET_GAME_MAXSP`: the joiner reports -3 from beat 120 to 230: GetSimRate -3 on both, GetGameSpeed 0, 50 beats in
+  600 frames of the clock (100 at 0); then both back to 0.
+- `NET_GAME_THIRD=player`: three players to beat 250, the three fingerprints equal.
+- `NET_GAME_THIRD=player NET_GAME_EJECT`: the third goes quiet at beat 150; the host votes, its game runs at most the
+  input delay on until the joiner votes; then both run on, `ejectedBy` {1, 2} on both; the host's replay plays back
+  the same.
+- `NET_GAME_SPLIT` besides: the third's last beat (one with a walk order) goes to the host alone. Both leave it out
+  from that beat (the joiner never had it); with `NET_GAME_RULE=original` the host runs it and the two differ there.
+- `NET_GAME_THIRD=observer`: two players and an observer to beat 250: the observer has no army (focus -1), looks
+  through army 1 and tells its commander to walk (the commander gets no order), and its fingerprints equal the
+  host's. With `NET_GAME_EJECT` the observer goes quiet at beat 150 and the two players vote it out.
 
 ## Chat
 

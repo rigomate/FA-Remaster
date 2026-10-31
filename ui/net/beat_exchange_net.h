@@ -20,7 +20,9 @@
 //   54 EJECT {u8 client, i32 n}: "eject that client after its beat n" (ProcessEject 0x53f2c0).
 //   55 CHAT {the message} (CClientBase::ReceiveChat 0x53c9a0 sends, Process 0x53c228 hands it to the interface).
 //   56 GAME SPEED {i32 serial, i32 rate} (SetSimRate 0x53e590, ApplyIncomingGameSpeedRequest 0x53e810).
-//   57 {i32}: the sender's own most sim speed ("maxSP", client+0xd4; FAF's sim driver sends it, 0x129004e).
+//   57 {i32}: the sender's own most sim speed ("maxSP", client+0xd4): BroadcastIntParam 0x53e850, called by the sim
+//      driver after each beat that is not paused when its measure changed (0x129004e; GameSession::NetMaxSimRate); the
+//      game runs at the smaller of the speed asked for and every connected client's value (GetSimRate 0x53e720).
 // And one of ours, not the original's (we are not network-compatible with it or FAF; its types end at 57):
 //   60 DESYNC PARTS {the bytes the game gives}: after a checksum differs, this copy's parts of that beat's state to the
 //      client whose checksum differs, so that each side can say which parts differ (GameSession::NetAfterBeat; Chris
@@ -88,6 +90,12 @@ class NetBeatExchange final : public BeatExchange {
   // changed it to what, for the interface (uimain.NoteGameSpeedChanged, through CWldUiInterface 0x88b960).
   void RequestRate(int rate);
   int Rate();
+  // GetSimRate 0x53e720 (the client manager's slot 14: WLD_GetSimRate 0x88d0b0, GetSimRate 0x843920): the rate the
+  // game runs at, Rate() held down to every client's maxSP that this program has not ejected (slot 1, 0x53c960), its
+  // own among them (0x53e781..0x53e7a1).
+  int RunRate();
+  // Message 57 to every client and to this one (BroadcastIntParam 0x53e850: CMessage 0x39, one i32, slot 17).
+  void SendMaxSimRate(int value);
   std::vector<std::pair<uint8_t, int>> TakeRateNotes();
   // Clients whose connection ended since the last call (the original's "%s disconnected.", 0x88b9d0). A connection
   // that ends ejects its client at once, as the original's messages 202 / 203 do (0x53c2c3).
@@ -109,6 +117,10 @@ class NetBeatExchange final : public BeatExchange {
   // A test's switch: from now on nothing is sent or taken in (the connector is no longer polled), as a program that
   // stopped answering.
   void FreezeForTests();
+  // A test's switch: the next beat of ours that holds orders (SendLocal with bytes) goes to `client` alone, and then
+  // this program freezes (FreezeForTests): the other peers are one beat of ours short of it, the case of the eject's
+  // last beat (ReadyForBeat).
+  void SplitForTests(uint8_t client);
 
  private:
   struct Client {
@@ -156,6 +168,7 @@ class NetBeatExchange final : public BeatExchange {
   uint8_t rateFrom_ = 0xff;      // (+0x44c)
   int rate_ = 0;                 // (+0x450)
   bool frozen_ = false;
+  uint8_t splitTo_ = 0xff;       // (SplitForTests)
   std::vector<std::pair<uint8_t, BeatChecksum>> checksums_;
   std::vector<std::pair<uint8_t, std::string>> chats_;
   std::vector<std::pair<uint8_t, std::string>> desyncParts_;

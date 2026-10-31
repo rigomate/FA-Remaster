@@ -1147,6 +1147,16 @@ struct GameSession::Net {
   std::chrono::steady_clock::time_point askedAt{}, inAt{}, lastBegun{};
   uint32_t askedFor = 0;
   bool inSeen = false;
+  // Message 57, this program's maxSP (NetMaxSimRate): the time of each beat not paused, from its orders taken
+  // (NetBeatOrders) to the end of its tick (NetDigest, on the thread that ran it; -1: paused, or none), the last 24
+  // kept (the sim driver's RollingFloat<25>, CSimDriver+0x1b8, its first / next at +0x220 / +0x224), the value sent
+  // last (+0x228: 10 at the start, CSimDriver ctor 0x73b767), and a test's value in place of the measure.
+  std::chrono::steady_clock::time_point ordersTakenAt{};
+  double beatMs = -1;
+  std::array<float, 25> beatTimes{};
+  int beatTimesFirst = 0, beatTimesNext = 0;
+  int maxSPSent = 10;
+  bool maxSPForced = false;
 };
 
 // The interface's side of it (user/user_state.h): what GetSessionClients, EjectSessionClient, SessionSendChatMessage
@@ -1734,6 +1744,13 @@ bool GameSession::FinishLoad(std::string* why) {
   PostPrints(*sim_);  // (what the scripts printed while the session started: the original's setup sync)
   pendingSync_.clear();
   if (session.focusArmy >= 0 && session.focusArmy < static_cast<int>(h.armies.size())) commandSource_ = h.armies[session.focusArmy].source;
+  // (a network game: this client's own source, the one AssignCommandSource gave its owner, CLobby::LaunchGame 0x7c46b8 /
+  // 0x7c497d; a player's is its army's, an observer's commands no army (its orders reach every sim and are dropped
+  // there, Sim::IssueCommand 0x749290); without this an observer's orders named source 0, the host's, and the
+  // lockstep dropped them as not its own)
+  if (net_)
+    for (const NetClient& c : net_->clients)
+      if (c.local && !c.sources.empty()) commandSource_ = c.sources.front();
   modUids_ = uids;
   sessionMods_ = h.mods;
   map_ = h.map;
@@ -1793,7 +1810,7 @@ bool GameSession::FinishLoad(std::string* why) {
     fpBeats_ = 0;
     fpPlayback_ = fp_ != nullptr;
   }
-  pace.rate = session.gameSpeed;
+  pace.rate = pace.asked = session.gameSpeed;
   pace.adjustable = session.adjustableSpeed;
   pictureDue_ = false;
   if (wantPicture) {
@@ -2527,6 +2544,7 @@ bool GameSession::NetBeatOrders(std::string* merged) {
   if (n.waiting && n.waitTold) Logf(LogLevel::Info, "moho64ui: the network game goes on with beat %u", beat);
   n.waiting = false;
   n.beat = beat;
+  n.ordersTakenAt = std::chrono::steady_clock::now();
   n.digest.clear();
   n.afterDue = true;
   return true;
@@ -2540,6 +2558,9 @@ void GameSession::NetDigest() {
   if (!net_ || !net_->afterDue) return;
   Net& n = *net_;
   const uint32_t beat = n.beat;
+  // (the beat's time for message 57, NetMaxSimRate; a paused beat has none: the sim driver skips it, 0x128ff9f)
+  n.beatMs = sim_->Paused() ? -1.0
+                            : std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - n.ordersTakenAt).count();
   // the test switches that change this copy's state, right after the beat's tick: a true desync from this beat on
   if (beat == n.drawAt) {
     sim_->NextUInt32();
@@ -2615,6 +2636,59 @@ void GameSession::NetAfterBeat() {
   if (!names.empty()) net_->events.desyncs.emplace_back(net_->beat, std::move(names));
   desyncs.clear();
   for (const auto& [client, bytes] : net_->exchange->TakeDesyncParts()) NetCompareParts(client, bytes);
+  NetMaxSimRate();
+}
+
+namespace {
+// QuantizeSimRateSample 0x55ae10: 10 log10(x) (x87: ln x / ln 10.0 (the double at 0xe4f790), times 10.0f, stored as a
+// float), rounded down (frndint, then one less when the float is below it, 0x55ae45..0x55ae53). (Ours in double
+// precision where the original's is in the x87's extended one: the two differ only for a float a hair from a whole
+// number.)
+int QuantizeSimRateSample(float x) {
+  const float v = static_cast<float>(std::log(static_cast<double>(x)) / std::log(10.0) * 10.0);
+  return static_cast<int>(std::floor(v));
+}
+}  // namespace
+
+// Message 57, this program's maxSP, after each beat: the original's sim driver after each dispatch (GPG's 0x73da03..
+// 0x73dab5, the same in FAF's 0x128ff9f..0x1290051): unless the sim is paused (+0x68, set from the beat's sync by
+// FinalizeSyncDispatchLocked 0x73dcae; INFERRED that the sync's two fields it reads, +0x250 != -1 or +0x270, mean the
+// pause), the beat's time in ms (a Timer from the dispatch's start, 0x128fdf9, to after the sync: CyclesToMilliseconds
+// 0x9554e0) goes into the last 25's ring (when full, the oldest out: 24 kept, 0x128ffbd..0x1290008); their median
+// (0x48bf00: the kept ones sorted, the one at count / 2) makes x = 1000 / median x 0.1 (single precision, 0x1290010..
+// 0x129001c: the beats a second this PC could run, over the 10 of normal speed), and QuantizeSimRateSample(x) is sent
+// when it differs from the value sent last (0x129003a..0x1290051: BroadcastIntParam, the client manager's slot 16).
+// So a client whose beats take 100 ms sends 0, 10 ms 10, 1 ms 20: every client runs the game at the smaller of the
+// speed asked for and every connected client's value (GetSimRate 0x53e720, NetBeatExchange::RunRate). A measure of
+// this PC's speed: the copies' values differ, never their simulations (the speed is not in the sim's state).
+// Ours times the beat from its orders taken (NetBeatOrders) to the end of its tick (NetDigest), on whichever thread
+// ran it; INFERRED: the original's span is the same work (its client manager's UpdateStates hands the beat's
+// messages to the sim, the Advance among them, CDecoder::DecodeAdvance 0x6e4400, runs it) and also holds the sync's
+// making, which ours does after it (TakeBeatSync). A test's switch (NetTestSwitch "maxsp") sends a value of its own
+// in place of the measure.
+void GameSession::NetMaxSimRate() {
+  Net& n = *net_;
+  const double ms = n.beatMs;
+  n.beatMs = -1;
+  if (ms < 0 || n.maxSPForced) return;
+  constexpr int kKept = 25;  // (RollingFloat<25>: Net::beatTimes)
+  if ((n.beatTimesNext + 1) % kKept == n.beatTimesFirst) n.beatTimesFirst = (n.beatTimesFirst + 1) % kKept;
+  n.beatTimes[n.beatTimesNext] = static_cast<float>(ms);
+  n.beatTimesNext = (n.beatTimesNext + 1) % kKept;
+  std::array<float, kKept> sorted{};
+  size_t count = 0;
+  for (int i = n.beatTimesFirst; i != n.beatTimesNext; i = (i + 1) % kKept) sorted[count++] = n.beatTimes[i];
+  std::sort(sorted.begin(), sorted.begin() + count);
+  const float median = sorted[count / 2];
+  if (!(median > 0)) return;  // (a beat of no time: none of ours; the original's would send INT_MIN)
+  const int value = QuantizeSimRateSample(1000.0f / median * 0.1f);
+  if (value == n.maxSPSent) return;
+  n.maxSPSent = value;
+  n.exchange->SendMaxSimRate(value);
+  static const bool beatLog = std::getenv("MOHO64UI_NET_BEAT_LOG") != nullptr;
+  if (beatLog)
+    Logf(LogLevel::Info, "moho64ui: beat %u: our maxSP sent: %d (the median beat %.2f ms of the last %zu)", n.beat, value,
+         static_cast<double>(median), count);
 }
 
 namespace {
@@ -2912,7 +2986,8 @@ void GameSession::NetChat(const std::vector<int>& clients, const std::string& me
 void GameSession::NetSpeed(int rate) {
   if (!net_) return;
   net_->exchange->RequestRate(rate);
-  pace.rate = net_->exchange->Rate();  // (ours is taken here at once, as the original's own broadcast is: GetGameSpeed)
+  pace.asked = net_->exchange->Rate();  // (ours is taken here at once, as the original's own broadcast is: GetGameSpeed)
+  pace.rate = net_->exchange->RunRate();
 }
 
 NetEvents GameSession::NetTakeEvents() {
@@ -2947,6 +3022,17 @@ void GameSession::NetTestSwitch(const std::string& what, uint32_t beat, const st
     net_->moveAt = beat;
   } else if (what == "draw") {
     net_->drawAt = beat;
+  } else if (what == "maxsp") {  // (message 57: this value from now on in place of the measure; "": measured again)
+    net_->maxSPForced = !arg.empty();
+    if (net_->maxSPForced) {
+      net_->maxSPSent = std::atoi(arg.c_str());
+      net_->exchange->SendMaxSimRate(net_->maxSPSent);
+    }
+    Logf(LogLevel::Info, "moho64ui: our maxSP %s%s (moho64ui_NetTestForTests)", net_->maxSPForced ? "is now " : "is measured again",
+         net_->maxSPForced ? arg.c_str() : "");
+  } else if (what == "split") {  // (our next beat with orders to that client alone (0-based), then this program freezes)
+    net_->exchange->SplitForTests(static_cast<uint8_t>(std::atoi(arg.c_str())));
+    Logf(LogLevel::Info, "moho64ui: our next beat with orders goes to client %s alone (moho64ui_NetTestForTests)", arg.c_str());
   }
 }
 
@@ -2960,7 +3046,10 @@ bool GameSession::RunningAhead() const { return aheadTo_ != 0; }
 
 void GameSession::Advance(double seconds) {
   if (!sim_) return;
-  if (net_) pace.rate = net_->exchange->Rate();  // (a network game's speed: the one its clients agreed on)
+  if (net_) {  // (a network game's speed: the one its clients agreed on, held down by every client's maxSP)
+    pace.asked = net_->exchange->Rate();
+    pace.rate = net_->exchange->RunRate();
+  }
   if (aheadTo_) {  // (RunAhead: a beat as soon as the last is through, whatever the time; no time counts meanwhile)
     if (BeatRunning()) return;
     if (beatToFinish_) FinishBeat();

@@ -164,9 +164,12 @@ struct WorldScene {
 // A game's pace, kept by the host (the original's client manager keeps it, FA exe 0x53e590):
 // the speed in the steps the speed keys count (the game runs 10^(rate / 10) times as fast as
 // normal: WLD_GetSimRate 0x88d0b0), and whether the players may change it (the game option
-// GameSpeed = "adjustable"; "fast" starts at 4).
+// GameSpeed = "adjustable"; "fast" starts at 4). `rate` is the speed run (GetSimRate, the client
+// manager's slot 14, 0x53e720), `asked` the speed asked for (GetGameSpeed, slot 15, 0x53e7e0);
+// the same except in a network game, where every client's maxSP holds `rate` down (message 57).
 struct GamePace {
   int rate = 0;
+  int asked = 0;
   bool adjustable = false;
   bool ended = false;  // SessionEndGame has been asked for (the simulation stands from the next beat on)
 };

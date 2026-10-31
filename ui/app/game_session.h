@@ -483,6 +483,7 @@ class GameSession {
   bool NetBeatOrders(std::string* merged);  // (the next beat's merged orders, or false: wait)
   void NetDigest();                         // (right after that beat, on its thread: the digest of a 50th beat)
   void NetAfterBeat();                      // (then here: the digest to the lockstep, desyncs to the dialog)
+  void NetMaxSimRate();                     // (and message 57: this program's maxSP, when it changed)
   // (ours, after a desync: this copy's parts of that beat to the client whose checksum differs, and a client's parts
   // compared with ours: which parts differ, on the console, in the log and in <replay>.desync.txt)
   void NetSendParts(uint8_t client, uint32_t beat);

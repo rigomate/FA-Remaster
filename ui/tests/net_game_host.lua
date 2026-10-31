@@ -18,6 +18,17 @@
 --   NET_GAME_RUN_TO = <beat>: after the orders both run on to that beat and end there (no chat, speed, pause or desync):
 --     a long plain game, for the beats' timing over a link with latency (MOHO64UI_REAL_TIME, MOHO64UI_NET_BEAT_LOG,
 --     MOHO64_NET_DELAY_MS: docs/ui-net-game.md, "A link with latency").
+--   NET_GAME_MAXSP: after the orders the joiner reports a maxSP of -3 (message 57, moho64ui_NetTestForTests("maxsp")):
+--     both games run at -3 (GetSimRate), the speed asked for stays 0 (GetGameSpeed); then the joiner measures again and
+--     both run at 0; they end at beat 300.
+--   NET_GAME_THIRD = "player" | "observer": a third program (net_game_join.lua with NET_GAME_JOINER = 2, "Joiner2"),
+--     army 3 or an observer (the configuration's Observers: client 3, a command source of its own, no army). Alone it
+--     goes with NET_GAME_RUN_TO (the three run to that beat). With NET_GAME_EJECT the third stops answering after beat
+--     150 and the host and the joiner both vote it out (EjectSessionClient(3)): until both have, the games wait for it.
+--     NET_GAME_SPLIT besides: the third's last beat (one with an order) goes to the host alone before it stops
+--     (moho64ui_NetTestForTests("split")): the joiner is a beat of it short, and both must still leave the third out
+--     from the same beat (ReadyForBeat in ui/net/beat_exchange_net.cpp; MOHO64UI_NET_EJECT_RULE=original shows the
+--     original's rule desync there).
 --   moho64ui --init <init.lua> --prefs <a copy> --stage frontend --no-world --lua ui/tests/net_game_host.lua
 --            --game-lua ui/tests/net_game_host.lua --replay-out <dir>/r --frames 2000000000 --log host.log
 -- Every check logs "TEST ok ..." or "TEST FAIL ..."; the last line is "TEST done: <n> failed".
@@ -37,6 +48,8 @@ local function WaitFor(cond, seconds)  -- (the PC's clock: the other program run
 end
 local EJECT, LOADING = rawget(_G, "NET_GAME_EJECT"), rawget(_G, "NET_GAME_LOADING")
 local RUN_TO = rawget(_G, "NET_GAME_RUN_TO")
+local MAXSP, THIRD = rawget(_G, "NET_GAME_MAXSP"), rawget(_G, "NET_GAME_THIRD")
+local CLIENTS = THIRD and 3 or 2
 -- ours after the desync dialog: a console line naming the parts of the state that differ (GameSession::NetCompareParts),
 -- the same on both programs but for the other's name. NET_GAME_DESYNC (both programs alike) picks the joiner's desync:
 -- nil, its line's part a2 changed with its checksum of beat 250 (the state itself left as it is: the fingerprints stay
@@ -88,22 +101,38 @@ if not inGame then
         ExitApplication()
         return
     end
-    local joiner
+    local joiner, joiner2, established = nil, nil, {}
     lobby.DataReceived = function(self, data)
-        if data.Type == 'Hello' then joiner = data.SenderID end
+        if data.Type == 'Hello' then
+            if data.SenderName == "Joiner2" then joiner2 = data.SenderID else joiner = data.SenderID end
+        end
     end
+    lobby.EstablishedPeers = function(self, uid, peers) established[uid] = table.getn(peers) end
     lobby.GameLaunched = function(self) LOG("TEST note: the game launched") self:Destroy() end
     lobby.LaunchFailed = function(self, why) check("the launch", why, nil) end
     lobby:HostGame()
     ForkThread(function()
         check("the joiner says hello", WaitFor(function() return joiner ~= nil end, 60), true)
-        if not joiner then
+        if THIRD then
+            check("the second joiner says hello", WaitFor(function() return joiner2 ~= nil end, 60), true)
+            -- (each joiner tells everyone whom it is established with: the host and the other; the game's links are the
+            -- lobby's, so they must all be up before the launch)
+            check("the joiners are connected to each other", WaitFor(function()
+                return joiner ~= nil and joiner2 ~= nil and established[joiner] == 2 and established[joiner2] == 2
+            end, 60), true)
+        end
+        if not joiner or (THIRD and not joiner2) then
             LOG("TEST done: " .. failed .. " failed")
             ExitApplication()
             return
         end
         config.PlayerOptions[1] = Player("Host", lobby:GetLocalPlayerID(), 1)
         config.PlayerOptions[2] = Player("Joiner", joiner, 2)
+        if THIRD == "player" then
+            config.PlayerOptions[3] = Player("Joiner2", joiner2, 3)
+        elseif THIRD == "observer" then  -- (FAF's lobby.lua: an observer's entry holds its name and owner)
+            config.Observers[1] = { PlayerName = "Joiner2", OwnerID = joiner2 }
+        end
         if rawget(_G, "NET_GAME_AI") then  -- (an AI on the host's side too: the runner's variant)
             config.PlayerOptions[3] = { PlayerName = "AI", OwnerID = lobby:GetLocalPlayerID(), Human = false, Civilian = false,
                                         Faction = 1, Team = 1, StartSpot = 3, PlayerColor = 3, ArmyColor = 3,
@@ -149,13 +178,20 @@ ForkThread(function()
     check("the host's army", GetFocusArmy(), 1)
     check("beat 1 waits for the others' READY (after the game's screen)", GameTick(), 0)
     local clients = GetSessionClients()
-    check("two clients", table.getn(clients), 2)
+    check(CLIENTS .. " clients", table.getn(clients), CLIENTS)
     check("the host is client 1 (the first army's)", clients[1] and clients[1].name, "Host")
     check("and the one here", clients[1] and clients[1]['local'], true)
     check("the joiner client 2", clients[2] and clients[2].name, "Joiner")
     check("speaking for source 2", clients[2] and clients[2].authorizedCommandSources[1], 2)
     check("nobody ejected", clients[2] and table.getn(clients[2].ejectedBy), 0)
-    check("FAF's maxSP field", clients[2] and clients[2].maxSP, 50)
+    check("FAF's maxSP field (50 until a client's first message 57)", clients[2] and clients[2].maxSP, 50)
+    if THIRD then  -- (CLobby::AssignClientIndex 0x7c4e80: the armies' owners first, then the observers)
+        check("the second joiner client 3", clients[3] and clients[3].name, "Joiner2")
+        check("speaking for source 3", clients[3] and clients[3].authorizedCommandSources[1], 3)
+        local armyOf2 = nil
+        for i, a in GetArmiesTable().armiesTable do if a.nickname == "Joiner2" then armyOf2 = i end end
+        check("the second joiner's army", armyOf2, THIRD == "player" and 3 or nil)
+    end
     if LOADING then
         -- the joiner never says READY: no beat runs; it goes quiet; ejected, it counts as ready and the game starts
         WaitFor(function() return false end, 3)
@@ -205,11 +241,74 @@ ForkThread(function()
         end
         return false
     end, 30), true)
+    if MAXSP then
+        -- the joiner reports -3 from beat 120 on: the speed run here is the smaller of the speed asked for and every
+        -- client's maxSP (GetSimRate 0x53e720); the speed asked for stays as it is (GetGameSpeed)
+        local cl = GetSessionClients()
+        LOG("TEST note: measured maxSP at tick " .. GameTick() .. ": host " .. tostring(cl[1].maxSP) .. ", joiner " ..
+            tostring(cl[2].maxSP) .. "; GetSimRate " .. tostring(GetSimRate()) .. ", GetGameSpeed " .. tostring(GetGameSpeed()))
+        check("the joiner reports -3", WaitFor(function() return GetSessionClients()[2].maxSP == -3 end, 60), true)
+        check("our game runs at -3", WaitFor(function() return GetSimRate() == -3 end, 5), true)
+        check("the speed asked for stays 0", GetGameSpeed(), 0)
+        -- (each frame of a run without a window is 1/60 s of the game's clock: 600 frames are 10 s, 50 beats at -3 and
+        -- 100 at 0; up to 10 more may be owed from before, the clock's most)
+        local t0 = GameTick()
+        WaitFrames(600)
+        local beats = GameTick() - t0
+        LOG("TEST note: " .. beats .. " beats in 600 frames at -3")
+        check("held down: at most 65 beats in 600 frames", beats <= 65, true)
+        check("the joiner measures again: its maxSP its own", WaitFor(function() return GetSessionClients()[2].maxSP ~= -3 end, 90), true)
+        check("our game runs at the speed asked for again", WaitFor(function() return GetSimRate() == 0 end, 10), true)
+        cl = GetSessionClients()
+        LOG("TEST note: measured maxSP at tick " .. GameTick() .. ": host " .. tostring(cl[1].maxSP) .. ", joiner " .. tostring(cl[2].maxSP))
+        check("beat 300 comes", WaitFor(function() return GameTick() >= 300 end, 120), true)
+        LOG("TEST note: the host's game ends at tick " .. GameTick())
+        LOG("TEST done: " .. failed .. " failed")
+        WaitFor(function() return false end, 1)
+        ExitApplication()
+        return
+    end
     if RUN_TO then
-        -- the game runs on to that beat (both), then ends here
+        -- the game runs on to that beat (all), then ends here
         check("beat " .. RUN_TO .. " comes", WaitFor(function() return GameTick() >= RUN_TO end, RUN_TO / 10 * 3 + 60), true)
         check("the joiner is still there", GetSessionClients()[2].connected, true)
+        if THIRD then check("and the second joiner", GetSessionClients()[3].connected, true) end
+        check("no desync", table.getn(desyncs), 0)
         LOG("TEST note: the host's game ends at tick " .. GameTick() .. "; ping to the other " .. tostring(GetSessionClients()[2].ping) .. " ms")
+        LOG("TEST done: " .. failed .. " failed")
+        WaitFor(function() return false end, 1)
+        ExitApplication()
+        return
+    end
+    if EJECT and THIRD then
+        -- the second joiner stops answering after beat 150 (NET_GAME_SPLIT: after its last beat went to us alone): our
+        -- game waits for it, it goes quiet; we vote it out, then the joiner does: until it has, the joiner's game waits
+        -- for the second joiner's beats, and ours for the joiner's (a beat runs when everyone still in has every part
+        -- of it: IsReadyForBeat 0x53c3e0), at most the input delay (5 beats) past where it stood
+        check("the second joiner goes quiet (the disconnect dialog's cue)", WaitFor(function()
+            local cl = GetSessionClients()
+            return cl[3] ~= nil and cl[3].connected and cl[3].quiet > 5000
+        end, 60), true)
+        local stood = GameTick()
+        WaitFor(function() return false end, 1)
+        check("meanwhile the game waits (the tick stands)", GameTick(), stood)
+        EjectSessionClient(3)
+        check("ejected: no longer connected here", WaitFor(function() return GetSessionClients()[3].connected == false end, 5), true)
+        WaitFor(function() return false end, 1.5)
+        local cl = GetSessionClients()
+        check("the joiner has not voted yet", cl[3] and table.getn(cl[3].ejectedBy), 1)
+        check("our game waits for its vote (at most the input delay on)", GameTick() <= stood + 6, true)
+        LOG("TEST note: the second joiner stood at tick " .. stood .. "; ours at " .. GameTick() .. " before the joiner's vote")
+        check("the joiner votes too", WaitFor(function() return table.getn(GetSessionClients()[3].ejectedBy) == 2 end, 60), true)
+        cl = GetSessionClients()
+        check("ejected by the host (client 1)", cl[3] and cl[3].ejectedBy[1], 1)
+        check("and by the joiner (client 2)", cl[3] and cl[3].ejectedBy[2], 2)
+        check("the joiner is still there", cl[2] and cl[2].connected, true)
+        check("the game runs on without the second joiner", WaitFor(function() return GameTick() >= stood + 60 end, 60), true)
+        -- (both left it out from the same beat: the checksums of beats 200 and 250 agree)
+        check("beat 265 comes", WaitFor(function() return GameTick() >= 265 end, 60), true)
+        check("no desync", table.getn(desyncs), 0)
+        LOG("TEST note: the host's game ends at tick " .. GameTick())
         LOG("TEST done: " .. failed .. " failed")
         WaitFor(function() return false end, 1)
         ExitApplication()

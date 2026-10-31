@@ -109,11 +109,17 @@ int l_Zero(lua_State* L) {
   lua_pushnumber(L, 0);
   return 1;
 }
-// GetGameSpeed() (FA exe 0x88e260) and GetSimRate(): how much faster or slower than normal the
-// game runs, in the steps the speed keys count. (The original's GetSimRate is the speed the
-// simulation manages; here both are the speed asked for.)
+// GetGameSpeed() (FA exe 0x88e260: the client manager's slot 15, GetSimRateRequested 0x53e7e0) and
+// GetSimRate() (0x843920: slot 14, GetSimRate 0x53e720): how much faster or slower than normal the
+// game is asked to run, and runs, in the steps the speed keys count. They differ in a network game
+// only: there every client's maxSP (message 57) holds the speed run down.
 int l_GetGameSpeed(lua_State* L) {
   lua_pushnumber(L, GameSpeedOf(L));
+  return 1;
+}
+int l_GetSimRate(lua_State* L) {
+  const GamePace* pace = UserState::From(L)->config().pace;
+  lua_pushnumber(L, pace ? pace->rate : 0);
   return 1;
 }
 // SetGameSpeed(rate) (FA exe 0x88e360): as given, without bounds.
@@ -860,7 +866,7 @@ void UserState::AdvanceTickFraction(double seconds) {
     return;
   }
   const GamePace* pace = config_.pace;
-  const double rate = std::pow(10.0, (pace ? pace->rate : 0) / 10.0);  // (WLD_GetSimRate: the speed asked for)
+  const double rate = std::pow(10.0, (pace ? pace->rate : 0) / 10.0);  // (WLD_GetSimRate: the speed run)
   tickFraction = std::min(1.0, tickFraction + rate * seconds * 10.0);
 }
 
@@ -909,7 +915,7 @@ std::string ArmyColorOf(lua_State* L, int army) {
 
 int GameSpeedOf(lua_State* L) {
   const GamePace* pace = UserState::From(L)->config().pace;
-  return pace ? pace->rate : 0;
+  return pace ? pace->asked : 0;
 }
 // (A network game: a request to every client, control message 56, SetSimRate 0x53e590 through SetGameSpeed 0x88e42d;
 // the rate changes once the clients agree on it, GameSession takes it from the exchange each frame. INFERRED: the
@@ -919,7 +925,7 @@ void SetGameSpeedTo(lua_State* L, int rate) {
   UserState* user = UserState::From(L);
   if (NetGameLink* net = user->config().net) return net->RequestSpeed(rate);
   GamePace* pace = user->config().pace;
-  if (pace && pace->adjustable) pace->rate = rate;
+  if (pace && pace->adjustable) pace->rate = pace->asked = rate;
 }
 
 void IconColorsForWorld(lua_State* L, std::vector<uint32_t>* out) {
@@ -1065,7 +1071,7 @@ void RegisterSessionBindings(lua_State* L) {
   SetGlobal(L, "GameTick", l_GameTick);
   SetGlobal(L, "GetGameTimeSeconds", l_GetGameTimeSeconds);
   SetGlobal(L, "GetSimTicksPerSecond", l_GetSimTicksPerSecond);
-  SetGlobal(L, "GetSimRate", l_GetGameSpeed);
+  SetGlobal(L, "GetSimRate", l_GetSimRate);
   SetGlobal(L, "GetGameSpeed", l_GetGameSpeed);
   SetGlobal(L, "SetGameSpeed", l_SetGameSpeed);
   SetGlobal(L, "SessionRequestPause", l_SessionRequestPause);
@@ -1083,7 +1089,9 @@ void RegisterSessionBindings(lua_State* L) {
   SetGlobal(L, "EjectSessionClient", l_EjectSessionClient);
   SetGlobal(L, "SessionSendChatMessage", l_SessionSendChatMessage);
   // moho64ui_NetTestForTests(what [, beat [, arg]]): a network game's test switch (NetGameLink::TestSwitch: "freeze",
-  // "corrupt", "move", "draw"); nothing in a local game. The host's own function for tests.
+  // "corrupt", "move", "draw", "maxsp" (arg: our message 57 value from now on; "": measured again), "split" (arg: the
+  // 0-based client our next beat with orders goes to alone, then frozen)); nothing in a local game. The host's own
+  // function for tests.
   lua_register(L, "moho64ui_NetTestForTests", [](lua_State* L) -> int {
     const std::string what = luaL_checkstring(L, 1);
     const uint32_t beat = lua_isnumber(L, 2) ? static_cast<uint32_t>(lua_tonumber(L, 2)) : 0;
