@@ -233,11 +233,12 @@ by the battle estimate of that zone (`Remastered.AIZoneEstimate`, 3.2), with our
 scouting, the army and expansion, not one after the other.
 - **Builders**, when idle or after 20 s of assisting (an assist is looked at again so new work is taken), in order:
   1. the first land factory (the commander), then its own zone's mass points in the opening;
-  2. power of the builder's tech, built ahead of need (less than 1.2x what is asked plus a margin), but never more
-     than 12 energy per mass of income plus 30 a second, and with at most 1 + one per 40 energy / s of income being
-     built at once (power costs energy to build, and a crowd of builders on it starves everything);
-  3. land factories up to a floor that grows with the minutes from minute 3 (1 + one per 1.5 minutes), more while
-     mass piles up (one per ~6 mass / s, at most 12);
+  2. power of the builder's tech, built ahead of need (less than 1.2x what is asked plus a margin; phase 11: and
+     after the opening, under 10 energy per mass of income), but never more than 12 energy per mass of income (phase
+     11: the larger of the income and its smoothed value) plus 30 a second, and with at most 1 + one per 40 energy / s
+     of income being built at once (power costs energy to build, and a crowd of builders on it starves everything);
+  3. land factories up to a floor that grows with the minutes from minute 3 (1 + one per 1.5 minutes; phase 11: one
+     more per 1.5 minutes after the opening), more while mass piles up (one per ~6 mass / s, at most 20 since phase 9);
   4. a defence where the enemy will come, when it is the cheaper answer (below);
   5. an air factory from minute 3 (scouts, then fighters), more air factories while the enemy's air grows (one more
      per 1,500 of its known air mass, at most 4), and a radar from minute 5;
@@ -280,6 +281,28 @@ scouting, the army and expansion, not one after the other.
   back to the base zone farthest from them that has no water beside it (else the farthest); otherwise away from the
   middle of every enemy near it, onto land our engineers reach, or to the start. On SETONS_R the start is on the coast:
   FAF's ships killed the commander there, and a farthest zone on another shore lost it to a submarine's deck gun.
+- **Phase 11, production capacity and tech pace.** M28 had 11-12 T1 and 9-10 T2 factories at minute 10 to our 7-8 T1
+  and 1 T2. Probes every 30 s (land factories by tier, upgrades, the bars; the engineers' states and the factory job's
+  outcomes; energy asked against energy made) showed three causes, none of them the floor alone:
+  - **Base sites promised whole.** `AIBuildSpots` hands out spots 4 world units apart, a factory's skirt is 8 or more,
+    and only the exact spot was promised: the next builder was sent 4 units beside the last one's factory, not yet
+    started, and its order failed when that one started (against M28, 106 factory orders in 2 minutes started 13
+    factories, with the mass bar full for minutes). A promised site now holds its whole skirt (`R.sites`) for the
+    walk too, and `BuildSpot` leaves out the spots that overlap one; this holds for every base build (factories,
+    power, radar).
+  - **Power ahead for what the mass can spend.** After the opening, power is needed while the energy income is under
+    10 energy per mass of income (`kEnergyPerMass`; the asks ran at 9-10), and the cap of 12 per mass counts the
+    smoothed mass income too: an energy stall cut the mass income, which cut the cap, which stopped the power
+    (1,040 energy a second against 1,522 asked was "not needed"). The energy bar was empty in most of minutes 8.5-13
+    against M28 with 10-15 T1 generators building at once behind the asks.
+  - **The factory floor after the opening** grows by one every 1.5 minutes on top of the opening's curve (the cap
+    stays the income's: one per ~6 mass / s, at most 20).
+  - Tried and left out: more factory upgrades at once (1 + income / 40), T2 support factories, a floor growing every
+    0.75 minutes, and the upgrades chosen before the factories' orders (the production gave every idle factory an
+    order first, so an upgrade found none idle: one game had 21 T1 land factories and none at T2 at minute 17). With
+    upgrades free to start, 2-3 at once from minute 8 emptied the energy bar for 30-76% of minutes 10-15 and lost two
+    or three of the seven M28 games, also when a new upgrade waited for half the energy bar. Tech waits for an energy
+    economy that carries it.
 - **Phase 9, energy after the opening.** "Short" is now under 30% stored and income under 1.2 x what is asked (an
   empty bar alone, a moment when a big build starts, had built 94 T1 generators by minute 14.5: 2,860 energy a second
   against 1,150 asked). Power is also capped first in `NeedPower`. The T2+ engineers kept grow by one every 3 minutes
@@ -1127,6 +1150,28 @@ both-modes check, multicore.md 1).
   - Together 161.0 minutes against 153.1; two games longer, three shorter: a first form, not yet a clear step. Our
     ships are 2,000-3,000 mass at minute 18 against M28's 18,000-21,000: against a navy that size the sea cannot be
     won on our economy yet, and the coast needs holding from the land too.
+- **The phase-11 sets (2026-10-31), production capacity,** against phase 10 on the same engine (main fd63c8f), 20
+  minutes with fog, FAF seeds 1001-6006 and M28 seeds 1001-7007 (13 games):
+  - **Against M28:** alive at minute 20 in 5 of 7 (phase 10: 6 of 7; the commander died in a push into the base at
+    minutes 15-19, a different seed each time); its army at minute 15 summed 45,700 mass against 29,600; mass lost
+    243,000 against 277,700; land factories at minute 10 6-14 T1 against 5-10.
+  - **Against FAF's AI:** all 6 alive (both); mass lost 71,300 against 86,300 for 71,900 killed against 80,000; the
+    energy bar empty in minutes 10-15 0-10% of the time in five games, 46% in one (phase 10: 2-44%).
+  - **60-minute duels:**
+
+    | Game | Phase 11 | Phase 10 | Lost per killed (phase 10) |
+    |---|---|---|---|
+    | recruit vs FAF adaptive | lost at minute 39.5 | lost at minute 30.2 | 1.97 (2.10) |
+    | veteran (turtle) vs FAF adaptive | lost at minute 45.2 | **no result after 60 minutes** | 0.87 (0.84) |
+    | recruit vs M28 | lost at minute 24.8 | lost at minute 20.5 | 5.2 (9.2) |
+    | veteran (turtle) vs M28 | lost at minute 21.9 | lost at minute 28.2 | 8.4 (15.3) |
+    | veteran (rusher) vs M28 without cheats | lost at minute 23.3 | lost at minute 23.7 | 11.1 (12.2) |
+
+  - Together 154.7 minutes against 162.6; two games longer, three shorter. Against M28 every game trades better (a
+    third to a half less lost per mass killed); our mass a second at minute 30 against FAF was 438 (recruit) and 153
+    (veteran) against 283 and 215. What decides the M28 games now is the fight at our base around minute 15-25: our index knew 2,400 mass of the
+    T2 bots and commander that killed ours (its zone estimate said 0.97 for us), so the land trades and what we see
+    of a push come next.
 - **Then Chris plays it** and judges the feel (decision 8), in the one big check after the UEF polish unless he asks
   sooner.
 
@@ -1140,6 +1185,7 @@ both-modes check, multicore.md 1).
 | 4 (first form built 2026-10-29) | Strategic and operation layers: aggression with hysteresis, objectives, gathering, push, retreat by estimate, raids, navy and air domains, combined arms timing. Built: the zone estimate from the index (fair intel, memory, reinforcements on the way, kiting), defend / attack / push / raid with commit rules and logged decisions, tech upgrades. Not yet: gathering, navy and air, combined arms | Ours vs M28 and FAF's AI, several seeds: the fight scores of section 6; "never fled a weaker force" at zero faults. First duels: 0 faults, 3 losses and one 60-minute game without a result (section 6) |
 | 5 (first form built 2026-10-29) | Economy in parallel with scouting, army and expansion (power ahead but not wasted, factory floor, engineers by distance and away from enemies, reclaim, storage, timed assists); counters by build value; defences as build candidates; investments by payback and danger with a planned dip; the strategy layer's read of the enemy and stances; attacks on armies and expansions with gathering and reinforcements via the staging zone; guard posts; the knobs in one place (decisions 13-16) | The five duels of section 6 (mass / s at 5 / 15 / 30 minutes, mass lost per enemy mass killed); the 16 + B1 / b8 identical; our-key sessions identical at 1 / 32 threads, shuffle, reverse |
 | 6a (first form built 2026-10-30) | Map control: the army kept against the enemy's known army, guard posts sized by the threat and lost zones taken back, reclaim fields; each enemy read on its own (the focus enemy); the player's two sliders (aggression, economy) with bounds; the duels with fog of war | The duels of section 6 with fog; the 16 + B1 / b8 identical; our-key fogged sessions identical at 1 / 32 threads, shuffle, reverse |
+| 11 (first form built 2026-10-31) | Production capacity: base sites promised whole (the skirt, for the walk), power ahead of what the mass can spend (10 energy per mass, the cap on the smoothed income), the factory floor growing after the opening | The army set with factory tiers and more seeds (FAF 1001-6006, M28 1001-7007, 20 minutes); the duels of section 6 with fog; our-key fogged sessions identical at 1 / 32 threads, shuffle, reverse |
 | 10 (first form built 2026-10-31) | The navy (naval factories by our shore, ships by build value, defend / attack / hold), the air answer to ships, shelled zones, the commander's fallback inland | The army set (FAF and M28, seeds 1001-4004, 20 minutes); the duels of section 6 with fog; our-key fogged sessions identical at 1 / 32 threads, shuffle, reverse |
 | 9 (first form built 2026-10-30) | The economy into an army (the army kept by our income, investments halved while short, up to 20 factories), energy after the opening (short by income against asks, power capped first, more T2 engineers), the trade check on attacks | The army set (FAF and M28, three seeds each, 20 minutes: army mass at 10 / 15 minutes, energy stalls, survival, trades); the duels of section 6 with fog; our-key fogged sessions identical at 1 / 32 threads, shuffle, reverse |
 | 8 (first form built 2026-10-30) | The opening: the commander's power after the factory, extractors first, a power floor, factories and upgrades waiting for energy, base sites beyond the start zone, T2 without the mass-bar gate, anti-missile before power | The opening set (FAF and M28, three seeds each: mass a second at minutes 4-5 and 9-10, energy stalls); the duels of section 6 with fog; our-key fogged sessions identical at 1 / 32 threads, shuffle, reverse |

@@ -46,9 +46,11 @@ local kBaseZones = 200                        -- world units of travel from the 
 local kArmyIncomeRate = 10                    -- the army kept: seconds of mass income per minute after the opening (9)
 local kArmyIncomeMax = 120                    -- ... at most this many seconds of income
 local kMaxFactories = 20                      -- land factories at most (phase 9; 12 before)
+local kFactoryEvery = 1.5                     -- minutes per extra land factory of the floor after the opening (11)
 local kOpening = 6                            -- minutes of the opening (phase 8): the energy rules below hold until then
 local kTechEngineersMax = 8                   -- engineers of T2 or above kept at most (phase 9)
 local kUpgradeIncome = 60                     -- mass a second per extra factory upgrade at once (phase 10)
+local kEnergyPerMass = 10                     -- energy income kept ahead per mass income after the opening (11)
 local kNavalAirShare = 1.5                    -- anti-ship aircraft kept per mass of enemy ships shelling our coast (10)
 local kNavalAirFactory = 1500                 -- one air factory more per this much enemy ship mass there
 local kNavalPendingTicks = 600                -- a naval factory ordered counts as under way this long before it starts
@@ -122,6 +124,7 @@ AIBrain = Class(StandardBrain) {
             startZ = sz,
             startZone = Remastered.AIZoneAt(sx, sz, 'land'),
             claims = {},   -- 'x:z' -> tick the site was promised
+            sites = {},    -- (phase 11) base sites promised: { x, z, hx, hz (half the skirt), tick }, in promise order
             assist = {},   -- builder entity id -> tick its assist began
             tick = 0,
         }
@@ -248,11 +251,39 @@ AIBrain = Class(StandardBrain) {
             for _, e in ipairs(list) do table.insert(R.baseZones, e.z) end
         end
         local bp = self:Bp(what)
+        -- (phase 11: a spot overlapping a site promised to another builder is not free either: the spots are 4 world
+        -- units apart, a factory's skirt 8 or more, and the next builder was sent 4 units beside the last one's
+        -- factory - against M28, 106 factory orders in 2 minutes started 13 factories, with the mass bar full)
+        local live = {}
+        for _, c in ipairs(R.sites) do
+            if R.tick - c.tick < kClaimTicks then table.insert(live, c) end
+        end
+        R.sites = live
+        local hx, hz = self:HalfSkirt(bp, size)
         for _, z in ipairs(R.baseZones) do
             for _, p in ipairs(Remastered.AIBuildSpots(z, size)) do
-                if not self:Claimed(p[1], p[2]) and self:CanBuildStructureAt(bp, Pos(p[1], p[2])) then return p end
+                if not self:Claimed(p[1], p[2]) and not self:SiteTaken(p[1], p[2], hx, hz) and
+                    self:CanBuildStructureAt(bp, Pos(p[1], p[2])) then
+                    return p
+                end
             end
         end
+    end,
+
+    -- (phase 11) half a blueprint's skirt (its footprint, else the spot size) on each axis
+    HalfSkirt = function(self, bp, size)
+        local b = __blueprints[bp]
+        local ph = b and b.Physics or {}
+        local fp = b and b.Footprint or {}
+        return 0.5 * (ph.SkirtSizeX or fp.SizeX or size), 0.5 * (ph.SkirtSizeZ or fp.SizeZ or size)
+    end,
+
+    -- (phase 11) a promised base site overlaps a structure of half-skirt hx, hz centred at x, z
+    SiteTaken = function(self, x, z, hx, hz)
+        for _, c in ipairs(self.Remaster.sites) do
+            if math.abs(c.x - x) < c.hx + hx and math.abs(c.z - z) < c.hz + hz then return true end
+        end
+        return false
     end,
 
     -- energy (phase 5): short now, or less than 1.2x what is asked plus a margin (built ahead of need), but never more
@@ -263,7 +294,14 @@ AIBrain = Class(StandardBrain) {
         local stored = self:GetEconomyStoredRatio('ENERGY')
         -- (phase 9: the cap first, and an empty bar counts only while the asks are above what comes in: the bar empties
         -- for a moment when a big build starts, with income far ahead)
-        if income * 10 > 12 * self:GetEconomyIncome('MASS') * 10 + 30 then return false end
+        -- (phase 11: the cap counts the smoothed mass income too: an energy stall cuts the mass income, which cut the
+        -- cap, which stopped the power - 1,040 energy a second against 1,522 asked, "not needed")
+        local mass = math.max(self:GetEconomyIncome('MASS') * 10, self.Remaster.massAvg or 0)
+        if income * 10 > 12 * mass + 30 then return false end
+        -- (phase 11: after the opening, power ahead for what the mass income can spend, kEnergyPerMass energy a mass:
+        -- against M28 the energy bar was empty most of minutes 8.5-13 while the asks ran at 9-10 energy a mass and the
+        -- T1 generators came 10-15 at a time behind them)
+        if GetGameTick() >= kOpening * 600 and income * 10 < kEnergyPerMass * mass then return true end
         if stored < 0.15 then return income < requested * 1.2 end
         return income < requested * 1.2 + 1 and stored < 0.95
     end,
@@ -326,7 +364,11 @@ AIBrain = Class(StandardBrain) {
         if not self:AtBase(u) then return false end
         local s = self:BuildSpot(what, size)
         if not s then return false end
-        self:Claim(s[1], s[2])
+        self:Claim(s[1], s[2], u)
+        -- (phase 11: the site's whole skirt is promised, for the walk too)
+        local hx, hz = self:HalfSkirt(self:Bp(what), size)
+        table.insert(self.Remaster.sites,
+            { x = s[1], z = s[2], hx = hx, hz = hz, tick = self.Remaster.claims[s[1] .. ':' .. s[2]] })
         IssueBuildMobile({ u }, Pos(s[1], s[2]), self:Bp(what), {})
         return true
     end,
@@ -587,7 +629,10 @@ AIBrain = Class(StandardBrain) {
         -- (phase 9: at most kMaxFactories instead of 12: with the phase-8 economy the mass bar filled at minute 9-10
         -- with 7-8 factories against 120 mass a second)
         local wantFactories = math.min(kMaxFactories, 1 + math.floor(self:GetEconomyIncome('MASS') * 10 / 6))
-        local floorFactories = ctx.minutes >= 3 and math.min(wantFactories, 1 + math.floor(ctx.minutes / 1.5)) or 1
+        -- (phase 11: after the opening the floor grows by one more every kFactoryEvery minutes: M28 had 22 factories
+        -- at minute 10 to our 9-10; the cap stays the income's)
+        local floorFactories = ctx.minutes >= 3 and math.min(wantFactories, 1 + math.floor(ctx.minutes / 1.5) +
+            math.floor(math.max(0, ctx.minutes - kOpening) / kFactoryEvery)) or 1
         -- (phase 8: in the opening a new factory waits for a sound energy economy: a factory draws energy as it
         -- builds and as it works, and the second one had started the stall)
         local energyOk = ctx.minutes >= kOpening or not ctx.energyShort
