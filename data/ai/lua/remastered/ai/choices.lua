@@ -152,6 +152,58 @@ function EnemyAir(brain)
     return am, gm
 end
 
+-- ---- the air answer to ships (phase 10) ----
+
+-- the air candidates against ships by air factory tech (blueprint suffixes): bombers, gunships, torpedo bombers
+local kNavalAir = { { 'a0103' }, { 'a0203', 'a0204' }, { 'a0304' } }
+
+-- the enemy's ships as known ({id, count}), from the whole known enemy
+local function NavalMix(R)
+    local list, mass = {}, 0
+    for _, e in ipairs(Remastered.AIEnemyMix(R.army, true)) do
+        local bp = __blueprints[e[1]]
+        local naval = false
+        if bp and bp.Categories then
+            for _, c in ipairs(bp.Categories) do if c == 'NAVAL' then naval = true end end
+        end
+        if naval and bp.Categories then
+            local mobile = false
+            for _, c in ipairs(bp.Categories) do if c == 'MOBILE' then mobile = true end end
+            if mobile then
+                table.insert(list, { e[1], e[2] })
+                mass = mass + e.mass
+            end
+        end
+    end
+    return list, mass
+end
+
+-- what an air factory of `tech` builds against the ships (the best build value against the known ships, id on ties),
+-- worked out again every kCounterTicks; nil when no candidate kills anything
+function NavalAirPick(brain, tech)
+    local R = brain.Remaster
+    R.navalPick = R.navalPick or {}
+    local c = R.navalPick[tech]
+    if c and R.tick - c.tick < kCounterTicks then return c.id end
+    local ships = NavalMix(R)
+    local best, bestV
+    if ships[1] then
+        for t = tech, 1, -1 do
+            for _, sfx in ipairs(kNavalAir[t] or {}) do
+                local id = brain:Bp(sfx)
+                if Valid(id) then
+                    local v = Remastered.AIBuildValue(id, ships)
+                    if v > 0 and (not bestV or v > bestV or (v == bestV and id < best)) then best, bestV = id, v end
+                end
+            end
+        end
+        LOG(string.format('ainaval %d %d T%d pick %s value %.2f vs %d ship types, coast threat %.0f mass', R.army, R.tick,
+            tech, tostring(best), bestV or 0, table.getn(ships), R.coastMass or 0))
+    end
+    R.navalPick[tech] = { tick = R.tick, id = best }
+    return best
+end
+
 -- ---- defences ----
 
 -- the place a defence goes in a zone: the free 2-unit build spot nearest (x, z) (spot order on ties), or nil

@@ -191,4 +191,6 @@ the duels showed. The duels are 1v1 on SETONS_R against FAF's adaptive AI and M2
     modded ship shelled 13,400 mass of our coastal base in 20 minutes with nothing of ours able to reach it. A first
     form of the air answer (the best anti-ship aircraft by build value, sent at ships seen off our coast) halved that
     ship's damage in one game but did not change the 20-minute set: under fog the ships are seen late, and few aircraft
-    reach them. So the navy comes as its own phase, with the air answer as part of it (not yet in the game).
+    reach them. So the navy came as its own phase (phase 10, 2026-10-31), with the air answer inside it: naval
+    factories by our shore while the enemy has ships, ships by build value that defend the coast, attack the nearest
+    ships the estimate favours, else hold. Observed M28 games had about half of its army at sea.

@@ -48,6 +48,10 @@ local kArmyIncomeMax = 120                    -- ... at most this many seconds o
 local kMaxFactories = 20                      -- land factories at most (phase 9; 12 before)
 local kOpening = 6                            -- minutes of the opening (phase 8): the energy rules below hold until then
 local kTechEngineersMax = 8                   -- engineers of T2 or above kept at most (phase 9)
+local kUpgradeIncome = 60                     -- mass a second per extra factory upgrade at once (phase 10)
+local kNavalAirShare = 1.5                    -- anti-ship aircraft kept per mass of enemy ships shelling our coast (10)
+local kNavalAirFactory = 1500                 -- one air factory more per this much enemy ship mass there
+local kNavalPendingTicks = 600                -- a naval factory ordered counts as under way this long before it starts
 local kMassNear = 120                         -- world units: a free mass point this near an engineer comes before reclaim
 
 local fixesApplied = false  -- (one game per sim state: the module lives with the state)
@@ -74,6 +78,10 @@ end
 
 local function Choices()  -- (the build choices of phase 5: counters, defences, investments)
     return import("/lua/remastered/ai/choices.lua")
+end
+
+local function Navy()  -- (the navy of phase 10)
+    return import("/lua/remastered/ai/navy.lua")
 end
 
 AIBrain = Class(StandardBrain) {
@@ -546,6 +554,33 @@ AIBrain = Class(StandardBrain) {
                 return
             end
         end
+        -- the navy (phase 10, navy.lua; before the land factories, which otherwise took every builder at the base):
+        -- naval factories while the enemy has ships we know of or ships shell our coast,
+        -- at the first point from the start toward our home water where one can stand
+        -- (orders not yet started count for kPendingTicks: the builder may still be walking there)
+        local R = self.Remaster
+        local pendingNaval = 0
+        R.navalPending = R.navalPending or {}
+        local keep = {}
+        for _, t in ipairs(R.navalPending) do
+            if R.tick - t < kNavalPendingTicks then
+                table.insert(keep, t)
+                pendingNaval = pendingNaval + 1
+            end
+        end
+        R.navalPending = keep
+        if not isCommander and ctx.navalFactories + pendingNaval < Navy().WantFactories(self) and self:AtBase(u) then
+            local site = Navy().FactorySite(self)
+            if site then
+                self:Claim(site[1], site[2])
+                IssueBuildMobile({ u }, Pos(site[1], site[2]), self:Bp('b0103'), {})
+                ctx.navalFactories = ctx.navalFactories + 1
+                table.insert(R.navalPending, R.tick)
+                LOG(string.format('ainavy %d %d factory ordered at %.0f, %.0f (%d wanted)', self.Remaster.army,
+                    self.Remaster.tick, site[1], site[2], Navy().WantFactories(self)))
+                return
+            end
+        end
         -- land factories (one per ~6 mass / s, at most 12): from minute 3 up to 1 + one per 1.5 minutes whatever is
         -- stored (the army grows with the economy), the rest while mass piles up; before the next far mass point
         local storedMass = self:GetEconomyStoredRatio('MASS')
@@ -666,10 +701,21 @@ AIBrain = Class(StandardBrain) {
         self:ReclaimScan()
         local factories, engineers, commander = {}, {}, nil
         local ctx = { minutes = GetGameTick() / 600, landFactories = 0, upgrading = {}, storages = 0, assistNext = 0,
-            factoryUpgrades = 0, extractorUpgrades = 0, airFactories = 0, landTier = 0, powerCount = 0 }
+            factoryUpgrades = 0, extractorUpgrades = 0, airFactories = 0, landTier = 0, powerCount = 0,
+            navalFactories = 0 }
         -- the enemy's air (choices.lua): our air factories and fighters answer it
         local enemyAir, enemyGround = Choices().EnemyAir(self)
         ctx.wantAir = math.min(4, 1 + math.floor(enemyAir / 1500))
+        -- (phase 10) the air answer to ships shelling our coast: anti-ship aircraft up to kNavalAirShare x the known
+        -- ships' mass there, and an air factory more per kNavalAirFactory of it
+        ctx.navalWanted = kNavalAirShare * (self.Remaster.coastMass or 0)
+        ctx.navalAir = 0
+        for _, u in ipairs(self:GetListOfUnits(categories.AIR * categories.MOBILE * (categories.BOMBER + categories.GROUNDATTACK + categories.ANTINAVY), false)) do
+            if not u.Dead then ctx.navalAir = ctx.navalAir + (u:GetBlueprint().Economy.BuildCostMass or 0) end
+        end
+        if (self.Remaster.coastMass or 0) > 0 then
+            ctx.wantAir = math.min(6, math.max(ctx.wantAir, 1 + math.floor(self.Remaster.coastMass / kNavalAirFactory)))
+        end
         ctx.fighters = enemyAir >= 300 and enemyAir >= 0.3 * (enemyAir + enemyGround)
         local R = self.Remaster
         for _, u in ipairs(self:GetListOfUnits(categories.FACTORY * categories.STRUCTURE, false)) do
@@ -679,6 +725,7 @@ AIBrain = Class(StandardBrain) {
                     ctx.airFactory = true
                     ctx.airFactories = ctx.airFactories + 1
                 end
+                if EntityCategoryContains(categories.NAVAL, u) then ctx.navalFactories = ctx.navalFactories + 1 end
                 if EntityCategoryContains(categories.LAND, u) then
                     ctx.landFactories = ctx.landFactories + 1
                     if Alive(u) then ctx.landTier = math.max(ctx.landTier, self:Tech(u)) end
@@ -710,6 +757,8 @@ AIBrain = Class(StandardBrain) {
             for _, u in ipairs(self:GetListOfUnits(cat * categories.STRUCTURE, false)) do
                 if not u.Dead and u:IsUnitState('Upgrading') then
                     table.insert(ctx.upgrading, u)
+                    if kind == 2 and EntityCategoryContains(categories.AIR, u) then ctx.airUpgrading = true end
+                    if kind == 2 and EntityCategoryContains(categories.NAVAL, u) then ctx.navalUpgrading = true end
                     if kind == 2 then ctx.factoryUpgrades = ctx.factoryUpgrades + 1 end
                     if kind == 1 then ctx.extractorUpgrades = ctx.extractorUpgrades + 1 end
                 end
@@ -761,22 +810,49 @@ AIBrain = Class(StandardBrain) {
                 R.acuHp = hp
                 local q = commander:GetPosition()
                 local tx, tz = R.startX, R.startZ
+                -- (phase 10: with ships shelling our coast, the fallback point is the base zone farthest from them,
+                -- not the start: the start is on the coast on SETONS_R, and FAF's ships killed the commander there)
+                local ct = R.coastThreat and R.coastThreat[1]
+                -- (a base zone with no water beside it when there is one: a farthest zone on another shore lost the
+                -- commander to a submarine's deck gun)
+                if ct and R.baseZones then
+                    local cz0 = Remastered.AIZone(ct.zone)
+                    local bestD, bestInland
+                    for _, z in ipairs(R.baseZones) do
+                        local inland = true
+                        for _, nb in ipairs(Remastered.AIZoneNeighbours(z)) do
+                            if nb.coast then inland = false end
+                        end
+                        local zz = Remastered.AIZone(z)
+                        local dx, dz = zz.x - cz0.x, zz.z - cz0.z
+                        local d = dx * dx + dz * dz
+                        if (inland and not bestInland) or (inland == (bestInland or false) and (not bestD or d > bestD)) then
+                            tx, tz, bestD, bestInland = zz.x, zz.z, d, inland
+                        end
+                    end
+                end
+                -- (phase 10: away from the middle of every enemy within kAcuDanger, not only the nearest, and only onto land
+                -- our engineers reach; the start when that point is not such land or no enemy is near. The duel against
+                -- FAF seed 1001 lost its commander backing away from a land unit into the guns of ships off the coast.)
                 local near = self:GetUnitsAroundPoint(categories.ALLUNITS - categories.WALL, q, kAcuDanger, 'Enemy') or {}
-                local best, bestD
+                local cx, cz, n = 0, 0, 0
                 for _, e in ipairs(near) do
                     if not e.Dead then
                         local p = e:GetPosition()
-                        local dx, dz = p[1] - q[1], p[3] - q[3]
-                        local dd = dx * dx + dz * dz
-                        local id = tonumber(e:GetEntityId()) or 0
-                        if not bestD or dd < bestD or (dd == bestD and id < best.id) then best, bestD = { p = p, id = id }, dd end
+                        cx, cz, n = cx + p[1], cz + p[3], n + 1
                     end
                 end
-                if best then  -- (away from the nearest enemy; the start only when none is near: a ship off the
-                    -- start's coast shelled the commander there)
-                    local dx, dz = q[1] - best.p[1], q[3] - best.p[3]
+                if n > 0 and not ct then
+                    cx, cz = cx / n, cz / n
+                    local dx, dz = q[1] - cx, q[3] - cz
                     local l = math.max(math.sqrt(dx * dx + dz * dz), 1)
-                    tx, tz = q[1] + dx / l * kAcuDanger, q[3] + dz / l * kAcuDanger
+                    local ax, az = q[1] + dx / l * kAcuDanger, q[3] + dz / l * kAcuDanger
+                    local lz = Remastered.AIZoneAt(ax, az, 'land')
+                    if lz > 0 and Remastered.AIZoneDistance(R.startZone, lz, 'land') >= 0 then
+                        local sx, sz = R.startX - cx, R.startZ - cz
+                        -- (the start when it is farther from the enemies than that point)
+                        if sx * sx + sz * sz < (ax - cx) * (ax - cx) + (az - cz) * (az - cz) then tx, tz = ax, az end
+                    end
                 end
                 IssueClearCommands({ commander })
                 IssueMove({ commander }, Pos(tx, tz))
@@ -874,10 +950,23 @@ AIBrain = Class(StandardBrain) {
                 elseif not short or landIndex * 2 <= ctx.landFactories + 1 then
                     IssueBuildFactory({ f }, Choices().LandPick(self, tech), 1)
                 end
+            elseif f:IsIdleState() and EntityCategoryContains(categories.NAVAL, f) then
+                -- (phase 10: the naval factories build ships while ours weigh less than the enemy's: navy.lua)
+                -- (a T1 naval factory due for T2 builds nothing, so its upgrade can start: frigates lost to FAF's
+                -- destroyers, 0.7-1.9 by build value)
+                local due = self:Tech(f) == 1 and ctx.landTier >= 2 and (R.enemyNavalPeak or 0) >= 1000 and
+                    not ctx.navalUpgrading
+                local ship = not due and Navy().FactoryPick(self, self:Tech(f))
+                if ship then IssueBuildFactory({ f }, ship, 1) end
             elseif f:IsIdleState() and EntityCategoryContains(categories.AIR, f) then
+                local naval = ctx.navalWanted > ctx.navalAir and Choices().NavalAirPick(self, self:Tech(f))
                 if scouts < 2 then
                     IssueBuildFactory({ f }, self:Bp('a0101'), 1)
                     scouts = scouts + 1
+                elseif naval then
+                    -- (phase 10: ships shelling our coast: the air answers them first)
+                    IssueBuildFactory({ f }, naval, 1)
+                    ctx.navalAir = ctx.navalAir + (__blueprints[naval].Economy.BuildCostMass or 0)
                 elseif ctx.fighters then
                     IssueBuildFactory({ f }, self:Bp('a0102'), 1)
                 end
@@ -886,6 +975,7 @@ AIBrain = Class(StandardBrain) {
         self:RemasterUpgrades(factories, ctx)
         self:RemasterScouts()
         self:RemasterFighters()
+        self:RemasterNavalStrike()
     end,
 
     -- Tech (phases 4-5): the extractor upgrades are investments by payback against danger (choices.lua, decision
@@ -901,15 +991,40 @@ AIBrain = Class(StandardBrain) {
         -- (phase 8: no gate on stored mass any more, the income thresholds below decide: with the opening's economy
         -- all mass is spent as it comes, the bar sat at 0, and no factory ever went to T2 - so no T2 engineer and no
         -- anti-missile)
-        if ctx.factoryUpgrades > 0 or ctx.landFactories < (rush and 2 or 3) then return end
+        -- (phase 10: up to 1 + one per kUpgradeIncome mass a second of factory upgrades at once, instead of one: with up
+        -- to 20 factories most stayed T1 and made T1 units against M28's T2 / T3 army - counter values of 0.6-0.7)
+        -- (only while the army is not short: more upgrades at once when the army is short cost a game against M28)
+        local maxUpgrades = 1 + (self.Remaster.armyShort and 0 or math.floor(income / kUpgradeIncome))
+        -- (phase 10: with ships shelling our coast and our land at T2, the air factories go to T2 one at a time, for
+        -- gunships and torpedo bombers)
+        -- (phase 10: a naval factory goes to T2 when our land is at T2 and the enemy has 1,000 mass of ships or more)
+        if (self.Remaster.enemyNavalPeak or 0) >= 1000 and ctx.landTier >= 2 and not ctx.navalUpgrading then
+            for _, f in ipairs(factories) do
+                if f:IsIdleState() and EntityCategoryContains(categories.NAVAL * categories.TECH1, f) then
+                    IssueUpgrade({ f }, self:Bp('b0203'))
+                    break
+                end
+            end
+        end
+        if (self.Remaster.coastMass or 0) > 0 and ctx.landTier >= 2 and not ctx.airUpgrading then
+            for _, f in ipairs(factories) do
+                if f:IsIdleState() and EntityCategoryContains(categories.AIR * categories.TECH1, f) then
+                    IssueUpgrade({ f }, self:Bp('b0202'))
+                    break
+                end
+            end
+        end
+        if ctx.factoryUpgrades >= maxUpgrades or ctx.landFactories < (rush and 2 or 3) then return end
+        local started = ctx.factoryUpgrades
         for _, f in ipairs(factories) do
+            if started >= maxUpgrades then return end
             if f:IsIdleState() and EntityCategoryContains(categories.LAND, f) then
                 if EntityCategoryContains(categories.TECH1, f) and (rush or minutes >= 7 and income >= 20) then
                     IssueUpgrade({ f }, self:Bp('b0201'))
-                    return
+                    started = started + 1
                 elseif EntityCategoryContains(categories.TECH2, f) and (rush or minutes >= 14 and income >= 50) then
                     IssueUpgrade({ f }, self:Bp('b0301'))
-                    return
+                    started = started + 1
                 end
             end
         end
@@ -929,15 +1044,44 @@ AIBrain = Class(StandardBrain) {
             end
         end
         if not R.scoutZones[1] then return end
+        -- (phase 10: and from minute 8 the water beside our coast, R.coastWater (operations.lua), so ships that shell
+        -- the base are seen; under fog they had been invisible at sea)
+        local zones = R.scoutZones
+        if R.coastWater and R.coastWater[1] and GetGameTick() >= 4800 then
+            zones = {}
+            for _, z in ipairs(R.scoutZones) do table.insert(zones, z) end
+            for _, z in ipairs(R.coastWater) do table.insert(zones, z) end
+        end
         for _, u in ipairs(self:GetListOfUnits(categories.SCOUT * categories.MOBILE, false)) do
             if Alive(u) and u:IsIdleState() then
                 local best
-                for _, z in ipairs(R.scoutZones) do
+                for _, z in ipairs(zones) do
                     if not best or (R.scouted[z] or -1) < (R.scouted[best] or -1) then best = z end
                 end
                 R.scouted[best] = R.tick
                 local zone = Remastered.AIZone(best)
                 IssueMove({ u }, Pos(zone.x, zone.z))
+            end
+        end
+    end,
+
+    -- The air answer to ships (phase 10): idle bombers, gunships and torpedo bombers attack-move to the coast's water
+    -- zone with the most enemy ground fire (R.coastThreat, operations.lua); with none, they wait at the start.
+    RemasterNavalStrike = function(self)
+        local R = self.Remaster
+        local idle = {}
+        for _, u in ipairs(self:GetListOfUnits(categories.AIR * categories.MOBILE * (categories.BOMBER + categories.GROUNDATTACK + categories.ANTINAVY), false)) do
+            if Alive(u) and u:IsIdleState() then table.insert(idle, u) end
+        end
+        if not idle[1] then return end
+        local t = R.coastThreat and R.coastThreat[1]
+        if t then
+            local zone = Remastered.AIZone(t.zone)
+            IssueAggressiveMove(idle, Pos(zone.x, zone.z))
+            if R.tick - (R.navalLogged or -10000) >= 600 then
+                LOG(string.format('ainaval %d %d strike zone %d with %d aircraft: enemy ships %.0f mass shell our coast',
+                    R.army, R.tick, t.zone, table.getn(idle), t.mass))
+                R.navalLogged = R.tick
             end
         end
     end,
@@ -967,5 +1111,6 @@ AIBrain = Class(StandardBrain) {
     RemasterArmy = function(self)
         import("/lua/remastered/ai/strategy.lua").Think(self)
         import("/lua/remastered/ai/operations.lua").Think(self)
+        Navy().Think(self)
     end,
 }
