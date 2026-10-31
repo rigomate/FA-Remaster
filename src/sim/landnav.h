@@ -34,7 +34,8 @@ struct NavQuery {
   bool result = false;
 };
 struct NavAhead {
-  std::vector<NavQuery> q;
+  // the recorded answers: [b, b + n) of the worker w's array of this round (sim/landnav.cpp LandNavAheadRun)
+  uint32_t w = 0, b = 0, n = 0;
 };
 
 struct LandNav {

@@ -54,9 +54,11 @@ struct NavDryStop {};
 struct NavDry {
   ReadLog* log;
   std::vector<NavQuery>* q;
+  std::vector<const Unit*>* logged;  // (the units logged in this turn: each once)
 };
 struct NavReplay {
-  const std::vector<NavQuery>* q = nullptr;
+  const NavQuery* q = nullptr;  // (n of them)
+  size_t n = 0;
   size_t at = 0;
   bool on = false, verify = false;
   std::string diff;
@@ -67,28 +69,55 @@ thread_local NavReplay* tl_navReplay = nullptr;  // the sim's thread at a turn p
 // What a unit test reads of a unit that the navigators' stage can change (an Execute or the air navigator before
 // the unit's turn): its states (the bit word of UnitStateSet), footprint flags, life, attachment, layer, formation,
 // guard / focus / creator. (Positions, shapes, the grids and the blueprints do not change in this stage.)
+// (one derived read: the fields packed one after another into a fixed record, the layer as its length and its first
+// 16 characters; a longer layer is also read as its string object, as before)
+constexpr size_t kLayerChars = 16;
+void NavPackUnit(const void* obj, void* out) {
+  const Unit* e = static_cast<const Unit*>(obj);
+  unsigned char* o = static_cast<unsigned char*>(out);
+  size_t at = 0;
+  auto put = [&](const void* p, size_t n) {
+    std::memcpy(o + at, p, n);
+    at += n;
+  };
+  put(e->unitStates.bitsAddress(), sizeof(uint64_t));
+  put(&e->altFootprintNav, sizeof e->altFootprintNav);
+  put(&e->altFootprintForced, sizeof e->altFootprintForced);
+  put(&e->dead, sizeof e->dead);
+  put(&e->destroyQueued, sizeof e->destroyQueued);
+  put(&e->immobile, sizeof e->immobile);
+  put(&e->parentId, sizeof e->parentId);
+  put(&e->transport, sizeof e->transport);
+  put(&e->army, sizeof e->army);
+  put(&e->form, sizeof e->form);
+  put(&e->formLeader, sizeof e->formLeader);
+  put(&e->formPathDelay, sizeof e->formPathDelay);
+  put(&e->formRank, sizeof e->formRank);
+  put(&e->guardedId, sizeof e->guardedId);
+  put(&e->focusId, sizeof e->focusId);
+  put(&e->creatorId, sizeof e->creatorId);
+  const uint64_t len = e->layer.size();
+  put(&len, sizeof len);
+  put(e->layer.data(), std::min<size_t>(len, kLayerChars));
+}
+constexpr uint32_t kNavPackBytes = sizeof(uint64_t) + 5 * sizeof(bool) + sizeof(uint32_t) +
+                                   sizeof(std::shared_ptr<struct TransportObj>) + sizeof(Army*) + sizeof(void*) +
+                                   sizeof(uint32_t) + sizeof(int) + sizeof(float) + 3 * sizeof(uint32_t) +
+                                   sizeof(uint64_t) + kLayerChars;
+static_assert(kNavPackBytes <= ReadLog::kMaxDerived, "NavPackUnit");
 void NavLogUnit(ReadLog& log, const Unit* e) {
-  log.Raw(*e->unitStates.bitsAddress());
-  log.Raw(e->altFootprintNav);
-  log.Raw(e->altFootprintForced);
-  log.Raw(e->dead);
-  log.Raw(e->destroyQueued);
-  log.Raw(e->immobile);
-  log.Raw(e->parentId);
-  log.Raw(e->transport);
-  log.Raw(e->army);
-  log.Raw(&e->layer, sizeof e->layer);  // (the layer names are short: their characters are in the string itself)
-  log.Raw(e->form);
-  log.Raw(e->formLeader);
-  log.Raw(e->formPathDelay);
-  log.Raw(e->formRank);
-  log.Raw(e->guardedId);
-  log.Raw(e->focusId);
-  log.Raw(e->creatorId);
+  static_assert(sizeof(*e->unitStates.bitsAddress()) == sizeof(uint64_t), "the state bits");
+  static_assert(sizeof(e->form) == sizeof(void*), "form");
+  log.Derived(NavPackUnit, e, kNavPackBytes);
+  if (e->layer.size() > kLayerChars) log.Raw(&e->layer, sizeof e->layer);
 }
 // (the filters' category caches are made lazily from the sim's blueprints: a turn played ahead that would make one
 // stops; the serial turn makes it)
 void NavDryCandidate(const Unit* e) {
+  // (each unit once a turn: the turn played ahead changes nothing, so a unit's bytes are the same at every test)
+  std::vector<const Unit*>& seen = *tl_navDry->logged;
+  if (std::find(seen.begin(), seen.end(), e) != seen.end()) return;
+  seen.push_back(e);
   NavLogUnit(*tl_navDry->log, e);
   const MotionBlueprint* b = e->motion.bp;
   if (b && e->blueprint && (b->naval < 0 || b->airCat < 0)) throw NavDryStop{};
@@ -106,11 +135,11 @@ void NavEnsureUnitGrid(Sim& sim) {
 bool NavReplayTake(uint8_t kind, uint8_t flags, const float* a, bool* out) {
   NavReplay& r = *tl_navReplay;
   if (!r.on) return false;
-  if (r.at >= r.q->size()) {
+  if (r.at >= r.n) {
     r.on = false;
     return false;
   }
-  const NavQuery& q = (*r.q)[r.at];
+  const NavQuery& q = r.q[r.at];
   if (q.kind != kind || q.flags != flags || std::memcmp(q.a, a, sizeof q.a) != 0) {
     r.on = false;
     return false;
@@ -136,6 +165,7 @@ struct LandNavState {
   std::unique_ptr<HPathTables> tables;
   double exec = 0, work = 0, deliver = 0, bg = 0;  // MOHO64_PROFILE: seconds, printed when the sim goes
   double stageExec = 0;                            // (this beat's navigator stages so far)
+  std::vector<std::vector<NavQuery>> aheadQ;  // MOHO64_PAR_NAV: the round's recorded answers, one array a worker
   uint64_t n = 0;
   ~LandNavState() {
     if (getenv("MOHO64_PROFILE")) {
@@ -1398,6 +1428,11 @@ static void LandNavAheadRun(Sim& sim, const std::vector<Unit*>& all) {
   // (MOHO64_PAR_NAV_GRAIN: navigators per task; 8 by default: a turn's cost varies a lot, B3-16k's longest task was
   // 17 ms with 64 and 7 ms with 8, the stage's wall 6.4 -> 2.9 s)
   static const size_t grain = getenv("MOHO64_PAR_NAV_GRAIN") ? std::max(1L, atol(getenv("MOHO64_PAR_NAV_GRAIN"))) : 8;
+  // (the recorded answers: one array a worker for the round, its capacity kept)
+  LandNavState& ns = LNS(sim);
+  if (ns.aheadQ.size() < static_cast<size_t>(sim.workers().Threads()) + 1)
+    ns.aheadQ.resize(static_cast<size_t>(sim.workers().Threads()) + 1);
+  for (auto& q : ns.aheadQ) q.clear();
   spec.Run(sim.workers(), "navigators' unit tests ahead", tick, items.size(), grain,
            [&](size_t i, ReadLog& log, NavAhead& out) {
              Unit* u = items[i];
@@ -1407,17 +1442,23 @@ static void LandNavAheadRun(Sim& sim, const std::vector<Unit*>& all) {
                scratch.startedThisTick = false;
                scratch.prevPos = u->position;
              }
-             out.q.clear();
+             std::vector<NavQuery>& q = ns.aheadQ[static_cast<size_t>(tl_specWorker)];
+             out.w = static_cast<uint32_t>(tl_specWorker);
+             out.b = static_cast<uint32_t>(q.size());
+             static thread_local std::vector<const Unit*> logged;
+             logged.clear();
+             logged.push_back(u);
              log.Raw(sim.entityGrid().version(0));
              NavLogUnit(log, u);
-             NavDry d{&log, &out.q};
+             NavDry d{&log, &q, &logged};
              tl_navDry = &d;
              try {
                UpdateCurrentPosition(sim, u, scratch);
              } catch (const NavDryStop&) {
              }
              tl_navDry = nullptr;
-             return !out.q.empty();
+             out.n = static_cast<uint32_t>(q.size()) - out.b;
+             return out.n > 0;
            });
 }
 
@@ -1451,7 +1492,8 @@ void LandNavTickUnits(Sim& sim, const std::vector<Unit*>& all) {
         navSpec.active() && u->navSpecRound == sim.tick() ? navSpec.Take(u->navSpecItem) : nullptr;
     NavReplay replay;
     if (ahead) {
-      replay.q = &ahead->q;
+      replay.q = LNS(sim).aheadQ[ahead->w].data() + ahead->b;
+      replay.n = ahead->n;
       replay.on = true;
       replay.verify = navSpec.mode() == SpecMode::kVerify;
       tl_navReplay = &replay;

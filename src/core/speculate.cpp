@@ -35,15 +35,18 @@ void ReadLog::Derived(Reader r, const void* obj, uint32_t n) {
   }
   std::memset(tmp, 0, n);
   r(obj, tmp);
-  e_.push_back({r, obj, static_cast<uint32_t>(bytes_.size()), n});
-  bytes_.insert(bytes_.end(), tmp, tmp + n);
+  Arena& A = a_ ? *a_ : own_;
+  A.e.push_back({r, obj, static_cast<uint32_t>(A.bytes.size()), n});
+  A.bytes.insert(A.bytes.end(), tmp, tmp + n);
+  ++n_;
 }
 
 bool ReadLog::Holds(size_t* first) const {
   unsigned char tmp[kMaxDerived];
-  for (size_t i = 0; i < e_.size(); ++i) {
-    const Entry& e = e_[i];
-    const unsigned char* was = bytes_.data() + e.off;
+  const Arena& A = a_ ? *a_ : own_;
+  for (size_t i = 0; i < n_; ++i) {
+    const Entry& e = A.e[e0_ + i];
+    const unsigned char* was = A.bytes.data() + e.off;
     bool same;
     if (!e.r) {
       same = std::memcmp(e.p, was, e.n) == 0;
