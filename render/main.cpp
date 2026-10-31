@@ -111,6 +111,9 @@
 //           factory (ueb0101, or <from>) at x, z by the cheats' CreateUnit, and `after` beats later (30) it is ordered to
 //           upgrade to its T2 (ueb0201, or <to>) by the simulation's IssueUpgrade (to measure what the upgrade costs); may be
 //           given several times
+// --orders <file>  [r7] with --session: the engine's orders file's "<beat> lua <one line>" lines, each run in the
+//           simulation's state before that beat (its other verbs are not read: a benchmark's set-up, as the engine's
+//           B3 makes its two armies and orders them at each other, docs/benchmarks.md)
 // --noicons, --icon-scale <n>  strategic icons: off, or n screen pixels for each of a symbol's (key I switches them)
 // --ao      ambient occlusion in the modern look: 0 off to 1 full (key O switches it)
 // --msaa    anti-aliasing: samples per pixel of the scene, 1 (off), 2, 4 (the default) or 8
@@ -642,6 +645,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <functional>
 #include <memory>
 #include <string>
@@ -956,6 +960,7 @@ struct Options {
   int pingAt = 0;                                // [pings] --ping
   double hitchLog = -1;                          // [hitches] --hitch-log (below 0: off)
   std::vector<LiveSim::Setup::Upgrade> upgrades;  // [hitches] --upgrade-test
+  std::vector<std::pair<uint32_t, std::string>> luaOrders;  // [r7] --orders
   bool minimapMeshes = false;                    // [pings] --minimap-meshes
   bool minimapResources = true;                  // [minimap deposits] --no-minimap-resources
   int minimapTest = 0, minimapTestSize = 300;    // [spikes] --minimap-test
@@ -1509,6 +1514,18 @@ bool ParseOptions(int argc, char** argv, Options* o) {
       if (from[0] && to[0]) u.from = from, u.to = to;
       o->upgrades.push_back(u);
     }
+    else if (a == "--orders") {  // [r7] the "lua" lines of an orders file
+      std::ifstream f(v);
+      if (!f) return false;
+      std::string line;
+      while (std::getline(f, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        int beat = 0, at = 0;
+        char what[16] = "";
+        if (sscanf(line.c_str(), "%d %15s %n", &beat, what, &at) >= 2 && !strcmp(what, "lua") && at > 0)
+          o->luaOrders.push_back({static_cast<uint32_t>(beat), line.substr(at)});
+      }
+    }
     else if (a == "--pause-at") o->pauseAt = atoi(v);  // <beat>: the commander of --enhance's army is paused then
     else if (a == "--enhance") {  // <beat>,<army>,<enhancement>: that army's commander is ordered to build it then
       char name[128] = "";
@@ -1824,6 +1841,7 @@ int main(int argc, char** argv) {
     setup.pauseAt = static_cast<uint32_t>(std::max(opt.pauseAt, 0));
     setup.pingAt = static_cast<uint32_t>(std::max(opt.pingAt, 0));  // [pings]
     setup.upgrades = opt.upgrades;  // [hitches] --upgrade-test
+    setup.lua = opt.luaOrders;      // [r7] --orders
     live.SetFocusArmy(opt.focus);
     picture.SetVulkan(opt.vulkan);
     picture.SetDebug(opt.debug);  // (photomode: the validation layer for the pixel interface's device too)

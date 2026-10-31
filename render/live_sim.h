@@ -61,6 +61,9 @@ class LiveSim {
       bool seen = false;  // (the upgrade stands there)
     };
     std::vector<Upgrade> upgrades;
+    // [r7] For tests of a new game: Lua run in the simulation's state before a beat (beat -> its lines, in order), as the
+    // engine's --orders "lua" lines (a benchmark building its case: the engine's B3 makes its armies and orders them so)
+    std::vector<std::pair<uint32_t, std::string>> lua;
   };
   enum class State { Loading, Running, Ended, Failed };
 
