@@ -387,6 +387,8 @@ void UserState::Frame(double seconds) {
         Logf(LogLevel::Warning, "Error running '/lua/ui/uimain.lua:UpdateDisconnectDialog': %s", lua_tostring(L, -1));
     }
     lua_settop(L, top);
+  } else if (!speedNotes.empty()) {
+    DeliverSpeedNotes(state_->L());  // (a local game's or a replay's speed changes: as a network game's, above)
   }
   // The original's frame (CScApp::Main 0x8d1470, READ): WLD_Frame (0x8d1af6: the session's frame, its beats and their
   // OnSync), the cameras (RCamManager::Frame 0x8d1b52), the user Lua state's script threads (its CTaskStage, the

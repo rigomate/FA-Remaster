@@ -284,6 +284,7 @@ class UserState {
   uint64_t syncCount = 0;  // the beats' syncs delivered so far (what was asked before one is old after it)
   float economyCopy[12] = {};
   std::string focusNickname;  // the focus army's player name (GetSessionClients)
+  std::vector<int> speedNotes;  // a local game's or a replay's speeds asked for since the last frame (SetGameSpeedTo)
   int focusArmyCopy = -1;     // the simulation's focusArmy, 0-based (GetFocusArmy)
   uint32_t tickCopy = 0;      // its tick (GameTick, GameTime, GetGameTimeSeconds, GetGameTime)
   // The part of a tick the game's clock is past the last sync (0..1), as the original's session keeps
@@ -913,6 +914,7 @@ void SelectionOrdersItself(lua_State* L, bool destroy);
 void DeliverChat(lua_State* L);
 // A network game's NetEvents since the last frame to its scripts (session_bindings.cpp).
 void DeliverNetEvents(lua_State* L);
+void DeliverSpeedNotes(lua_State* L);  // (a local game's or a replay's: uimain.NoteGameSpeedChanged)
 // CWldSession::RequestFocusArmy with its checks (session_bindings.cpp): a 0-based army, or -1 for none; for the Lua
 // SetFocusArmy and the console's SetFocusArmy.
 void RequestFocusArmyChecked(lua_State* L, int wanted);

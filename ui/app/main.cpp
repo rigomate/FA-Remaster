@@ -494,6 +494,8 @@ int main(int argc, char** argv) {
   session.fastForwardTo = fastForward;
   session.wantPicture = !noWorld;
   session.waitForWindow = windowed && directWindow;  // (a launched table's picture opens on the window)
+  // (the game's time at the PC's clock: a window, or MOHO64UI_REAL_TIME below; then a local game measures its maxSP)
+  session.paceByClock = windowed || std::getenv("MOHO64UI_REAL_TIME") != nullptr;
   // A game in a window: its simulation on all the machine's cores (the engine, Chris's item 20: his snapshot games ran
   // one thread, as MOHO64_THREADS was unset; the result is the same beat for beat). MOHO64_THREADS, when set, decides.
   if (windowed && !std::getenv("MOHO64_THREADS")) session.simThreads = static_cast<int>(std::thread::hardware_concurrency());  // (0 if unknown: as unset)

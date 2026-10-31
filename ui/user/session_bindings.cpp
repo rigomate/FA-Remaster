@@ -111,8 +111,9 @@ int l_Zero(lua_State* L) {
 }
 // GetGameSpeed() (FA exe 0x88e260: the client manager's slot 15, GetSimRateRequested 0x53e7e0) and
 // GetSimRate() (0x843920: slot 14, GetSimRate 0x53e720): how much faster or slower than normal the
-// game is asked to run, and runs, in the steps the speed keys count. They differ in a network game
-// only: there every client's maxSP (message 57) holds the speed run down.
+// game is asked to run, and runs, in the steps the speed keys count. They differ when a client's
+// maxSP (message 57: the sim driver's measure of its PC's speed) holds the speed run down: in a
+// network game every client's, in a local game or a replay this program's own (GamePace).
 int l_GetGameSpeed(lua_State* L) {
   lua_pushnumber(L, GameSpeedOf(L));
   return 1;
@@ -521,7 +522,8 @@ int l_GetSessionClients(lua_State* L) {
   }
   lua_newtable(L);
   lua_newtable(L);
-  SetField(L, "maxSP", static_cast<lua_Number>(50));
+  const GamePace* pace = user->config().pace;  // (the local client's +0xd4: 50 until our first measure, MaxSimRate)
+  SetField(L, "maxSP", static_cast<lua_Number>(pace ? pace->maxSP : 50));
   SetField(L, "name", name);
   SetField(L, "connected", true);
   SetField(L, "local", true);
@@ -921,11 +923,40 @@ int GameSpeedOf(lua_State* L) {
 // the rate changes once the clients agree on it, GameSession takes it from the exchange each frame. INFERRED: the
 // original's check before it, 0x88e3aa (a player who has an army, or a session whose byte +0x486 is off), is left
 // out: every client may ask.)
+// A local game or a replay goes the same way in the original, with its one local client: SetSimRate (where +0x454,
+// adjustable: the single player's CLIENT_CreateClientManager(1, 0, 0, 1) at 0x88bcb9 and the replay's (2, 0, 0, 1) at
+// 0x876c14 make it so) broadcasts SPEED, the local client takes it as its own (CLocalClient::Process 0x53d190 ->
+// CClientBase::Process; a replay's CReplayClient::Process drops it), ApplyIncomingGameSpeedRequest 0x53e810 sets the
+// speed asked for (+0x450) and tells the interface (slot 3: CWldUiInterface, set for every session by DoPreload at
+// 0x88bf86): uimain.NoteGameSpeedChanged(client + 1, rate), handed to the main thread for later (DeliverSpeedNotes).
+// The speed run is then the smaller of it and the clients' maxSP (GamePace::LocalRate). (Those games' +0x454 is always
+// on in the original, whatever the game option GameSpeed; ours keeps the option's gate as before, GamePace::adjustable.)
 void SetGameSpeedTo(lua_State* L, int rate) {
   UserState* user = UserState::From(L);
   if (NetGameLink* net = user->config().net) return net->RequestSpeed(rate);
   GamePace* pace = user->config().pace;
-  if (pace && pace->adjustable) pace->rate = pace->asked = rate;
+  if (!pace || !pace->adjustable) return;
+  pace->asked = rate;
+  pace->rate = pace->LocalRate();
+  user->speedNotes.push_back(rate);
+}
+
+// A local game's or a replay's speed changes since the last frame (SetGameSpeedTo) to its scripts:
+// uimain.NoteGameSpeedChanged(client + 1, rate) as in a network game (DeliverNetEvents), which the speed display
+// (score.lua / objectives2.lua: "(asked / run)" with GetSimRate) and a replay's speed slider read. The client is the
+// local one: 1 in a local game; in a replay the original's is 2 (its CReplayClient is client 0, the local one, "Local",
+// client 1: VCR_SetupReplaySession 0x876c45 / 0x876c9e), but ours lists that one client only (GetSessionClients), so 1.
+void DeliverSpeedNotes(lua_State* L) {
+  UserState* user = UserState::From(L);
+  if (user->speedNotes.empty()) return;
+  std::vector<int> notes;
+  notes.swap(user->speedNotes);
+  if (!user->HasSim()) return;
+  for (int rate : notes) {
+    lua_pushnumber(L, 1);
+    lua_pushnumber(L, static_cast<lua_Number>(rate));
+    CallModule(L, "/lua/ui/uimain.lua", "NoteGameSpeedChanged", 2);
+  }
 }
 
 void IconColorsForWorld(lua_State* L, std::vector<uint32_t>* out) {

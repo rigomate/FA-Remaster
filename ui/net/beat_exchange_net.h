@@ -21,7 +21,7 @@
 //   55 CHAT {the message} (CClientBase::ReceiveChat 0x53c9a0 sends, Process 0x53c228 hands it to the interface).
 //   56 GAME SPEED {i32 serial, i32 rate} (SetSimRate 0x53e590, ApplyIncomingGameSpeedRequest 0x53e810).
 //   57 {i32}: the sender's own most sim speed ("maxSP", client+0xd4): BroadcastIntParam 0x53e850, called by the sim
-//      driver after each beat that is not paused when its measure changed (0x129004e; GameSession::NetMaxSimRate); the
+//      driver after each beat that is not paused when its measure changed (0x129004e; GameSession::MaxSimRate); the
 //      game runs at the smaller of the speed asked for and every connected client's value (GetSimRate 0x53e720).
 // And one of ours, not the original's (we are not network-compatible with it or FAF; its types end at 57):
 //   60 DESYNC PARTS {the bytes the game gives}: after a checksum differs, this copy's parts of that beat's state to the

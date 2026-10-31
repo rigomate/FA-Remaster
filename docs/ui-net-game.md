@@ -105,13 +105,34 @@ A measure of each PC's speed, so that the game runs no faster than its slowest c
   50 for it until its first (CClientBase ctor 0x53be07; FAF's dialog shows it as `maxSP`).
 - The copies' values differ (each PC's own); their simulations never do: the speed is not in the sim's state. The rate
   run follows a client's value a round trip later on the others.
-- Ours (GameSession::NetMaxSimRate): the beat's time from its orders taken (NetBeatOrders) to the end of its tick
-  (NetDigest, on whichever thread ran it); the original's span also holds the sync's making, which ours does after
+- Ours (GameSession::MaxSimRate): the beat's time from its orders taken (NetBeatOrders) to the end of its tick
+  (NoteBeatTime, on whichever thread ran it); the original's span also holds the sync's making, which ours does after
   (TakeBeatSync). The test game on Seton's measures 27-28 (beats of about 0.16 ms). A test's switch,
   `moho64ui_NetTestForTests("maxsp", 0, "<n>")` ("": measured again), sends a value in place of the measure.
-- The original measures in a single-player game too (INFERRED from the shared code, not run: the same sim driver and
-  client manager, with one local client), so there the speed run follows the PC's own measure. Ours does not, yet
-  (GetSessionClients shows 50 there, GetSimRate the speed asked for).
+- The original measures in a single-player game and in a replay too (spmaxsp, 2026-10-31; READ, not run): the sim
+  driver's Dispatch (0x73c250 -> 0x73c393) asks nothing of the clients, and the path above only the pause. A
+  single-player session's client manager has one client, the local one (WLD_SetupSessionInfo 0x88cbc0 -> 0x88bbb0:
+  CLIENT_CreateClientManager(1, 0, 0, 1) at 0x88bcb9, CreateLocalClient at 0x88bceb); a replay's has two
+  (VCR_SetupReplaySession: CLIENT_CreateClientManager(2, 0, 0, 1) at 0x876c14, CreateReplayClient, client 0, at
+  0x876c45, CreateLocalClient "<LOC Engine0031>Local", client 1, at 0x876c9e). Message 57 goes to every client's
+  Process (0x53e990): the local one takes it as its own (CLocalClient::Process 0x53d190 -> CClientBase::Process: its
+  +0xd4); a CReplayClient drops it (CReplayClient::Process 0x53d99c: every type above 53), so its +0xd4 stays 50.
+  GetSimRate 0x53e720 is the same loop with one client or two: a local game runs at min(asked, ours), a replay at
+  min(asked, 50, ours). Both games are made with the speed adjustable (the last argument, +0x454) and the interface
+  set (DoPreload 0x88bf86: SetUIInterface), so SetGameSpeed there too broadcasts SPEED to the local client, and
+  ApplyIncomingGameSpeedRequest 0x53e810 calls uimain.NoteGameSpeedChanged(local client + 1, rate): FAF's score panel
+  shows "(asked / run)" from it and GetSimRate (score.lua `_OnBeat`, objectives2.lua), and a replay's speed slider
+  follows it. FAF's interface has no other sign of a lowered speed (no message: READ in uimain.lua, score.lua,
+  objectives2.lua, gamemain.lua `OnBeat`, which only throttles its beat functions above 0).
+- Ours since spmaxsp: the measure (GameSession::measure_) is the same in every game. A local game's or a replay's
+  value goes to GamePace::maxSP (GetSessionClients' maxSP) and the speed run is GamePace::LocalRate (min(asked, maxSP),
+  and 50 in a replay); SetGameSpeed there queues uimain.NoteGameSpeedChanged for the next frame (DeliverSpeedNotes;
+  the client 1: ours lists a replay's local client alone, where the original's is its second). Ours, not the
+  original's: (1) a local game or a replay measures only at the PC's clock (a window, or MOHO64UI_REAL_TIME): a
+  headless run's stepped frames wait for their beats, so the PC always keeps up, and the tests stay the same on a busy
+  machine; a network game measures as before; (2) the beats behind the loading screen (the first beat and RunAhead's,
+  M28's start among them) are not measured, so the game does not start slowed by the stall moved there; (3) a test's
+  switch, MOHO64UI_FORCE_MAXSP=<n>, puts n in place of the measure in a local game or a replay from its start.
 
 ## Observers and three players (net6)
 

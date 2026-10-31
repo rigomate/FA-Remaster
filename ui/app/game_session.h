@@ -5,6 +5,8 @@
 // then runs its beats, ten a second. There is no in-game interface yet and nothing is drawn of the
 // world: the host only reports that the simulation runs.
 #pragma once
+#include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <functional>
@@ -324,6 +326,10 @@ class GameSession {
   // touches the simulation (the interface's scripts and input, orders, sounds, sync) waits until
   // it is done: while BeatRunning(), the window only shows frames.
   bool beatsOnThread = false;
+  // The game's time follows the PC's clock (a window, or MOHO64UI_REAL_TIME): only then does a local game or a replay
+  // measure its maxSP (MaxSimRate). A headless run steps its frames, each waiting for its beats, so its PC always keeps
+  // up (and the run stays the same on a busy machine).
+  bool paceByClock = false;
   // The simulation's worker pool (core/workers.h ThreadsOverride, when the Sim is made): 0 leaves it to MOHO64_THREADS
   // (1 when unset: the headless tests' way, many at once). A game in a window takes the machine's cores (main.cpp).
   int simThreads = 0;
@@ -483,7 +489,23 @@ class GameSession {
   bool NetBeatOrders(std::string* merged);  // (the next beat's merged orders, or false: wait)
   void NetDigest();                         // (right after that beat, on its thread: the digest of a 50th beat)
   void NetAfterBeat();                      // (then here: the digest to the lockstep, desyncs to the dialog)
-  void NetMaxSimRate();                     // (and message 57: this program's maxSP, when it changed)
+  // This program's maxSP, in every game (the original's sim driver after each dispatch, CSimDriver+0x1b8..+0x228): each
+  // beat's time not paused, from its orders taken (BeatOrdersTaken) to the end of its tick (NoteBeatTime, on the
+  // thread that ran it; -1: paused, or none), the last 24 kept (RollingFloat<25>, +0x1b8, its first / next at +0x220
+  // / +0x224), the value sent last (+0x228: 10 at the start, CSimDriver ctor 0x73b767), and a test's value in place of
+  // the measure (a network game's moho64ui_NetTestForTests("maxsp"), a local game's MOHO64UI_FORCE_MAXSP).
+  struct SpeedMeasure {
+    std::chrono::steady_clock::time_point ordersTakenAt{};
+    double beatMs = -1;
+    std::array<float, 25> beatTimes{};
+    int first = 0, next = 0;
+    int sent = 10;
+    bool forced = false;
+  };
+  SpeedMeasure measure_;
+  void BeatOrdersTaken() { measure_.ordersTakenAt = std::chrono::steady_clock::now(); }
+  void NoteBeatTime();   // (right after the beat's tick, on its thread)
+  void MaxSimRate();     // (then here: into the ring; when the value changed, message 57 or the local pace)
   // (ours, after a desync: this copy's parts of that beat to the client whose checksum differs, and a client's parts
   // compared with ours: which parts differ, on the console, in the log and in <replay>.desync.txt)
   void NetSendParts(uint8_t client, uint32_t beat);

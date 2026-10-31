@@ -1244,9 +1244,14 @@ moho64ui --init <the game's init .lua> [--mods uids.txt] [--prefs <our preferenc
   `SetGameSpeed`, `GetGameSpeed`, and the console commands `WLD_IncreaseSimRate`,
   `WLD_DecreaseSimRate`, `WLD_ResetSimRate`, `WLD_GameSpeed <n>` with the original's bounds (-10
   to 50) are built. As in the original the speed only changes where the game's option
-  `GameSpeed` is "adjustable" ("fast" starts at 4, "normal" stays). `GetSimRate` gives the speed
-  asked for, not the speed the simulation manages; at high speeds the host runs at most ten
-  beats a frame. The game's clock in seconds (`GameTime`, `GetGameTimeSeconds`, `GetGameTime`)
+  `GameSpeed` is "adjustable" ("fast" starts at 4, "normal" stays). `GetGameSpeed` gives the
+  speed asked for, `GetSimRate` the speed run: as in the original, in every game the smaller of
+  the speed asked for and each client's maxSP, the sim driver's measure of its PC's speed (the
+  median of the last beats' times; a local game's or a replay's own, a network game's every
+  client's: `docs/ui-net-game.md`, "maxSP"); a change of speed reaches the game's scripts
+  (uimain.NoteGameSpeedChanged, the score panel's "(asked / run)"). A headless run's stepped
+  frames measure nothing (`MOHO64UI_FORCE_MAXSP=<n>` puts a value in its place, for tests); at
+  high speeds the host runs at most ten beats a frame. The game's clock in seconds (`GameTime`, `GetGameTimeSeconds`, `GetGameTime`)
   is the last sync's tick plus the part of the next tick gone by since, as the original's session
   keeps it (CWldSession+0x460, SessionFrame 0x895b40): it runs smoothly between beats, stands a
   tenth past the last tick while paused, and goes on from there; `GameTick()` is the last sync's

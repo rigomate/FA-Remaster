@@ -166,10 +166,20 @@ struct WorldScene {
 // normal: WLD_GetSimRate 0x88d0b0), and whether the players may change it (the game option
 // GameSpeed = "adjustable"; "fast" starts at 4). `rate` is the speed run (GetSimRate, the client
 // manager's slot 14, 0x53e720), `asked` the speed asked for (GetGameSpeed, slot 15, 0x53e7e0);
-// the same except in a network game, where every client's maxSP holds `rate` down (message 57).
+// `rate` is the smaller of `asked` and every client's maxSP (message 57, the sim driver's measure
+// of the PC's speed): in a network game the host takes both from the exchange; in a local game or
+// a replay the one local client's is `maxSP` (CClientBase+0xd4: 50 until the first measure sent),
+// and a replay's CReplayClient keeps 50 (its Process takes no message 57: CReplayClient::Process
+// 0x53d99c drops every type above 53), so LocalRate().
 struct GamePace {
   int rate = 0;
   int asked = 0;
+  int maxSP = 50;       // (a local game or a replay: this program's own, GameSession::MaxSimRate)
+  bool replay = false;  // (a replay: its CReplayClient's 50 holds the rate down too)
+  int LocalRate() const {
+    const int r = asked < maxSP ? asked : maxSP;
+    return replay && r > 50 ? 50 : r;
+  }
   bool adjustable = false;
   bool ended = false;  // SessionEndGame has been asked for (the simulation stands from the next beat on)
 };
