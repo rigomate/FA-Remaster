@@ -1,5 +1,9 @@
 // Units, weapons, props and platoons: the engine objects that scripts create and drive.
 #pragma once
+#include <atomic>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <map>
 #include <memory>
@@ -189,11 +193,45 @@ class UnitStateSet {
   uint64_t bits_ = 0;
 };
 
+// A unit's or projectile's layer name ("Land", "Air", "Water", "Sub", "Seabed", ...): a std::string and nothing more (the
+// same object, the same bytes: landnav.cpp's read log takes them raw), whose compare with a string literal takes the
+// literal's length from its type: a length test and a compare of those bytes, instead of the library's strlen of the
+// literal before its compare. The same answer for every string (speed only, 2026-10-31: the layer tests' strlen and
+// compares were about 1% of B1's beat time). A compare with anything else (another layer, a const char* constant, a
+// std::string) is the library's. MOHO64_VERIFY_LAYER=1: every literal compare is also made the library's way and the
+// two answers compared; the counts go to stderr at exit (sim.cpp).
+inline const bool g_verifyLayer = std::getenv("MOHO64_VERIFY_LAYER") != nullptr;
+inline std::atomic<uint64_t> g_layerChecked{0}, g_layerMismatches{0};
+struct LayerString : std::string {
+  using std::string::string;
+  using std::string::operator=;
+  LayerString(const std::string& s) : std::string(s) {}
+  LayerString(std::string&& s) : std::string(std::move(s)) {}
+  template <size_t N>
+  bool Is(const char (&lit)[N]) const {
+    const bool r = size() == N - 1 && std::memcmp(data(), lit, N - 1) == 0;
+    if (g_verifyLayer) [[unlikely]] {
+      g_layerChecked.fetch_add(1, std::memory_order_relaxed);
+      if (r != (static_cast<const std::string&>(*this) == static_cast<const char*>(lit)))
+        g_layerMismatches.fetch_add(1, std::memory_order_relaxed);
+    }
+    return r;
+  }
+};
+template <size_t N>
+bool operator==(const LayerString& a, const char (&lit)[N]) { return a.Is(lit); }
+template <size_t N>
+bool operator!=(const LayerString& a, const char (&lit)[N]) { return !a.Is(lit); }
+template <size_t N>
+bool operator==(const char (&lit)[N], const LayerString& a) { return a.Is(lit); }
+template <size_t N>
+bool operator!=(const char (&lit)[N], const LayerString& a) { return !a.Is(lit); }
+
 class Unit : public Entity {
  public:
   Unit() { typeBits |= kTypeUnit; }
   const UnitBpData* bpData = nullptr;
-  std::string layer = "None";
+  LayerString layer = "None";
   std::vector<UnitWeapon*> weapons;
   // The attacker's task stage (attacker+0x44): each weapon's fire task (false) and acquire task (true), in the
   // order they run. A fire thread that was suspended goes to the end when it is woken (WakeFireThread).
@@ -434,7 +472,7 @@ class Projectile : public Entity {
   Projectile() { typeBits |= kTypeProjectile; }
   Entity* launcher = nullptr;
   Vec3 velocity;  // units per second
-  std::string layer = "None";
+  LayerString layer = "None";
   // Motion (sim/projectile.cpp; the original's Projectile, ctor 0x69afe0)
   Vec3 angVel, scaleVel;
   // The size its mesh is drawn at, per axis (the original's entity scale, +0x84): UniformScale +- MeshScaleRange
