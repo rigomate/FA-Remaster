@@ -88,6 +88,7 @@ client's slot 8 (CHAT 55; this program's own back to itself).
 
 CWldSession::DoBeat 0x894530: for a sync with desyncs, one string per desync record (the client's name, 0x895364),
 GPGNET_ReportDesync, then UI_ShowDesyncDialog (0x895434) -> uimain.ShowDesyncDialog(the session's beat, strings).
+Ours makes the same call (GameSession::NetAfterBeat), then goes past the original: see "A desync's parts" below.
 
 ## FAF's /lua/ui/dialogs/disconnect.lua (build 3839), left as it is
 
@@ -151,3 +152,74 @@ Its own beats go out by the clock: the same thread compares now with the time of
 due (0x73c03a..0x73c10d, at most min(2000 / ms per beat, 99) beats past the last sync), else sleeps until the next is
 due. So the original too sends a beat's orders net_Lag ahead and runs it only when everyone has ACKed it; INFERRED (not
 measured): it waits likewise once the round trip nears net_Lag. Nothing is changed in the game's code for this.
+
+## A desync's parts (ours, not the original's; Chris approved, 2026-10-30)
+
+The original's desync dialog says only that the copies differ, and at which beat. Ours also says WHICH PART of the game's
+state differs and from about which beat: a step towards the debugger Chris wants after multicore.
+
+- **The parts.** Every 50th beat, beside its digest, each program keeps the state line the digest is made of (the
+  engine's `Fingerprint::StateLine` without its lua part: one 64-bit hash per part, `rng`, `sim`, `a<N>` per army,
+  `u<N>` per army's units, `proj`, `props`, `ents`; sim/fingerprint.h), for 300 beats. And every beat a pulse: the
+  random draws so far, the number of units and of projectiles (three numbers read; 128 beats kept). Both are made in
+  `GameSession::NetDigest` on the thread that ran the beat. Nothing else is computed on the other beats.
+- **The cost.** LockstepDigest makes the same line and does not hand it out, so the line is made twice on a checksum
+  beat: 0.3-0.5 ms more each 50th beat in the 2-player test game on Seton's (the digest itself 0.5-0.9 ms there; the
+  engine's estimate for a big game is 1-5 ms). The engine change asked for: `LockstepDigest(sim, beat,
+  std::string* line = nullptr)` (or a `LockstepDigestOfLine(line)`), so the line is made once.
+- **The exchange.** When the lockstep finds a client's checksum differs (Lockstep::desyncs()), this program sends that
+  client message 60, DESYNC PARTS (ours: `net/beat_exchange_net.h`; the original's index table 0x53c344 sends a type 60
+  to its default case 0x53c2df, as every type past 57 but 202 / 203): the checksum beat, the pulses of the beats since
+  the checksum beat before, and its state line. Each side compares what came with its own (`NetCompareParts`).
+- **What the player sees.** FAF's dialog stays as it is, called as before. Our line comes a round trip later, on the
+  console (shown on the game's screen by FAF's consoleecho, as the original's "%s disconnected." is, and kept in the
+  console window), for the game's first desync with each client:
+  `Desync at beat 250 with Host: Joiner's economy (army 2) differs (first between beats 201 and 250)`.
+  The parts in words: the random numbers; the game's own state (orders, path searches, pause); <player>'s economy
+  (army N); <player>'s units (army N); the projectiles; the props (wrecks, trees, rocks); the other entities
+  (shields, beams, blips); the game's tick. More than six: the first five "and N more parts". None: "every part of the
+  state is the same; only the checksums differ". FAF's dialog's text box is a local of desync.lua, which a hook cannot
+  reach, and the parts come after the dialog opened: so the console, not the dialog (a dialog line would need FAF's
+  file changed, or a dialog of ours).
+- **"First between beats A and B".** The checksum beat before was the same (or the desync would have been found
+  there), so the difference began after it: A = that beat + 1. B is the first beat whose pulse differs, else the
+  checksum beat. A = B: "first at beat A". A later desync with the same client says "out of step since beat <the
+  first>" (log and file only).
+- **Files** (beside the game's record, `--replay-out`, else beside the replay: `replays/<profile>/LastGame.*`, so the
+  next game's desync overwrites them as the next game overwrites the replay): `<base>.desync.txt` (every desync as this
+  copy saw it: the line, both state lines, the first pulse that differs) and this copy's full listing of the next
+  checksum beat after the game's first desync, `<base>.desync.fp.detail.<beat>` (the engine's listing,
+  MOHO64_FINGERPRINT_DETAIL: one line per army, unit, projectile, prop and entity; `<base>.desync.fp` holds that beat's
+  line). Two players' files of one game compare line by line. Not the listing of the desync's own beat: its state is
+  gone when the desync is found (a few beats later), and keeping a listing every 50 beats costs too much. Both copies
+  find it within a few beats of the checksum beat, so both list the same next checksum beat. The engine's class is made
+  from the environment for that moment (as StartSession does for the record's fingerprint); the engine change asked
+  for: `Fingerprint::WriteDetail` public and static (it reads only the sim).
+- **Tests** (`ui/tests/net_game_host.lua` / `net_game_join.lua`, both programs alike): the plain run, the joiner's
+  checksum of beat 250 and its line's part a2 changed on purpose (`moho64ui_NetTestForTests("corrupt", 250, "a2")`,
+  the state itself left as it is, so the fingerprints stay equal): both say "Joiner's economy (army 2) differs (first
+  between beats 201 and 250)". `NET_GAME_DESYNC = "unit"`: army 1's first unit moved a quarter on the joiner at beat
+  250 ("move"): "Host's units (army 1) differ (first between beats 201 and 250)", the fingerprints first unlike at
+  250; the two listings of beat 300 differ in that one unit's line, its x a quarter apart. `NET_GAME_DESYNC = "draw"`:
+  one random number more on the joiner at beat 230 ("draw"): "the random numbers differ (first between beats 201 and
+  230)" (the test game is quiet: nothing else differs yet at 250), the fingerprints first unlike at 230.
+
+### Narrowing to the exact beat (a proposal, not built)
+
+The pulses narrow a desync only when it shows in the draws or the counts. The exact first beat, and the full listing
+of that beat, come from the replays, which both players have (the same merged orders):
+
+1. After the game each player plays their own replay back to the checksum beat with the fingerprint on
+   (`MOHO64_FINGERPRINT=<file>`, which a playback already writes line for line as the live game's `.fp`;
+   tools/twocopies.py --focus-a / -b for the focus army). One file of one line per beat each.
+2. The two files compared (tools/twocopies.py --compare, or the suite's fpcmp): the first beat whose lines differ is
+   the exact first beat, and its line names the parts; then each plays to that beat again with
+   `MOHO64_FINGERPRINT_DETAIL=<beat>` and the two listings compared name the unit, projectile or prop.
+3. If both replays, played on one PC, give the same lines, the desync came from one PC's copy itself (a file or mod
+   that differs, the focus army leaking into the sim, the clock, memory): exactly what the two-copies harness looks
+   for. A playback reproduces the live game when the difference is one of the orders' outcome; one that came from
+   something outside the orders shows as the playback not matching that player's own `<base>.desync.txt` lines.
+
+A button in the desync dialog (ours) could do 1 and 2 on the player's own PC after the game, and the files could be
+swapped through the lobby later. Cheaper live narrowing (a part's hash every beat) costs a line every beat (1-5 ms):
+not without the multicore phase.
