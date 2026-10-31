@@ -14,6 +14,7 @@
 --     runner then plays the host's replay (net_game_replay.lua) and compares its fingerprints with the host's.
 --   NET_GAME_LOADING: the joiner stops answering before it is ready (a player lost while loading): the host's beats
 --     wait (the waiting dialog), it ejects the joiner and its game starts without it.
+--   NET_GAME_DESYNC = "unit" | "draw": the joiner's desync is a true one (below, DesyncLineSaid).
 --   NET_GAME_RUN_TO = <beat>: after the orders both run on to that beat and end there (no chat, speed, pause or desync):
 --     a long plain game, for the beats' timing over a link with latency (MOHO64UI_REAL_TIME, MOHO64UI_NET_BEAT_LOG,
 --     MOHO64_NET_DELAY_MS: docs/ui-net-game.md, "A link with latency").
@@ -36,6 +37,26 @@ local function WaitFor(cond, seconds)  -- (the PC's clock: the other program run
 end
 local EJECT, LOADING = rawget(_G, "NET_GAME_EJECT"), rawget(_G, "NET_GAME_LOADING")
 local RUN_TO = rawget(_G, "NET_GAME_RUN_TO")
+-- ours after the desync dialog: a console line naming the parts of the state that differ (GameSession::NetCompareParts),
+-- the same on both programs but for the other's name. NET_GAME_DESYNC (both programs alike) picks the joiner's desync:
+-- nil, its line's part a2 changed with its checksum of beat 250 (the state itself left as it is: the fingerprints stay
+-- equal); "unit", army 1's first unit moved at beat 250 on the joiner only; "draw", one random number more drawn at beat
+-- 230 on the joiner only (both true desyncs: the fingerprints differ from that beat on).
+local DESYNC = rawget(_G, "NET_GAME_DESYNC")
+local function DesyncLineSaid(lines, peer)
+    local head = "Desync at beat 250 with " .. peer .. ": "
+    for _, l in lines do
+        if DESYNC == "unit" then
+            if l == head .. "Host's units (army 1) differ (first between beats 201 and 250)" then return true end
+        elseif DESYNC == "draw" then
+            if string.sub(l, 1, string.len(head) + 18) == head .. "the random numbers"
+               and string.find(l, "(first between beats 201 and 230)", 1, true) then return true end
+        elseif l == head .. "Joiner's economy (army 2) differs (first between beats 201 and 250)" then
+            return true
+        end
+    end
+    return false
+end
 -- (a hang ends the run after four minutes of the PC's clock)
 ForkThread(function()
     local stop = moho64ui_WallSeconds() + 240 + (RUN_TO or 0) / 5
@@ -243,6 +264,7 @@ ForkThread(function()
     check("naming the joiner", desyncs[1] and desyncs[1].who, "Joiner")
     check("at the beat compared or after it", desyncs[1] ~= nil and desyncs[1].beat >= 250, true)
     LOG("TEST note: desync dialog at beat " .. tostring(desyncs[1] and desyncs[1].beat))
+    check("our line names the parts that differ", WaitFor(function() return DesyncLineSaid(console, "Joiner") end, 10), true)
     -- the joiner quits after beat 310: its connection ends, and it is ejected here at once (no dialog), the game runs on
     check("the joiner, gone, is ejected at once", WaitFor(function()
         local cl = GetSessionClients()

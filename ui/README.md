@@ -367,13 +367,18 @@ moho64ui --init <the game's init .lua> [--mods uids.txt] [--prefs <our preferenc
   SPEED (SetGameSpeed where the game's speed is adjustable: every client ends on the newest request,
   uimain.NoteGameSpeedChanged tells who). GetSessionClients lists the clients (connected = not ejected here, ping,
   quiet, ejectedBy, FAF's maxSP), SessionIsMultiplayer is true, uimain.UpdateDisconnectDialog runs each frame, and a
-  checksum difference shows uimain.ShowDesyncDialog(beat, names). As in the original (and FAF, Chris 2026-10-30: "Just
+  checksum difference shows uimain.ShowDesyncDialog(beat, names); then, ours (Chris approved, 2026-10-30), the two
+  programs swap their state's parts of that beat (message 60, ours) and each says on the console which parts differ
+  and from which beat ("Desync at beat 250 with Host: Joiner's economy (army 2) differs (first between beats 201 and
+  250)"), the same in the log and in `<replay>.desync.txt`, with the full listing of the next checksum beat beside it
+  (docs/ui-net-game.md, "A desync's parts"). As in the original (and FAF, Chris 2026-10-30: "Just
   keep faf behaviour"): a connection that ends ejects its player at once ("X disconnected." on the console, 0x53c2c3),
   and a player only gone quiet goes through FAF's disconnect dialog and its vote (its Eject button after
   DisconnectionDelay02, its forced eject later). The input delay is the original's
   net_Lag (500 ms) in beats at the game's speed at launch (5 at normal). Tests: two programs over loopback
   (`ui/tests/net_game_host.lua`, `net_game_join.lua`): a 2-player game with orders from both, chat both ways, the
-  speed changed by each, a pause, a desync on purpose, the two programs' fingerprints equal at every beat, then the
+  speed changed by each, a pause, a desync on purpose (and the part it names), the two programs' fingerprints equal at
+  every beat, then the
   joiner quits and the host ejects it at once and runs on; variants with the joiner frozen mid-game (quiet: the host
   ejects it as the dialog's button does and
   runs on; `net_game_replay.lua` plays the host's replay with the same fingerprints) and frozen before it is ready

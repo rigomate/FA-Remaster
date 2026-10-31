@@ -13,6 +13,7 @@ constexpr uint8_t kAdvance = 0, kVerifyChecksum = 3;  // (the replay stream's ty
 constexpr uint8_t kLastStream = 49;                   // (0..49: the stream; CNetClient's ranges, 0x53bb60)
 constexpr uint8_t kAck = 50, kDispatched = 51, kAvailable = 52, kReady = 53, kEject = 54, kChat = 55, kSpeed = 56,
                   kMaxSimRate = 57;
+constexpr uint8_t kDesyncParts = 60;  // (ours: beat_exchange_net.h)
 
 Message AdvanceMessage(uint32_t n) { return MessageWriter().U32(n).Done(kAdvance); }
 
@@ -223,6 +224,9 @@ void NetBeatExchange::Process(Client& from, const Message& m) {
     case kMaxSimRate:  // (0x53c2b2)
       from.maxSP = r.I32();
       return;
+    case kDesyncParts:  // (ours)
+      if (!from.local) desyncParts_.emplace_back(from.who.client, m.payload);
+      return;
     default:
       Logf(LogLevel::Info, "CClientBase::Queue(): Ignoring message type %d", m.type);
   }
@@ -367,6 +371,20 @@ std::vector<std::pair<uint8_t, std::string>> NetBeatExchange::TakeChats() {
   Pump();
   std::vector<std::pair<uint8_t, std::string>> out;
   out.swap(chats_);
+  return out;
+}
+
+void NetBeatExchange::SendDesyncParts(uint8_t client, const std::string& bytes) {
+  std::lock_guard<std::mutex> g(mu_);
+  const Client* c = ByIndex(client);
+  if (c && !c->local) SendTo(*c, Message{kDesyncParts, bytes});
+}
+
+std::vector<std::pair<uint8_t, std::string>> NetBeatExchange::TakeDesyncParts() {
+  std::lock_guard<std::mutex> g(mu_);
+  Pump();
+  std::vector<std::pair<uint8_t, std::string>> out;
+  out.swap(desyncParts_);
   return out;
 }
 

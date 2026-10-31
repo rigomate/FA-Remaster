@@ -749,7 +749,9 @@ void CallModule(lua_State* L, const char* module, const char* fn, int nargs) {
 // uimain.NoteGameSpeedChanged(client + 1, rate)), the chat (0x88b880 -> 0x83ebd0: gamemain.ReceiveChat(the sender's
 // name, the message)) and a lost connection's console line (0x88b810 -> 0x88b9d0: "<LOC Engine0002>%s disconnected.").
 // The original hands the chat, the speed and the console line to the main thread as it gets them (THREAD_InvokeAsync
-// 0x413b70); here they come before the frame's script threads. INFERRED: that order among them.
+// 0x413b70); here they come before the frame's script threads. INFERRED: that order among them. Then ours, not the
+// original's: after a desync, a console line saying which parts of the game's state differ (GameSession::NetAfterBeat),
+// shown as the disconnect line is (FAF's consoleecho on the game's screen, and the console).
 void DeliverNetEvents(lua_State* L) {
   UserState* user = UserState::From(L);
   NetGameLink* net = user->config().net;
@@ -788,6 +790,7 @@ void DeliverNetEvents(lua_State* L) {
     if (at != std::string::npos) text.replace(at, 2, name);
     ConsolePrint(L, text);
   }
+  for (const std::string& note : ev.notes) ConsolePrint(L, note);  // (ours: GameSession::NetAfterBeat)
   if (ev.waiting < 0) user->CallProvider("StopWaitingDialog");
   lua_settop(L, top);
 }
@@ -1079,12 +1082,13 @@ void RegisterSessionBindings(lua_State* L) {
   SetGlobal(L, "GetSessionClients", l_GetSessionClients);
   SetGlobal(L, "EjectSessionClient", l_EjectSessionClient);
   SetGlobal(L, "SessionSendChatMessage", l_SessionSendChatMessage);
-  // moho64ui_NetTestForTests(what [, beat]): a network game's test switch (NetGameLink::TestSwitch: "freeze", or
-  // "corrupt" with the beat whose checksum is changed); nothing in a local game. The host's own function for tests.
+  // moho64ui_NetTestForTests(what [, beat [, arg]]): a network game's test switch (NetGameLink::TestSwitch: "freeze",
+  // "corrupt", "move", "draw"); nothing in a local game. The host's own function for tests.
   lua_register(L, "moho64ui_NetTestForTests", [](lua_State* L) -> int {
     const std::string what = luaL_checkstring(L, 1);
     const uint32_t beat = lua_isnumber(L, 2) ? static_cast<uint32_t>(lua_tonumber(L, 2)) : 0;
-    if (NetGameLink* net = UserState::From(L)->config().net) net->TestSwitch(what, beat);
+    const std::string arg = lua_isstring(L, 3) ? lua_tostring(L, 3) : "";
+    if (NetGameLink* net = UserState::From(L)->config().net) net->TestSwitch(what, beat, arg);
     return 0;
   });
   SetGlobal(L, "IsAlly", l_IsAlly);
