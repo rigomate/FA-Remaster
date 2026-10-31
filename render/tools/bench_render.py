@@ -126,6 +126,14 @@ SCENES = {
            "flakes at 15 s (frame 900)",
            GROUND + ["--map", "/maps/SETONS_R/SETONS_R.scmap", "--time-of-day", "9", "--day-length", "1200", "--weather", "auto",
                      "--climate", "cold", "--seed", "3977804112", "--weather-spell", "20", "--cam", "600,560,90,50,20"], 1500, 60),
+    # (the engine's B3, docs/benchmarks.md: 16,000 mixed land units of two armies ordered at each other on Hanna Oasis,
+    # some 15,700 alive through the run; its session and orders in the renderer's scratch, bench/r7. Not in the set run
+    # by default; asked for by --scenes R7. Measure only: what a picture of 10,000+ units costs, for the optimisation)
+    "R7": ("the engine's B3 at 16,000 units: two armies at each other on Hanna Oasis from beat 400, the front seen whole "
+           "from 250 up",
+           GROUND + ["--session", LAB + "/_scratch/render/bench/r7/b3_session_hanna.lua", "--orders",
+                     LAB + "/_scratch/render/bench/r7/b3_16000.txt", "--seed", "1", "--fixed-step", "--tick", "400",
+                     "--time-of-day", "12", "--cam", "1000,380,250,55,0"], 1200, 60),
     # (the sea's own: not in the set run by default, which stays R1-R6; asked for by --scenes W1,W2)
     "W1": ("the lifted ocean close: a battleship and a frigate on the remastered Seton's sea at noon, 20 up (the ships' "
            "reflections, the glint near the eye)",
@@ -704,7 +712,7 @@ def run_sides(sides, scenes, sizes, a):
 
 
 def scenes_sizes(a):
-    scenes = a.scenes.split(",") if a.scenes else [s for s in SCENES if s.startswith("R")]
+    scenes = a.scenes.split(",") if a.scenes else [s for s in SCENES if s.startswith("R") and s != "R7"]
     sizes = a.sizes.split(",") if a.sizes else SIZES
     for s in scenes:
         if s not in SCENES:
