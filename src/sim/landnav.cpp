@@ -333,7 +333,17 @@ static bool PathUnitBlockedCore(Unit* u, int x, int z, int flags) {
     }
     float cx = (x1 + x0) * 0.5f, cz = (z1 + z0) * 0.5f;
     float hx = static_cast<float>(Fp(u).sizeX) * 0.5f, hz = static_cast<float>(Fp(u).sizeZ) * 0.5f;
-    if (ShapeOverlapsAABox(s, Vec3{cx - hx, -1000.0f, cz - hz}, Vec3{cx + hx, 1000.0f, cz + hz})) blocked = true;
+    // Entity::Intersects 0x67a9d0 hands the box (0x474170: centre (cx, 0, cz), identity axes) to the primitive's own
+    // test (vt+0x1c): a Box primitive goes through BoxBox 0x474830 (CColPrimitive_Box::CollideBox 0x4ff260), as the
+    // line test above does, not a plain separation test. Seen: MP1 17338, army 7's destroyer 0x7000d8 searches a
+    // continuation; 0x700109's box reaches x 490.99869, 0.0013 into the square (487, 438)'s box by the plain test, apart
+    // by BoxBox's arithmetic: the original's search steps through (487, 438) and takes the southern way round (its
+    // waypoint (491, 438) at 17339); ours found the cell blocked and went north.
+    static const Vec3 kAxes[3] = {{1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 1.0f}};
+    const Vec3 centre{cx, 0.0f, cz};
+    const float half[3] = {hx, 1000.0f, hz};
+    if (s.type == ShapeType::Box ? BoxPrimitiveMeetsBox(s, centre, kAxes, half) : ShapeOverlapsOBox(s, centre, kAxes, half))
+      blocked = true;
   };
   if (sim.entityGrid().ready()) {
     // 0x721c00 -> 0x722df0 (mask 0x100): the candidates are the units in the entity grid's lists of the square's
