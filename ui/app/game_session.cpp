@@ -4,14 +4,18 @@
 #include "app/window.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
+#include <map>
 #include <mutex>
+#include <set>
 #include <thread>
 #if defined(__APPLE__)
 #include <pthread.h>
@@ -44,6 +48,7 @@
 #endif
 
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 
 #include "sim/sim_view.h"
@@ -1116,6 +1121,27 @@ struct GameSession::Net {
   uint32_t beat = 0;      // the beat whose orders were taken last
   bool afterDue = false;  // (that beat has run, or runs on its thread: AfterBeat is due)
   std::string digest;     // its state's digest, every 50th beat (made on the thread that ran it, read after it)
+  // (ours, after a desync: NetSendParts / NetCompareParts) this copy's state line of the last checksum beats (the
+  // engine's Fingerprint::StateLine without its lua part: the line LockstepDigest hashes), and of each of the last
+  // beats its pulse (the random draws so far, the units, the projectiles: a few numbers read, for the first beat a
+  // desync shows in). Both made in NetDigest on the thread that ran the beat and read here after it, as `digest`.
+  std::vector<std::pair<uint32_t, std::string>> lines;
+  struct Pulse {
+    uint32_t beat = 0;
+    uint64_t draws = 0;
+    uint32_t units = 0, projectiles = 0;
+  };
+  std::array<Pulse, 128> pulses{};
+  std::map<uint8_t, uint32_t> firstDesync;           // per client, the checksum beat it was first out of step at
+  std::set<std::pair<uint8_t, uint32_t>> partsSent;  // (client, beat)
+  bool desyncFileStarted = false;
+  std::unique_ptr<Fingerprint> detail;  // the full listing of beat detailAt, asked for at the game's first desync
+  uint32_t detailAt = 0;
+  bool detailAsked = false;
+  // the test switches that change this copy's state or its line (NetTestSwitch; set before the game's beats come)
+  std::string corruptPart;
+  std::atomic<uint32_t> moveAt{0}, drawAt{0};
+  std::atomic<int> moveArmy{0};
   // MOHO64UI_NET_BEAT_LOG=1 (tests): a line per beat, when it began, how long it waited for its orders and how much
   // of that with every client's orders in (the wait for the ACKs); see NetBeatOrders
   std::chrono::steady_clock::time_point askedAt{}, inAt{}, lastBegun{};
@@ -1142,7 +1168,9 @@ class NetLinkOf final : public NetGameLink {
   void SendChat(const std::vector<int>& clients, const std::string& message) override { session_->NetChat(clients, message); }
   void RequestSpeed(int rate) override { session_->NetSpeed(rate); }
   NetEvents TakeEvents() override { return session_->NetTakeEvents(); }
-  void TestSwitch(const std::string& what, uint32_t beat) override { session_->NetTestSwitch(what, beat); }
+  void TestSwitch(const std::string& what, uint32_t beat, const std::string& arg) override {
+    session_->NetTestSwitch(what, beat, arg);
+  }
 
  private:
   GameSession* session_;
@@ -1714,6 +1742,7 @@ bool GameSession::FinishLoad(std::string* why) {
   due_ = 0;
   StartReplayFile(session);
   if (stream_) std::fclose(stream_), stream_ = nullptr;
+  recordBase_.clear();
   if (!replayOut.empty()) {  // the game's record: see the header
     const std::string base = replayOut + (recorded_ ? "." + std::to_string(recorded_ + 1) : "");
     const std::string table = TableFile();
@@ -1726,6 +1755,7 @@ bool GameSession::FinishLoad(std::string* why) {
     lastTable_ = table;
     tableAgain_ = false;
     ++recorded_;
+    recordBase_ = base;
     stream_ = std::fopen((base + ".stream").c_str(), "wb");
     if (!stream_) Logf(LogLevel::Warning, "moho64ui: cannot write %s.stream", base.c_str());
     else Logf(LogLevel::Info, "moho64ui: this game is recorded in %s.stream (seed %u)", base.c_str(), h.seed);
@@ -2503,21 +2533,67 @@ bool GameSession::NetBeatOrders(std::string* merged) {
 }
 
 // After a network game's beat, on the thread that ran it (the engine's: on the beats' thread right after the beat):
-// its digest for the checksum, every 50th beat only (not free).
+// its digest for the checksum, every 50th beat only (not free). Beside it, ours for a desync (NetSendParts): the
+// beat's pulse (a few numbers read, every beat) and, every 50th beat, the state line the digest is made of. That line
+// is made twice on those beats today, once inside LockstepDigest and once here: the engine's LockstepDigest does not
+// hand out the line it hashes (the engine change asked for: docs/ui-net-game.md, "A desync's parts").
 void GameSession::NetDigest() {
-  if (!net_ || !net_->afterDue || net_->beat % kLockstepChecksumPeriod != 0) return;
-  net_->digest = LockstepDigest(*sim_, net_->beat);
-  if (net_->beat == net_->corruptAt && !net_->digest.empty()) {  // (the test switch: a desync on purpose)
-    net_->digest[0] = static_cast<char>(net_->digest[0] ^ 0x5a);
-    Logf(LogLevel::Info, "moho64ui: beat %u: our checksum is changed on purpose (moho64ui_NetTestForTests)", net_->beat);
+  if (!net_ || !net_->afterDue) return;
+  Net& n = *net_;
+  const uint32_t beat = n.beat;
+  // the test switches that change this copy's state, right after the beat's tick: a true desync from this beat on
+  if (beat == n.drawAt) {
+    sim_->NextUInt32();
+    Logf(LogLevel::Info, "moho64ui: beat %u: one random number more drawn on purpose (moho64ui_NetTestForTests)", beat);
   }
+  if (beat == n.moveAt) {
+    Unit* pick = nullptr;
+    for (Unit* u : sim_->units())
+      if (u && !u->dead && u->army && u->army->index == n.moveArmy && (!pick || u->id < pick->id)) pick = u;
+    if (pick) {
+      pick->position.x += 0.25f;
+      Logf(LogLevel::Info, "moho64ui: beat %u: unit %#x of army %d moved on purpose (moho64ui_NetTestForTests)", beat,
+           pick->id, n.moveArmy.load());
+    }
+  }
+  Net::Pulse& p = n.pulses[beat % n.pulses.size()];
+  p.beat = beat;
+  p.draws = sim_->rngDraws_;
+  p.units = static_cast<uint32_t>(sim_->units().size());
+  p.projectiles = static_cast<uint32_t>(sim_->projectiles.size());
+  if (n.detail && beat == n.detailAt) {  // (asked for at the game's first desync: NetAskDetail)
+    n.detail->Beat(*sim_, beat);
+    n.detail.reset();
+  }
+  if (beat % kLockstepChecksumPeriod != 0) return;
+  n.digest = LockstepDigest(*sim_, beat);
+  std::string line = Fingerprint::StateLine(*sim_, beat);
+  if (const size_t lua = line.rfind(" lua="); lua != std::string::npos) line.resize(lua);  // (as LockstepDigest)
+  if (beat == n.corruptAt && !n.digest.empty()) {  // (the test switch: a desync on purpose)
+    n.digest[0] = static_cast<char>(n.digest[0] ^ 0x5a);
+    // (and, when named, that part of our line, as if the state's part differed: the state itself is left as it is)
+    const size_t at = n.corruptPart.empty() ? std::string::npos : line.find(" " + n.corruptPart + "=");
+    if (at != std::string::npos) {
+      const size_t end = line.find(' ', at + 1);
+      char& c = line[(end == std::string::npos ? line.size() : end) - 1];
+      c = c == '0' ? '1' : '0';
+    }
+    Logf(LogLevel::Info, "moho64ui: beat %u: our checksum is changed on purpose (moho64ui_NetTestForTests)%s%s", beat,
+         at != std::string::npos ? ", and our line's part " : "", at != std::string::npos ? n.corruptPart.c_str() : "");
+  }
+  n.lines.emplace_back(beat, std::move(line));
+  // (kept 300 beats: a peer's parts come a round trip after it found the desync, itself up to its input delay and its
+  // network behind)
+  n.lines.erase(std::remove_if(n.lines.begin(), n.lines.end(), [&](const auto& l) { return l.first + 300 < beat; }),
+                n.lines.end());
 }
 
 // Then, here: the lockstep hears of it (sends our checksum, compares the others'); a difference goes to the desync
 // dialog: as the original's CWldSession::DoBeat 0x894530 after a beat whose sync names desyncs, one
 // uimain.ShowDesyncDialog(beat, strings) (0x895434) with the beat just run (CWldSession+0x458, 0x895429) and, for
 // each difference, the name of the client whose checksum differs (0x895364: its entry in the session's client list;
-// GPGNET_ReportDesync 0x7b9ac0 beside it is not ours).
+// GPGNET_ReportDesync 0x7b9ac0 beside it is not ours). Then ours: our parts of that beat to that client, and the
+// parts other clients sent compared with ours.
 void GameSession::NetAfterBeat() {
   if (!net_ || !net_->afterDue) return;
   net_->afterDue = false;
@@ -2530,9 +2606,267 @@ void GameSession::NetAfterBeat() {
     for (const NetClient& c : net_->clients)
       if (c.client == d.client) name = c.name;
     names.push_back(name);
+    NetSendParts(d.client, d.beat);
   }
   if (!names.empty()) net_->events.desyncs.emplace_back(net_->beat, std::move(names));
   desyncs.clear();
+  for (const auto& [client, bytes] : net_->exchange->TakeDesyncParts()) NetCompareParts(client, bytes);
+}
+
+namespace {
+
+// A state line (sim/fingerprint.h: "<beat> <tick> <total> <part>=<hash> ...", the lua part cut) taken apart.
+struct StateParts {
+  std::string beat, tick, total;
+  std::vector<std::pair<std::string, std::string>> parts;  // in the line's order
+};
+
+StateParts SplitStateLine(const std::string& line) {
+  StateParts out;
+  size_t p = 0;
+  for (int field = 0; p < line.size(); ++field) {
+    size_t end = line.find(' ', p);
+    if (end == std::string::npos) end = line.size();
+    const std::string w = line.substr(p, end - p);
+    p = end + 1;
+    if (w.empty()) continue;
+    if (field == 0) out.beat = w;
+    else if (field == 1) out.tick = w;
+    else if (field == 2) out.total = w;
+    else if (const size_t eq = w.find('='); eq != std::string::npos) out.parts.emplace_back(w.substr(0, eq), w.substr(eq + 1));
+  }
+  return out;
+}
+
+// A part of the state line in a player's words, and whether it is plural ("differ" or "differs"): the parts as
+// sim/fingerprint.h lists them; an army's by its player's name when it has one.
+std::pair<std::string, bool> PartInWords(const std::string& part, const Sim& sim) {
+  if (part == "rng") return {"the random numbers", true};
+  if (part == "sim") return {"the game's own state (orders, path searches, pause)", false};
+  if (part == "proj") return {"the projectiles", true};
+  if (part == "props") return {"the props (wrecks, trees, rocks)", true};
+  if (part == "ents") return {"the other entities (shields, beams, blips)", true};
+  if (part == "u0") return {"the units of no army", true};
+  if (part.size() > 1 && (part[0] == 'a' || part[0] == 'u') && std::isdigit(static_cast<unsigned char>(part[1]))) {
+    const int index = std::atoi(part.c_str() + 1);
+    std::string who;
+    for (const auto& a : sim.armies())
+      if (a->index == index) who = a->nickname;
+    const bool units = part[0] == 'u';
+    const std::string what = units ? "units" : "economy";
+    if (who.empty()) return {"army " + std::to_string(index) + "'s " + what, units};
+    return {who + "'s " + what + " (army " + std::to_string(index) + ")", units};
+  }
+  return {"the part " + part, false};
+}
+
+std::string NowText() {
+  const std::time_t t = std::time(nullptr);
+  std::tm tm{};
+#ifdef _WIN32
+  localtime_s(&tm, &t);
+#else
+  localtime_r(&t, &tm);
+#endif
+  char b[40];
+  std::strftime(b, sizeof b, "%Y-%m-%d %H:%M:%S", &tm);
+  return b;
+}
+
+// An environment variable set (nullptr: removed), as the record's fingerprint is opened (StartSession).
+void SetEnv(const char* name, const char* value) {
+#ifdef _WIN32
+  _putenv_s(name, value ? value : "");
+#else
+  if (value) setenv(name, value, 1);
+  else unsetenv(name);
+#endif
+}
+
+}  // namespace
+
+// Where a desync's files go: beside the game's record (--replay-out) or, without one, its replay
+// (replays/<profile>/LastGame.SCFAReplay: LastGame.desync.txt beside it, overwritten by the next game's desync as
+// the replay is by the next game). Empty: none (the log alone).
+std::string GameSession::NetDesyncBase() const {
+  if (!recordBase_.empty()) return recordBase_;
+  if (currentReplay.empty()) return std::string();
+  const size_t dot = currentReplay.find_last_of('.');
+  const size_t slash = currentReplay.find_last_of("/\\");
+  return dot != std::string::npos && (slash == std::string::npos || dot > slash) ? currentReplay.substr(0, dot) : currentReplay;
+}
+
+// At the game's first desync: this copy's full listing of a beat both sides can still write, the next checksum beat
+// (the beat found out of step has run here already, and its state is gone; both copies find a desync within a few
+// beats of its checksum beat, so both list the same beat). The listing is the engine's (Fingerprint with
+// MOHO64_FINGERPRINT_DETAIL: one line per army, unit, projectile, prop and entity), written on the beats' thread at
+// that beat (NetDigest): <base>.desync.fp (that beat's line) and <base>.desync.fp.detail.<beat>. The engine's class is
+// made from the environment, set for that moment as StartSession does for the record's fingerprint.
+void GameSession::NetAskDetail() {
+  Net& n = *net_;
+  if (n.detailAsked) return;
+  n.detailAsked = true;
+  const std::string base = NetDesyncBase();
+  if (base.empty()) {
+    Logf(LogLevel::Info, "moho64ui: no record or replay of this game: the desync's listing is not written");
+    return;
+  }
+  n.detailAt = (n.beat / kLockstepChecksumPeriod + 1) * kLockstepChecksumPeriod;
+  const char* names[] = {"MOHO64_FINGERPRINT", "MOHO64_FINGERPRINT_PEER", "MOHO64_FINGERPRINT_DETAIL"};
+  std::string kept[3];
+  bool had[3];
+  for (int i = 0; i < 3; ++i) {
+    const char* v = std::getenv(names[i]);
+    had[i] = v != nullptr;
+    kept[i] = v ? v : "";
+  }
+  const std::string file = base + ".desync.fp", beat = std::to_string(n.detailAt);
+  SetEnv(names[0], file.c_str());
+  SetEnv(names[1], nullptr);
+  SetEnv(names[2], beat.c_str());
+  n.detail = Fingerprint::FromEnvironment();
+  for (int i = 0; i < 3; ++i) SetEnv(names[i], had[i] ? kept[i].c_str() : nullptr);
+  if (n.detail)
+    Logf(LogLevel::Info, "moho64ui: the state of beat %u (the next checksum beat) will be listed in %s.detail.%u",
+         n.detailAt, file.c_str(), n.detailAt);
+}
+
+// A desync with `client` at checksum beat `beat` (the lockstep found its checksum differs from ours): our parts of that
+// beat to it, once (ours, message 60: net/beat_exchange_net.h): the beat, then each beat's pulse from the checksum beat
+// before it on (as far as kept: the first beat whose pulse differs narrows where the difference began), then our state
+// line of that beat.
+void GameSession::NetSendParts(uint8_t client, uint32_t beat) {
+  Net& n = *net_;
+  n.firstDesync.emplace(client, beat);
+  NetAskDetail();
+  if (!n.partsSent.insert({client, beat}).second) return;
+  auto mine = std::find_if(n.lines.begin(), n.lines.end(), [&](const auto& l) { return l.first == beat; });
+  if (mine == n.lines.end()) {
+    Logf(LogLevel::Warning, "moho64ui: no state line of ours is kept for beat %u: its parts are not sent", beat);
+    return;
+  }
+  uint32_t from = beat > kLockstepChecksumPeriod ? beat - kLockstepChecksumPeriod + 1 : 1;
+  while (from <= beat && n.pulses[from % n.pulses.size()].beat != from) ++from;  // (the oldest kept)
+  net::MessageWriter w;
+  w.U32(beat).U32(from).U16(static_cast<uint16_t>(beat + 1 - from));
+  for (uint32_t b = from; b <= beat; ++b) {
+    const Net::Pulse& p = n.pulses[b % n.pulses.size()];
+    w.U32(static_cast<uint32_t>(p.draws)).U32(static_cast<uint32_t>(p.draws >> 32)).U32(p.units).U32(p.projectiles);
+  }
+  w.Str(mine->second);
+  n.exchange->SendDesyncParts(client, w.Done(0).payload);
+  Logf(LogLevel::Info, "moho64ui: our state's parts of beat %u sent to client %u", beat, client);
+}
+
+// A client's parts of a beat (NetSendParts on its side) compared with ours: the parts that differ, in a player's words,
+// and the first beat it shows in as closely as the pulses tell: after the checksum beat before (the same then, or the
+// desync would have been found there), and no later than the first beat whose pulse differs. The game's first desync
+// with that client goes to the console (DeliverNetEvents); every one to the log and to <base>.desync.txt.
+void GameSession::NetCompareParts(uint8_t client, const std::string& bytes) {
+  Net& n = *net_;
+  net::MessageReader r(bytes);
+  const uint32_t beat = r.U32(), from = r.U32();
+  const uint16_t count = r.U16();
+  std::vector<Net::Pulse> theirs;
+  for (uint16_t i = 0; i < count && r.Ok(); ++i) {
+    Net::Pulse p;
+    p.beat = from + i;
+    const uint32_t lo = r.U32(), hi = r.U32();
+    p.draws = lo | (static_cast<uint64_t>(hi) << 32);
+    p.units = r.U32();
+    p.projectiles = r.U32();
+    theirs.push_back(p);
+  }
+  const std::string theirLine = r.Str();
+  if (!r.Ok()) {
+    Logf(LogLevel::Warning, "moho64ui: client %u's desync parts could not be read (%zu bytes)", client, bytes.size());
+    return;
+  }
+  auto mine = std::find_if(n.lines.begin(), n.lines.end(), [&](const auto& l) { return l.first == beat; });
+  if (mine == n.lines.end()) {
+    Logf(LogLevel::Warning, "moho64ui: client %u's parts of beat %u came, but ours of that beat are no longer kept", client, beat);
+    return;
+  }
+  std::string name;
+  for (const NetClient& c : n.clients)
+    if (c.client == client) name = c.name;
+  n.firstDesync.emplace(client, beat);
+  NetAskDetail();
+  const bool first = n.firstDesync[client] == beat;
+  // which parts differ (a part only one side has differs too)
+  const StateParts a = SplitStateLine(mine->second), b = SplitStateLine(theirLine);
+  std::vector<std::pair<std::string, bool>> differ;
+  if (a.tick != b.tick) differ.push_back({"the game's tick", false});
+  std::vector<std::string> parts;
+  for (const auto& kv : a.parts) parts.push_back(kv.first);
+  for (const auto& kv : b.parts)
+    if (std::find(parts.begin(), parts.end(), kv.first) == parts.end()) parts.push_back(kv.first);
+  auto valueOf = [](const StateParts& s, const std::string& part) {
+    for (const auto& kv : s.parts)
+      if (kv.first == part) return kv.second;
+    return std::string();
+  };
+  for (const std::string& part : parts)
+    if (valueOf(a, part) != valueOf(b, part)) differ.push_back(PartInWords(part, *sim_));
+  std::string what;
+  const size_t shown = differ.size() > 6 ? 5 : differ.size();
+  for (size_t i = 0; i < shown; ++i)
+    what += (i == 0 ? "" : i + 1 == shown && shown == differ.size() ? " and " : ", ") + differ[i].first;
+  if (shown < differ.size()) what += " and " + std::to_string(differ.size() - shown) + " more parts";
+  if (differ.empty()) what = "every part of the state is the same; only the checksums differ";
+  else what += differ.size() == 1 && !differ[0].second ? " differs" : " differ";
+  // where it began: lo .. hi
+  const uint32_t lo = beat > kLockstepChecksumPeriod ? beat - kLockstepChecksumPeriod + 1 : 1;
+  uint32_t hi = beat, pulseAt = 0;
+  for (const Net::Pulse& t : theirs) {
+    const Net::Pulse& o = n.pulses[t.beat % n.pulses.size()];
+    if (t.beat < lo || t.beat > beat || o.beat != t.beat) continue;
+    if (o.draws != t.draws || o.units != t.units || o.projectiles != t.projectiles) {
+      hi = pulseAt = t.beat;
+      break;
+    }
+  }
+  std::string when;
+  if (!first) when = "out of step since beat " + std::to_string(n.firstDesync[client]);
+  else if (lo == hi) when = "first at beat " + std::to_string(lo);
+  else when = "first between beats " + std::to_string(lo) + " and " + std::to_string(hi);
+  const std::string text = "Desync at beat " + std::to_string(beat) + " with " + name + ": " + what + " (" + when + ")";
+  Logf(LogLevel::Warning, "moho64ui: %s\n  ours   %s\n  theirs %s", text.c_str(), mine->second.c_str(), theirLine.c_str());
+  if (first) n.events.notes.push_back(text);
+  // the same in the desync's file, with both lines and the pulses, for taking it apart afterwards
+  const std::string base = NetDesyncBase();
+  if (base.empty()) return;
+  const std::string file = base + ".desync.txt";
+  std::FILE* f = std::fopen(file.c_str(), n.desyncFileStarted ? "ab" : "wb");
+  if (!f) {
+    Logf(LogLevel::Warning, "moho64ui: cannot write %s", file.c_str());
+    return;
+  }
+  if (!n.desyncFileStarted) {
+    n.desyncFileStarted = true;
+    std::string self;
+    for (const NetClient& c : n.clients)
+      if (c.local) self = c.name;
+    std::fprintf(f,
+                 "# FA Remastered: a network game's desyncs as this copy saw them (docs/ui-net-game.md, \"A desync's parts\")\n"
+                 "# written %s by client %u (%s); seed %u, map %s\n"
+                 "# the lines: <beat> <tick> <total> <part>=<hash> ... (sim/fingerprint.h); pulses: <beat> <random draws> "
+                 "<units> <projectiles>\n",
+                 NowText().c_str(), n.local, self.c_str(), seed_, map_.c_str());
+  }
+  std::fprintf(f, "\n%s\n  ours   %s\n  theirs %s\n", text.c_str(), mine->second.c_str(), theirLine.c_str());
+  if (pulseAt) {
+    const Net::Pulse& o = n.pulses[pulseAt % n.pulses.size()];
+    const Net::Pulse& t = theirs[pulseAt - from];
+    std::fprintf(f, "  the first pulse that differs: ours %u %llu %u %u, theirs %u %llu %u %u\n", o.beat,
+                 static_cast<unsigned long long>(o.draws), o.units, o.projectiles, t.beat,
+                 static_cast<unsigned long long>(t.draws), t.units, t.projectiles);
+  } else if (!theirs.empty()) {
+    std::fprintf(f, "  the pulses of beats %u..%u are the same\n", std::max(lo, from), beat);
+  }
+  if (n.detailAt)
+    std::fprintf(f, "  this copy's full listing of beat %u: %s.desync.fp.detail.%u\n", n.detailAt, base.c_str(), n.detailAt);
+  std::fclose(f);
 }
 
 // The game's screen is up (main.cpp, after CreateGameInterface; the original sends READY at the end of DoInitializing,
@@ -2621,13 +2955,19 @@ NetEvents GameSession::NetTakeEvents() {
   return out;
 }
 
-void GameSession::NetTestSwitch(const std::string& what, uint32_t beat) {
+void GameSession::NetTestSwitch(const std::string& what, uint32_t beat, const std::string& arg) {
   if (!net_) return;
   if (what == "freeze") {
     Logf(LogLevel::Info, "moho64ui: this program's network game is frozen (moho64ui_NetTestForTests)");
     net_->exchange->FreezeForTests();
   } else if (what == "corrupt") {
+    net_->corruptPart = arg;  // (before the beat: NetDigest reads it on the beats' thread once corruptAt is that beat)
     net_->corruptAt = beat;
+  } else if (what == "move") {
+    net_->moveArmy = std::atoi(arg.c_str());
+    net_->moveAt = beat;
+  } else if (what == "draw") {
+    net_->drawAt = beat;
   }
 }
 

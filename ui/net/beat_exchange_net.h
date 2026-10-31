@@ -21,6 +21,10 @@
 //   55 CHAT {the message} (CClientBase::ReceiveChat 0x53c9a0 sends, Process 0x53c228 hands it to the interface).
 //   56 GAME SPEED {i32 serial, i32 rate} (SetSimRate 0x53e590, ApplyIncomingGameSpeedRequest 0x53e810).
 //   57 {i32}: the sender's own most sim speed ("maxSP", client+0xd4; FAF's sim driver sends it, 0x129004e).
+// And one of ours, not the original's (we are not network-compatible with it or FAF; its types end at 57):
+//   60 DESYNC PARTS {the bytes the game gives}: after a checksum differs, this copy's parts of that beat's state to the
+//      client whose checksum differs, so that each side can say which parts differ (GameSession::NetAfterBeat; Chris
+//      approved, 2026-10-30). An earlier build of ours logs it as a type it ignores.
 #pragma once
 
 #include <chrono>
@@ -76,6 +80,9 @@ class NetBeatExchange final : public BeatExchange {
   // CHAT to one client (this one too: then it comes back through TakeChats, as the original's local client hears it).
   void SendChat(uint8_t client, const std::string& bytes);
   std::vector<std::pair<uint8_t, std::string>> TakeChats();  // (sender, message), oldest first
+  // DESYNC PARTS (ours, type 60) to one peer; those that came, (sender, bytes), oldest first.
+  void SendDesyncParts(uint8_t client, const std::string& bytes);
+  std::vector<std::pair<uint8_t, std::string>> TakeDesyncParts();
   // GAME SPEED: a request to every client (SetSimRate 0x53e590; nothing when the game's speed is not adjustable), the
   // rate agreed (the newest request, the lower client index on a tie: 0x53e810; GetSimRateRequested 0x53e7e0) and who
   // changed it to what, for the interface (uimain.NoteGameSpeedChanged, through CWldUiInterface 0x88b960).
@@ -151,6 +158,7 @@ class NetBeatExchange final : public BeatExchange {
   bool frozen_ = false;
   std::vector<std::pair<uint8_t, BeatChecksum>> checksums_;
   std::vector<std::pair<uint8_t, std::string>> chats_;
+  std::vector<std::pair<uint8_t, std::string>> desyncParts_;
   std::vector<std::pair<uint8_t, int>> rateNotes_;
   std::vector<uint8_t> disconnects_;
 };

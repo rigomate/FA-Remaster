@@ -66,6 +66,7 @@ struct NetEvents {
   std::vector<std::pair<int, int>> speeds;  // uimain.NoteGameSpeedChanged(client + 1, rate) (0x83d670)
   std::vector<std::pair<std::string, std::string>> chats;  // gamemain.ReceiveChat(name, message) (0x83ebd0); bytes: SerializeLua
   std::vector<std::string> disconnects;  // "<LOC Engine0002>%s disconnected." to the console (0x88b9d0)
+  std::vector<std::string> notes;  // ours, to the console after those: which parts of the state a desync touched
 };
 
 // A network game's side for its interface state (the host's: GameSession over net/beat_exchange_net.h).
@@ -78,8 +79,11 @@ class NetGameLink {
   virtual void RequestSpeed(int rate) = 0;            // SetGameSpeed
   virtual NetEvents TakeEvents() = 0;
   // moho64ui_NetTestForTests: "freeze" (from now on this program sends and hears nothing, as one that stopped
-  // answering), "corrupt" (its checksum of `beat` changed: a desync).
-  virtual void TestSwitch(const std::string& what, uint32_t beat) = 0;
+  // answering), "corrupt" (its checksum of `beat` changed: a desync; with `arg` a part's name, that part of its state
+  // line too, the state itself left as it is), "move" (at `beat` the unit of army `arg` with the lowest id is moved a
+  // quarter of a unit on this copy only: a true desync of that army's units), "draw" (at `beat` one random number more
+  // is drawn on this copy: a true desync of the random stream). GameSession::NetTestSwitch.
+  virtual void TestSwitch(const std::string& what, uint32_t beat, const std::string& arg) = 0;
 };
 
 class UserState {

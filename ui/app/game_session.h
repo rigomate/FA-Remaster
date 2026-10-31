@@ -97,7 +97,7 @@ class GameSession {
   void NetChat(const std::vector<int>& clients, const std::string& message);
   void NetSpeed(int rate);
   NetEvents NetTakeEvents();
-  void NetTestSwitch(const std::string& what, uint32_t beat);
+  void NetTestSwitch(const std::string& what, uint32_t beat, const std::string& arg);
   // Start a single-player session (LaunchSinglePlayerSession: an operation of the campaign) from
   // the table FAF's SinglePlayerLaunch.lua makes, at stack index `info` (the engine's
   // SessionFromSinglePlayerInfo). False with the reason.
@@ -461,6 +461,7 @@ class GameSession {
   double due_ = 0;  // seconds of beats not run yet
   std::FILE* stream_ = nullptr;  // the game's record (replayOut), open while a game runs
   int recorded_ = 0;             // games recorded in this run
+  std::string recordBase_;       // the running game's record without its extensions (<replayOut>[.n]; empty: none)
   std::string lastTable_;        // the table file of the game recorded last
   bool tableAgain_ = false;      // the game starting is a restart (Relaunch): its table is the last one
   void Record(const std::string& bytes);
@@ -482,6 +483,12 @@ class GameSession {
   bool NetBeatOrders(std::string* merged);  // (the next beat's merged orders, or false: wait)
   void NetDigest();                         // (right after that beat, on its thread: the digest of a 50th beat)
   void NetAfterBeat();                      // (then here: the digest to the lockstep, desyncs to the dialog)
+  // (ours, after a desync: this copy's parts of that beat to the client whose checksum differs, and a client's parts
+  // compared with ours: which parts differ, on the console, in the log and in <replay>.desync.txt)
+  void NetSendParts(uint8_t client, uint32_t beat);
+  void NetCompareParts(uint8_t client, const std::string& bytes);
+  std::string NetDesyncBase() const;        // (where the desync's files go: beside the record or the replay)
+  void NetAskDetail();                      // (at the game's first desync: the full listing of the next checksum beat)
   // The last launch, for Relaunch.
   std::unique_ptr<SessionDescription> last_;
   std::vector<std::string> lastUids_;
