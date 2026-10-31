@@ -713,6 +713,7 @@ void SurfaceContactsAhead(Sim& sim, const std::vector<Unit*>& order) {
   static const bool dbgCol = getenv("MOHO64_DEBUG_COL") != nullptr;
   if (!spec.active() || dbgCol) return;
   const uint32_t round = sim.tick();
+  if (spec.Below(order.size(), round)) return;  // (a small beat: its searches are made at the units' turns)
   for (size_t i = 0; i < order.size(); ++i) {
     order[i]->specItem = static_cast<uint32_t>(i);
     order[i]->specRound = round;

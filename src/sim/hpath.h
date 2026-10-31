@@ -117,6 +117,10 @@ class HPathTables {
   // result when its army's work units left cover the steps: the serial loop would have made the same steps from the
   // same state, as nothing in the loop changes a clean cluster, a unit or a grid. A stopped one goes on serially.
   void SearchesAhead(WorkerPool& pool, uint32_t round);
+  // MOHO64_PAR_PATH's default, settled once per sim at the stage's first beat (the sim's ParDefault: a game with the
+  // engine's fixes and more than one thread); a value given in the environment wins. Its minimum: searches played
+  // ahead in a beat (all armies' together), below which none is (on:N overrides).
+  void SettleSearchesAhead(bool defaultOn);
   // Synchronous search (CanPathTo's direct probe, 500 units).
   bool SearchNow(PathTraveler* t, int budget);
   // Multicore step 2a, before WorkAll: what the queued searches would make lazily, made now: the occupancy grids

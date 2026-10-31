@@ -9,9 +9,10 @@
 //   that would not change the result (a -0 for a +0) counts as a change: the verifier is conservative, never lenient.
 // - Speculation<Out>: the slots of one stage (a ReadLog and an Out per item, reused from beat to beat), Run (the
 //   items on the sim's worker pool), Take (an item's verified result at its serial turn), and the counts.
-// - SpecMode, from MOHO64_PAR_<NAME>: off (the default: nothing runs ahead, the serial code alone), on, verify
-//   (every taken result is also computed serially and compared: a difference is a read the task did not note, and
-//   stops the program), redo (every result is thrown away: the serial redo through the stage's new code).
+// - SpecMode, from MOHO64_PAR_<NAME>: off (nothing runs ahead, the serial code alone), on, verify (every taken
+//   result is also computed serially and compared: a difference is a read the task did not note, and stops the
+//   program), redo (every result is thrown away: the serial redo through the stage's new code). Unset: the sim's
+//   default (Sim::ParDefault: on in a game with the engine's fixes and more than one thread, else off).
 //
 // The rules of a speculative task are a parallel task's (core/workers.h): it reads only state that nothing writes
 // while the pool runs, writes only its own slot (and its worker's scratch), never touches a Lua state, allocates
@@ -34,8 +35,14 @@ enum class SpecMode { kOff, kOn, kVerify, kRedo };
 
 // The worker a speculative task runs on (set by Speculation::Run for its tasks): a stage's own per-worker storage.
 inline thread_local int tl_specWorker = 0;
-// MOHO64_PAR_<name>: unset / 0 / off -> kOff; 1 / on -> kOn; verify; redo
-SpecMode SpecModeFromEnvironment(const char* name);
+// MOHO64_PAR_<name>: unset -> unset (kOff unless given); 0 / off -> kOff; 1 / on -> kOn; verify; redo
+SpecMode SpecModeFromEnvironment(const char* name, SpecMode unset = SpecMode::kOff);
+// MOHO64_PAR_<name> is set (not empty): an explicit choice, which wins over a default (Sim::ParDefault)
+bool SpecModeGiven(const char* name);
+// The stage's minimum of items a beat (MOHO64_PAR_<name>=on:N; else dflt): below it nothing is made ahead in that beat
+// and the stage runs serially as with the switch off (a pool call and the checks at each item's turn cost more than
+// a small beat's work saves: measured, e1 2026-10-31). verify and redo always run ahead (0).
+size_t SpecMinFromEnvironment(const char* name, size_t dflt);
 const char* SpecModeName(SpecMode m);
 
 class ReadLog {
@@ -96,6 +103,8 @@ class ReadLog {
 // and compared with the serial result (verify).
 struct SpecCounts {
   uint64_t made = 0, taken = 0, changed = 0, none = 0, thrown = 0, checked = 0;
+  uint64_t rounds = 0, below = 0;  // beats made ahead / beats under the stage's minimum (made serially)
+  uint64_t items = 0;               // the items of the beats made ahead (made: those that gave a result)
   // the changed results by the index of their first changed read (the last bucket: that index or later): which read
   // throws results away, for the stage's tuning (its order of reads is the stage's own)
   static constexpr size_t kFirst = 16;
@@ -109,6 +118,18 @@ class Speculation {
   explicit Speculation(const char* name) : name_(name), mode_(SpecModeFromEnvironment(name)) {}
   SpecMode mode() const { return mode_; }
   bool active() const { return mode_ != SpecMode::kOff; }
+  void SetMode(SpecMode m) { mode_ = m; }  // (Sim::Start: the default once the session is known)
+  size_t minItems() const { return minItems_; }
+  void SetMinItems(size_t n) { minItems_ = n; }
+  // A beat of n items under the minimum (not in verify / redo): nothing is made ahead in round `round`, and every
+  // Take of it answers "none" (the serial path). Returns whether it is under.
+  bool Below(size_t n, uint32_t round) {
+    if (mode_ == SpecMode::kVerify || mode_ == SpecMode::kRedo || n >= minItems_) return false;
+    round_ = round;
+    n_ = 0;
+    ++counts_.below;
+    return true;
+  }
   const SpecCounts& counts() const { return counts_; }
   const char* name() const { return name_; }
 
@@ -137,6 +158,8 @@ class Speculation {
     for (size_t i = 0; i < n; ++i)
       if (slots_[i].made) ++counts_.made;
     n_ = n;
+    ++counts_.rounds;
+    counts_.items += n;
   }
   // Item i's result at its serial turn, if one was made this round and every read it noted is unchanged; else
   // nullptr, and the caller computes the item itself (the redo). An item is taken at most once.
@@ -180,6 +203,7 @@ class Speculation {
   std::vector<Slot> slots_;
   std::vector<ReadLog::Arena> arenas_;  // (one a worker: the round's read logs)
   size_t n_ = 0;
+  size_t minItems_ = 0;
   uint32_t round_ = 0xffffffffu;
   SpecCounts counts_;
 };

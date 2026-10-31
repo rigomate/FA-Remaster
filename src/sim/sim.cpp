@@ -881,14 +881,7 @@ Sim::Sim(Vfs* vfs, std::vector<std::string> hookDirs, std::vector<std::string> m
       navSpec_(std::make_unique<Speculation<NavAhead>>("NAV")),
       commandIds(std::make_shared<CommandIdPool>()) {
   prof::InstallLuaTimer();  // MOHO64_PROFILE only (core/profile.h): the Lua timer on the sim's thread
-  if (surfaceSpec_->active())
-    Logf(LogLevel::Info, "moho64: MOHO64_PAR_MOTION=%s: the entity pass's contact searches are made ahead",
-         SpecModeName(surfaceSpec_->mode()));
-  if (aimAhead_->active())
-    Logf(LogLevel::Info, "moho64: MOHO64_PAR_AIM=%s: the aim controllers' muzzles are made ahead", SpecModeName(aimAhead_->mode));
-  if (navSpec_->active())
-    Logf(LogLevel::Info, "moho64: MOHO64_PAR_NAV=%s: the navigators' unit tests are played ahead",
-         SpecModeName(navSpec_->mode()));
+  // (MOHO64_PAR_MOTION / AIM / NAV: read here as given; Start(SessionDescription) settles their default, ParDefault)
   if (workers_->Threads() > 1 || workers_->Check().mode != ParCheck::kOff)
     Logf(LogLevel::Info, "moho64: the sim's worker pool: %d thread(s)%s", workers_->Threads(),
          workers_->Check().mode == ParCheck::kShuffle   ? ", order check: shuffle (tasks on this thread)"
@@ -1226,11 +1219,46 @@ bool Sim::FixesFor(const SessionDescription& session) {
   return on;
 }
 
+bool Sim::ParDefault() const { return fixes && workers_->Threads() > 1; }
+
+namespace {
+// The multicore stages' minimum items (Sim::Start; MOHO64_PAR_<NAME>=on:N overrides): units in the entity pass a beat
+// for MOTION and AIM; for NAV, navigators that test in one army's navigator stage (the stages run army by army)
+constexpr size_t kParMotionMin = 1024, kParAimMin = 1024, kParNavMin = 110;
+}  // namespace
+
 bool Sim::Start(const SessionDescription& session) {
   SimFpScope fp;
   focusArmy = session.focusArmy;
   isReplay = session.replay;
   fixes = FixesFor(session);
+  // The multicore switches' default, now that the fixes are known (ParDefault); one given in the environment stays as
+  // it was read. (The intel stages' switches are settled at their first use in a beat, per sim: sim/intel.cpp.)
+  {
+    const bool on = ParDefault();
+    if (!SpecModeGiven("MOTION")) surfaceSpec_->SetMode(on ? SpecMode::kOn : SpecMode::kOff);
+    if (!SpecModeGiven("AIM")) aimAhead_->mode = on ? SpecMode::kOn : SpecMode::kOff;
+    if (!SpecModeGiven("NAV")) navSpec_->SetMode(on ? SpecMode::kOn : SpecMode::kOff);
+    // The minimum a beat for each (on:N overrides; verify / redo: none). Measured (e1, 2026-10-31, quiet machine, same-
+    // moment pairs): the entity pass's stages (MOTION + AIM) cost more than they save below about 1,000 units in the
+    // pass (b8, B1's first 8000 beats: +0.01..+0.05 ms a beat) and pay above it (B1 at 2,000-2,700 units -0.1..-0.3 ms,
+    // B3-2000 entity pass -6%); the navigators' (NAV, per army's stage since the stages run army by army) cost at 63
+    // and 88 navigators testing in an army's stage (B3-2000 / B3-8000: +5% / +2% of the navigators' phase) and pay at
+    // 138 (B3-16k: -3.5%); the line between them crosses near 106.
+    surfaceSpec_->SetMinItems(SpecMinFromEnvironment("MOTION", kParMotionMin));
+    aimAhead_->minItems = SpecMinFromEnvironment("AIM", kParAimMin);
+    navSpec_->SetMinItems(SpecMinFromEnvironment("NAV", kParNavMin));
+    const char* why = on ? " (the default: a game with the fixes, more than one thread)" : "";
+    if (surfaceSpec_->active())
+      Logf(LogLevel::Info, "moho64: MOHO64_PAR_MOTION=%s%s: the entity pass's contact searches are made ahead (beats of %zu units or more)",
+           SpecModeName(surfaceSpec_->mode()), SpecModeGiven("MOTION") ? "" : why, surfaceSpec_->minItems());
+    if (aimAhead_->active())
+      Logf(LogLevel::Info, "moho64: MOHO64_PAR_AIM=%s%s: the aim controllers' muzzles are made ahead (beats of %zu units or more)",
+           SpecModeName(aimAhead_->mode), SpecModeGiven("AIM") ? "" : why, aimAhead_->minItems);
+    if (navSpec_->active())
+      Logf(LogLevel::Info, "moho64: MOHO64_PAR_NAV=%s%s: the navigators' unit tests are played ahead (an army's stage of %zu navigators or more)",
+           SpecModeName(navSpec_->mode()), SpecModeGiven("NAV") ? "" : why, navSpec_->minItems());
+  }
   // A fix made in the blueprints needs the rules state: the hosts load the rules (LoadRules) before the session
   // says whether the fixes are on, so the rules are the original's. With the fixes, and only in a game that has
   // what such a fix is for (today the stock campaign mod's blueprints, deviations.md 4), they are loaded again,
@@ -1628,6 +1656,25 @@ void EraseById(std::vector<Unit*>& v, Unit* u) {
 }
 }  // namespace
 
+namespace {
+struct UnitGridCounts {
+  std::atomic<uint64_t> entries{0}, entryMismatches{0}, lists{0}, listMismatches{0};
+  ~UnitGridCounts() {
+    if (Sim::kVerifyUnitGrid)
+      std::fprintf(stderr, "moho64 verify unitgrid: entries %llu, mismatches %llu; lists %llu, mismatches %llu\n",
+                   static_cast<unsigned long long>(entries.load()), static_cast<unsigned long long>(entryMismatches.load()),
+                   static_cast<unsigned long long>(lists.load()), static_cast<unsigned long long>(listMismatches.load()));
+  }
+} g_unitGridCounts;
+}  // namespace
+void Sim::VerifyUnitGridEntry(const UnitGridEntry& e) {
+  g_unitGridCounts.entries.fetch_add(1, std::memory_order_relaxed);
+  if (e.army != e.u->army) g_unitGridCounts.entryMismatches.fetch_add(1, std::memory_order_relaxed);
+}
+void Sim::VerifyUnitGridList(bool same) {
+  g_unitGridCounts.lists.fetch_add(1, std::memory_order_relaxed);
+  if (!same) g_unitGridCounts.listMismatches.fetch_add(1, std::memory_order_relaxed);
+}
 void Sim::RebuildUnitGrid() {
   int w = map_ ? (map_->width() + 15) / 16 + 1 : 64, h = map_ ? (map_->height() + 15) / 16 + 1 : 64;
   if (w != gridW_ || h != gridH_) {
@@ -1641,10 +1688,17 @@ void Sim::RebuildUnitGrid() {
     if (u->destroyQueued) continue;
     int cx = std::clamp(static_cast<int>(u->position.x) >> 4, 0, gridW_ - 1);
     int cz = std::clamp(static_cast<int>(u->position.z) >> 4, 0, gridH_ - 1);
-    grid_[static_cast<size_t>(cz) * gridW_ + cx].push_back(u);
+    grid_[static_cast<size_t>(cz) * gridW_ + cx].push_back(UnitGridEntry{u, u->army, 0});
   }
+  for (auto& c : grid_)  // each entry's run of one army (UnitGridEntry::runEnd)
+    for (size_t i = c.size(); i-- > 0;)
+      c[i].runEnd = i + 1 < c.size() && c[i + 1].army == c[i].army ? c[i + 1].runEnd : static_cast<uint32_t>(i + 1);
   gridDirty_ = false;
 }
+namespace combat {
+int Relation(const Army* a, const Army* b);  // (combat.cpp)
+}
+int Sim::ArmyRelation(const Army* a, const Army* b) { return combat::Relation(a, b); }
 
 const std::vector<Unit*>& Sim::CommandOrder() {
   if (cmdOrderDirty_) {

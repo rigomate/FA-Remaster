@@ -8,10 +8,25 @@
 
 namespace moho {
 
-SpecMode SpecModeFromEnvironment(const char* name) {
+bool SpecModeGiven(const char* name) {
   const std::string var = std::string("MOHO64_PAR_") + name;
   const char* v = std::getenv(var.c_str());
-  if (!v || !*v || !std::strcmp(v, "0") || !std::strcmp(v, "off")) return SpecMode::kOff;
+  return v && *v;
+}
+
+size_t SpecMinFromEnvironment(const char* name, size_t dflt) {
+  const std::string var = std::string("MOHO64_PAR_") + name;
+  const char* v = std::getenv(var.c_str());
+  if (v && (!std::strcmp(v, "verify") || !std::strcmp(v, "redo"))) return 0;
+  if (v && !std::strncmp(v, "on:", 3)) return static_cast<size_t>(std::strtoull(v + 3, nullptr, 10));
+  return dflt;
+}
+
+SpecMode SpecModeFromEnvironment(const char* name, SpecMode unset) {
+  const std::string var = std::string("MOHO64_PAR_") + name;
+  const char* v = std::getenv(var.c_str());
+  if (!v || !*v) return unset;
+  if (!std::strcmp(v, "0") || !std::strcmp(v, "off")) return SpecMode::kOff;
   if (!std::strcmp(v, "verify")) return SpecMode::kVerify;
   if (!std::strcmp(v, "redo")) return SpecMode::kRedo;
   return SpecMode::kOn;
@@ -71,6 +86,9 @@ std::string SpecCounts::Line(const char* name) const {
                 static_cast<unsigned long long>(changed), static_cast<unsigned long long>(none),
                 static_cast<unsigned long long>(thrown), static_cast<unsigned long long>(checked));
   std::string line = b;
+  if (rounds || below)
+    line += "; beats ahead " + std::to_string(rounds) + " (items " + std::to_string(items) + "), under the minimum " +
+            std::to_string(below);
   if (changed) {
     line += "; changed by first read:";
     for (size_t i = 0; i < kFirst; ++i)

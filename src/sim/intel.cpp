@@ -85,6 +85,19 @@ struct ArmyIntel {
 };
 }  // namespace
 
+// The intel stages on the worker pool (multicore step 4), each behind its own switch MOHO64_PAR_<NAME>: 0 / off: the
+// serial code alone; on (or 1): on the pool; verify: on the pool, and the serial result is worked out too and
+// compared, and any difference stops the program; unset: the sim's default (Sim::ParDefault). (The names and values
+// as e1's speculation switches, core/speculate.h.) "on:N": on the pool only in beats with at least N items (the
+// stage's own default without ":N"; the serial code below it, which gives the same result: a pool call costs more
+// than a few hundred items' work). verify always takes the pool. Settled once per sim (IntelState::par*).
+enum class ParMode { kOff, kOn, kVerify };
+struct IntelPar {
+  ParMode mode = ParMode::kOff;
+  size_t minItems = 0;
+  bool Pool(size_t items) const { return mode == ParMode::kVerify || (mode == ParMode::kOn && items >= minItems); }
+};
+
 // The sim's intel (Sim::intelState). Multicore step 1: these were process-wide (g_armies, g_sources, g_blips,
 // g_goneUnits), so two sims in one process shared them.
 struct IntelState {
@@ -111,6 +124,9 @@ struct IntelState {
   };
   std::vector<Ahead> ahead;
   uint64_t luaCalls = 0;
+  // MOHO64_PAR_RECON / BLIPS / INTELCOORDS for this sim (IntelPars: at the first use, after Start settled the fixes)
+  bool parSettled = false;
+  IntelPar parRecon, parBlips, parCoords;
 };
 
 namespace {
@@ -124,35 +140,29 @@ const IntelState& IS(const Sim& sim) {
   return sim.intelState ? *sim.intelState : none;
 }
 
-// The intel stages on the worker pool (multicore step 4), each behind its own switch MOHO64_PAR_<NAME>: unset / 0 /
-// off: the serial code alone (the default); on (or 1): on the pool; verify: on the pool, and the serial result is
-// worked out too and compared, and any difference stops the program. (The names and values as e1's speculation
-// switches, core/speculate.h.) "on:N": on the pool only in beats with at least N items (the stage's own default
-// without ":N"; the serial code below it, which gives the same result: a pool call costs more than a few hundred
-// items' work). verify always takes the pool. Read once per process.
-enum class ParMode { kOff, kOn, kVerify };
-struct IntelPar {
-  ParMode mode = ParMode::kOff;
-  size_t minItems = 0;
-  bool Pool(size_t items) const { return mode == ParMode::kVerify || (mode == ParMode::kOn && items >= minItems); }
-};
-IntelPar IntelParMode(const char* name, size_t defaultMin) {
+// The intel stages' switches (ParMode / IntelPar above IntelState), settled once per sim at their first use: the
+// default (unset) is the sim's (Sim::ParDefault: on in a game with the engine's fixes and more than one thread);
+// MOHO64_PAR_<NAME> given wins. (Per sim, not per process: a host that plays a replay and then a new game in one
+// process takes each one's own.)
+IntelPar IntelParMode(const char* name, size_t defaultMin, bool defaultOn) {
   const std::string var = std::string("MOHO64_PAR_") + name;
   const char* v = std::getenv(var.c_str());
   IntelPar p;
   p.minItems = defaultMin;
-  if (!v || !*v || !std::strcmp(v, "0") || !std::strcmp(v, "off")) return p;
-  if (!std::strcmp(v, "verify")) {
+  const bool given = v && *v;
+  if (!given ? !defaultOn : (!std::strcmp(v, "0") || !std::strcmp(v, "off"))) return p;
+  if (given && !std::strcmp(v, "verify")) {
     p.mode = ParMode::kVerify;
     p.minItems = 0;
   } else {
     p.mode = ParMode::kOn;
-    if (!std::strncmp(v, "on:", 3)) p.minItems = static_cast<size_t>(std::strtoull(v + 3, nullptr, 10));
+    if (given && !std::strncmp(v, "on:", 3)) p.minItems = static_cast<size_t>(std::strtoull(v + 3, nullptr, 10));
   }
   if (p.mode == ParMode::kVerify)
     Logf(LogLevel::Info, "moho64: %s=verify: on the worker pool, every beat checked against the serial result", var.c_str());
   else
-    Logf(LogLevel::Info, "moho64: %s=on: on the worker pool in beats with at least %zu items", var.c_str(), p.minItems);
+    Logf(LogLevel::Info, "moho64: %s=on%s: on the worker pool in beats with at least %zu items", var.c_str(),
+         given ? "" : " (the default: a game with the fixes, more than one thread)", p.minItems);
   return p;
 }
 // The defaults of "on" (items: blips, intel sources). Measured on B1 (2026-10-28): a pool call cost about 0.07-0.1 ms
@@ -163,6 +173,17 @@ constexpr size_t kParBlipsMin = 2048, kParIntelCoordsMin = 1024;
 constexpr size_t kParRasterOpsMin = 64;
 // MOHO64_PAR_RECON's default for "on": the main loop's units (of the other armies, VISIBLETORECON)
 constexpr size_t kParReconMin = 1024;
+IntelState& IntelPars(Sim& sim) {
+  IntelState& st = IS(sim);
+  if (!st.parSettled) {
+    const bool on = sim.ParDefault();
+    st.parRecon = IntelParMode("RECON", kParReconMin, on);
+    st.parBlips = IntelParMode("BLIPS", kParBlipsMin, on);
+    st.parCoords = IntelParMode("INTELCOORDS", kParIntelCoordsMin, on);
+    st.parSettled = true;
+  }
+  return st;
+}
 [[noreturn]] void IntelParMismatch(const char* name, uint32_t tick, const char* what, size_t item) {
   std::fprintf(stderr, "moho64: MOHO64_PAR_%s=verify: tick %u: %s %zu differs from the serial result\n", name, tick, what,
                item);
@@ -625,7 +646,7 @@ void ReconTick(Sim& sim, lua_State* L, int a) {
   // reads nor of the loop's own tests. From the first call on, and from any unit that is not the one expected, the
   // rest of the loop works its answers out itself, as without the switch. (The gone-units loops above may call Lua:
   // the answers are made after them.)
-  static const IntelPar parRecon = IntelParMode("RECON", kParReconMin);
+  const IntelPar parRecon = IntelPars(sim).parRecon;
   IntelState& st = IS(sim);
   std::vector<IntelState::Ahead>& ahead = st.ahead;
   ahead.clear();
@@ -972,7 +993,7 @@ void ReconBeat(Sim& sim) {
   // MOHO64_PAR_BLIPS (multicore step 4, R1): on the worker pool. Exact by construction: each item writes only its own
   // blip's transform and health, and reads only its source unit's fields and its own offset, which nothing writes
   // in this loop (a blip is never another blip's source; the list holds each blip once).
-  static const IntelPar parBlips = IntelParMode("BLIPS", kParBlipsMin);
+  const IntelPar parBlips = IntelPars(sim).parBlips;
   std::vector<ReconBlip*>& blips = IS(sim).blips;
   auto refresh = [&](size_t i0, size_t i1, int) {
     for (size_t i = i0; i < i1; ++i) {
@@ -1116,7 +1137,7 @@ void AdvanceIntelCoordsPar(Sim& sim, IntelState& st, uint32_t tick, bool allOnPo
 void AdvanceIntelCoords(Sim& sim) {
   uint32_t tick = sim.tick();
   IntelState& st = IS(sim);
-  static const IntelPar par = IntelParMode("INTELCOORDS", kParIntelCoordsMin);
+  const IntelPar par = IntelPars(sim).parCoords;
   if (!par.Pool(st.sources.size())) {
     AdvanceIntelCoordsSerial(st, tick);
     return;

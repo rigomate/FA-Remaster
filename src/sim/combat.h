@@ -312,6 +312,7 @@ struct AimAhead {
   AimAhead();
   SpecMode mode;
   SpecCounts counts;
+  size_t minItems = 0;  // the pass's units a beat below which nothing is walked ahead (Sim::Start; on:N)
   bool active() const { return mode != SpecMode::kOff; }
 };
 void AimMuzzlesAhead(Sim& sim, const std::vector<Unit*>& order);

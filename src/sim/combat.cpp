@@ -1330,9 +1330,11 @@ const std::vector<Unit*>& BlipsInRange(Sim& sim, Unit* u, int period) {
   if (R <= 0 || !u->army) return u->blipCache;
   int a = u->army->index - 1;
   Vec3 p = u->position;
-  sim.ForUnitsInRect(p.x - R, p.z - R, p.x + R, p.z + R, [&](Unit* t) {
-    if (t->dead || t->destroyQueued || !t->army) return;
-    if (Relation(u->army, t->army) == 2) return;
+  // The units of armies that are neither this one nor allied nor none (ForNonAlliedUnitsInRect: the others' runs in the
+  // grid are passed over untouched); the other tests as before. All are reads and the list is sorted below, so leaving
+  // the allies out first changes nothing (speed only).
+  sim.ForNonAlliedUnitsInRect(u->army, p.x - R, p.z - R, p.x + R, p.z + R, [&](Unit* t) {
+    if (t->dead || t->destroyQueued) return;
     // EntitiesAroundPoint 0x722350 keeps a unit when R^2 > dx^2 + dz^2, dx = its x - the point's (comiss 0x7224b5,
     // jbe: strict, and a NaN distance is left out); ours kept one at exactly R.
     if (!(R * R > Dist2XZ(t->position, p))) return;
@@ -1340,6 +1342,18 @@ const std::vector<Unit*>& BlipsInRange(Sim& sim, Unit* u, int period) {
     u->blipCache.push_back(t);
   });
   std::sort(u->blipCache.begin(), u->blipCache.end(), [](const Unit* x, const Unit* y) { return x->id < y->id; });
+  if (Sim::kVerifyUnitGrid) {  // the list the old way (every unit in the rect walked), compared
+    std::vector<Unit*> old;
+    sim.ForUnitsInRect(p.x - R, p.z - R, p.x + R, p.z + R, [&](Unit* t) {
+      if (t->dead || t->destroyQueued || !t->army) return;
+      if (Relation(u->army, t->army) == 2) return;
+      if (!(R * R > Dist2XZ(t->position, p))) return;
+      if (a < 0 || a >= 16 || !HasBlip(t, a)) return;
+      old.push_back(t);
+    });
+    std::sort(old.begin(), old.end(), [](const Unit* x, const Unit* y) { return x->id < y->id; });
+    Sim::VerifyUnitGridList(old == u->blipCache);
+  }
   // EntitiesAroundPoint walks the entity grid, so the list comes in GRID order (rect_queries.md 2.4: rows by z,
   // columns by x, in a bucket the most recently registered first; ids play no part). FindBestEnemy depends on it:
   // the current target only holds its place against candidates that come after it.
@@ -2366,6 +2380,11 @@ void AimMuzzlesAhead(Sim& sim, const std::vector<Unit*>& order) {
   AimAhead& st = sim.aimAhead();
   static const bool dbgW = getenv("MOHO64_DEBUG_WEAPON") != nullptr;  // (its lines are written at the unit's turn)
   if (!st.active() || dbgW) return;
+  if (st.mode != SpecMode::kVerify && st.mode != SpecMode::kRedo && order.size() < st.minItems) {
+    ++st.counts.below;  // (a small beat: the muzzles are walked at the units' turns)
+    return;
+  }
+  ++st.counts.rounds;
   const uint32_t round = sim.tick();
   std::atomic<uint64_t> made{0};
   sim.workers().ParallelFor("aim muzzles ahead", order.size(), 16, [&](size_t b, size_t e, int) {

@@ -1434,6 +1434,9 @@ static void LandNavAheadRun(Sim& sim, const std::vector<Unit*>& all) {
     items.push_back(u);
   }
   if (items.empty()) return;
+  // (an army's stage with few navigators testing: they test at their own turns, as with the switch off; the minimum
+  // counts per call, which is per army since the stages run army by army)
+  if (spec.Below(items.size(), tick)) return;
   sim.EnsureUnitGrid();
   // (MOHO64_PAR_NAV_GRAIN: navigators per task; 8 by default: a turn's cost varies a lot, B3-16k's longest task was
   // 17 ms with 64 and 7 ms with 8, the stage's wall 6.4 -> 2.9 s)
@@ -1559,7 +1562,8 @@ void LandNavStageEnd(Sim& sim) {
     if (prof) T.aheadCounts.seconds += NowS() - p0;
   }
   double t1 = prof ? NowS() : 0;
-  T.SearchesAhead(sim.workers(), sim.tick());  // MOHO64_PAR_PATH (off by default)
+  T.SettleSearchesAhead(sim.ParDefault());
+  T.SearchesAhead(sim.workers(), sim.tick());  // MOHO64_PAR_PATH (on by default in a game with the fixes: ParDefault)
   T.WorkAll(0);
   double t2 = prof ? NowS() : 0;
   // A search that ends the move (state 1, Failed: an empty first path, a continuation blocked after its

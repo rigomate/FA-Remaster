@@ -45,13 +45,31 @@ struct HPathTables::PathSpec {
   uint64_t stopped = 0, serial = 0, whyN[6] = {};
   double stoppedS = 0, serialS = 0;
   Search ref;                     // (verify) the serial computation
+  bool settled = false;           // SettleSearchesAhead ran
 };
 
 HPathTables::HPathTables(Navigation* nav, int mapW, int mapH)
-    : nav_(nav), w_(mapW), h_(mapH), spec_(std::make_unique<PathSpec>()) {
-  if (spec_->spec.active())
-    Logf(LogLevel::Info, "moho64: MOHO64_PAR_PATH=%s: the path searches are played ahead",
-         SpecModeName(spec_->spec.mode()));
+    : nav_(nav), w_(mapW), h_(mapH), spec_(std::make_unique<PathSpec>()) {}
+
+namespace {
+// MOHO64_PAR_PATH's minimum: searches played ahead in a beat (SettleSearchesAhead). Measured (e1, 2026-10-31, quiet
+// machine, same-moment pairs, PATH alone): it pays at every load seen, B1 at ~11 searches a beat (navigators' phase
+// -2.8%), B3-2000 / 8000 / 16000 at 15 / 16 / 21 (-7 / -8 / -9%); B1's first 4000 beats, a few searches each, are
+// even (+-0.01 ms a beat): a beat of fewer than 4 is left serial, the pool call is not worth its wake.
+constexpr size_t kParPathMin = 4;
+}  // namespace
+
+void HPathTables::SettleSearchesAhead(bool defaultOn) {
+  PathSpec& P = *spec_;
+  if (P.settled) return;
+  P.settled = true;
+  const bool given = SpecModeGiven("PATH");
+  if (!given) P.spec.SetMode(defaultOn ? SpecMode::kOn : SpecMode::kOff);
+  P.spec.SetMinItems(SpecMinFromEnvironment("PATH", kParPathMin));
+  if (P.spec.active())
+    Logf(LogLevel::Info, "moho64: MOHO64_PAR_PATH=%s%s: the path searches are played ahead (beats of %zu searches or more)",
+         SpecModeName(P.spec.mode()), given ? "" : " (the default: a game with the fixes, more than one thread)",
+         P.spec.minItems());
 }
 
 HPathTables::~HPathTables() {
@@ -1172,6 +1190,7 @@ void HPathTables::SearchesAhead(WorkerPool& pool, uint32_t round) {
     }
   }
   if (P.items.empty()) return;
+  if (P.spec.Below(P.items.size(), round)) return;  // (a small beat: the queues' work searches serially, as with the switch off)
   P.round = round;
   P.ready = true;
   P.spec.Run(pool, "path searches ahead", round, P.items.size(), 1, [&](size_t i, ReadLog&, PathSpec::Out& o) {
