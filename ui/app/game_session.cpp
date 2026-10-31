@@ -1135,7 +1135,7 @@ struct GameSession::Net {
   std::map<uint8_t, uint32_t> firstDesync;           // per client, the checksum beat it was first out of step at
   std::set<std::pair<uint8_t, uint32_t>> partsSent;  // (client, beat)
   bool desyncFileStarted = false;
-  std::unique_ptr<Fingerprint> detail;  // the full listing of beat detailAt, asked for at the game's first desync
+  std::string detailPath;  // where the full listing of beat detailAt goes (asked for at the game's first desync)
   uint32_t detailAt = 0;
   bool detailAsked = false;
   // the test switches that change this copy's state or its line (NetTestSwitch; set before the game's beats come)
@@ -2534,9 +2534,8 @@ bool GameSession::NetBeatOrders(std::string* merged) {
 
 // After a network game's beat, on the thread that ran it (the engine's: on the beats' thread right after the beat):
 // its digest for the checksum, every 50th beat only (not free). Beside it, ours for a desync (NetSendParts): the
-// beat's pulse (a few numbers read, every beat) and, every 50th beat, the state line the digest is made of. That line
-// is made twice on those beats today, once inside LockstepDigest and once here: the engine's LockstepDigest does not
-// hand out the line it hashes (the engine change asked for: docs/ui-net-game.md, "A desync's parts").
+// beat's pulse (a few numbers read, every beat) and, every 50th beat, the state line the digest is made of (handed out
+// by LockstepDigest: ui request 51).
 void GameSession::NetDigest() {
   if (!net_ || !net_->afterDue) return;
   Net& n = *net_;
@@ -2561,14 +2560,19 @@ void GameSession::NetDigest() {
   p.draws = sim_->rngDraws_;
   p.units = static_cast<uint32_t>(sim_->units().size());
   p.projectiles = static_cast<uint32_t>(sim_->projectiles.size());
-  if (n.detail && beat == n.detailAt) {  // (asked for at the game's first desync: NetAskDetail)
-    n.detail->Beat(*sim_, beat);
-    n.detail.reset();
-  }
   if (beat % kLockstepChecksumPeriod != 0) return;
-  n.digest = LockstepDigest(*sim_, beat);
-  std::string line = Fingerprint::StateLine(*sim_, beat);
-  if (const size_t lua = line.rfind(" lua="); lua != std::string::npos) line.resize(lua);  // (as LockstepDigest)
+  std::string line;
+  n.digest = LockstepDigest(*sim_, beat, &line);
+  if (!n.detailPath.empty() && beat == n.detailAt) {  // (asked for at the game's first desync: NetAskDetail)
+    Fingerprint::WriteDetail(*sim_, beat, n.detailPath + ".detail." + std::to_string(beat),
+                             "the next checksum beat after the game's first desync");
+    if (FILE* f = std::fopen(n.detailPath.c_str(), "w")) {
+      std::fprintf(f, "%s\n", line.c_str());
+      std::fclose(f);
+    }
+    n.detailPath.clear();
+  }
+  if (const size_t lua = line.rfind(" lua="); lua != std::string::npos) line.resize(lua);  // (as LockstepDigest hashes it)
   if (beat == n.corruptAt && !n.digest.empty()) {  // (the test switch: a desync on purpose)
     n.digest[0] = static_cast<char>(n.digest[0] ^ 0x5a);
     // (and, when named, that part of our line, as if the state's part differed: the state itself is left as it is)
@@ -2673,16 +2677,6 @@ std::string NowText() {
   return b;
 }
 
-// An environment variable set (nullptr: removed), as the record's fingerprint is opened (StartSession).
-void SetEnv(const char* name, const char* value) {
-#ifdef _WIN32
-  _putenv_s(name, value ? value : "");
-#else
-  if (value) setenv(name, value, 1);
-  else unsetenv(name);
-#endif
-}
-
 }  // namespace
 
 // Where a desync's files go: beside the game's record (--replay-out) or, without one, its replay
@@ -2698,10 +2692,9 @@ std::string GameSession::NetDesyncBase() const {
 
 // At the game's first desync: this copy's full listing of a beat both sides can still write, the next checksum beat
 // (the beat found out of step has run here already, and its state is gone; both copies find a desync within a few
-// beats of its checksum beat, so both list the same beat). The listing is the engine's (Fingerprint with
-// MOHO64_FINGERPRINT_DETAIL: one line per army, unit, projectile, prop and entity), written on the beats' thread at
-// that beat (NetDigest): <base>.desync.fp (that beat's line) and <base>.desync.fp.detail.<beat>. The engine's class is
-// made from the environment, set for that moment as StartSession does for the record's fingerprint.
+// beats of its checksum beat, so both list the same beat). The listing is the engine's (Fingerprint::WriteDetail: one
+// line per army, unit, projectile, prop and entity), written on the beats' thread at that beat (NetDigest):
+// <base>.desync.fp (that beat's line) and <base>.desync.fp.detail.<beat>.
 void GameSession::NetAskDetail() {
   Net& n = *net_;
   if (n.detailAsked) return;
@@ -2712,23 +2705,9 @@ void GameSession::NetAskDetail() {
     return;
   }
   n.detailAt = (n.beat / kLockstepChecksumPeriod + 1) * kLockstepChecksumPeriod;
-  const char* names[] = {"MOHO64_FINGERPRINT", "MOHO64_FINGERPRINT_PEER", "MOHO64_FINGERPRINT_DETAIL"};
-  std::string kept[3];
-  bool had[3];
-  for (int i = 0; i < 3; ++i) {
-    const char* v = std::getenv(names[i]);
-    had[i] = v != nullptr;
-    kept[i] = v ? v : "";
-  }
-  const std::string file = base + ".desync.fp", beat = std::to_string(n.detailAt);
-  SetEnv(names[0], file.c_str());
-  SetEnv(names[1], nullptr);
-  SetEnv(names[2], beat.c_str());
-  n.detail = Fingerprint::FromEnvironment();
-  for (int i = 0; i < 3; ++i) SetEnv(names[i], had[i] ? kept[i].c_str() : nullptr);
-  if (n.detail)
-    Logf(LogLevel::Info, "moho64ui: the state of beat %u (the next checksum beat) will be listed in %s.detail.%u",
-         n.detailAt, file.c_str(), n.detailAt);
+  n.detailPath = base + ".desync.fp";
+  Logf(LogLevel::Info, "moho64ui: the state of beat %u (the next checksum beat) will be listed in %s.detail.%u",
+       n.detailAt, n.detailPath.c_str(), n.detailAt);
 }
 
 // A desync with `client` at checksum beat `beat` (the lockstep found its checksum differs from ours): our parts of that

@@ -163,10 +163,9 @@ state differs and from about which beat: a step towards the debugger Chris wants
   `u<N>` per army's units, `proj`, `props`, `ents`; sim/fingerprint.h), for 300 beats. And every beat a pulse: the
   random draws so far, the number of units and of projectiles (three numbers read; 128 beats kept). Both are made in
   `GameSession::NetDigest` on the thread that ran the beat. Nothing else is computed on the other beats.
-- **The cost.** LockstepDigest makes the same line and does not hand it out, so the line is made twice on a checksum
-  beat: 0.3-0.5 ms more each 50th beat in the 2-player test game on Seton's (the digest itself 0.5-0.9 ms there; the
-  engine's estimate for a big game is 1-5 ms). The engine change asked for: `LockstepDigest(sim, beat,
-  std::string* line = nullptr)` (or a `LockstepDigestOfLine(line)`), so the line is made once.
+- **The cost.** None beyond the digest: LockstepDigest hands out the line it hashed (`LockstepDigest(sim, beat,
+  &line)`, the lua part included and cut off here; ui request 51, engine 10abbc6). Before that the line was made
+  twice: 0.3-0.5 ms more each 50th beat in the 2-player test game.
 - **The exchange.** When the lockstep finds a client's checksum differs (Lockstep::desyncs()), this program sends that
   client message 60, DESYNC PARTS (ours: `net/beat_exchange_net.h`; the original's index table 0x53c344 sends a type 60
   to its default case 0x53c2df, as every type past 57 but 202 / 203): the checksum beat, the pulses of the beats since
@@ -189,12 +188,10 @@ state differs and from about which beat: a step towards the debugger Chris wants
   next game's desync overwrites them as the next game overwrites the replay): `<base>.desync.txt` (every desync as this
   copy saw it: the line, both state lines, the first pulse that differs) and this copy's full listing of the next
   checksum beat after the game's first desync, `<base>.desync.fp.detail.<beat>` (the engine's listing,
-  MOHO64_FINGERPRINT_DETAIL: one line per army, unit, projectile, prop and entity; `<base>.desync.fp` holds that beat's
-  line). Two players' files of one game compare line by line. Not the listing of the desync's own beat: its state is
+  `Fingerprint::WriteDetail`: one line per army, unit, projectile, prop and entity; `<base>.desync.fp` holds that
+  beat's line). Two players' files of one game compare line by line. Not the listing of the desync's own beat: its state is
   gone when the desync is found (a few beats later), and keeping a listing every 50 beats costs too much. Both copies
-  find it within a few beats of the checksum beat, so both list the same next checksum beat. The engine's class is made
-  from the environment for that moment (as StartSession does for the record's fingerprint); the engine change asked
-  for: `Fingerprint::WriteDetail` public and static (it reads only the sim).
+  find it within a few beats of the checksum beat, so both list the same next checksum beat.
 - **Tests** (`ui/tests/net_game_host.lua` / `net_game_join.lua`, both programs alike): the plain run, the joiner's
   checksum of beat 250 and its line's part a2 changed on purpose (`moho64ui_NetTestForTests("corrupt", 250, "a2")`,
   the state itself left as it is, so the fingerprints stay equal): both say "Joiner's economy (army 2) differs (first
