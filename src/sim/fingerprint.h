@@ -71,13 +71,15 @@ class Fingerprint {
   // The line Beat writes for the state after beat `beat`, made without a Fingerprint (no MOHO64_FINGERPRINT needed;
   // the props are sorted afresh, so a call costs a little more than Beat's): sim/lockstep.h LockstepDigest.
   static std::string StateLine(const Sim& sim, uint32_t beat);
+  // The full listing of the state after beat `beat` (armies, units, projectiles, props, ...) written to `path`, headed
+  // by `why`: what MOHO64_FINGERPRINT_DETAIL writes; also for a network game's desync (ui request 51).
+  static void WriteDetail(const Sim& sim, uint32_t beat, const std::string& path, const char* why);
 
  private:
   std::string Line(const Sim& sim, uint32_t beat) const;
   // The props in id order, sorted again only when the props list no longer holds the same entities in the same order
   // (handles are never given out twice).
   const std::vector<const Prop*>& PropsById(const Sim& sim) const;
-  void WriteDetail(const Sim& sim, uint32_t beat, const std::string& path, const char* why) const;
   bool PeerLine(uint32_t beat, std::string* line);  // false: the peer ended or went silent
   FILE* out_ = nullptr;
   std::string path_;

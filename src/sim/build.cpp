@@ -2187,6 +2187,7 @@ struct GuardData {
   bool childToGuard = false;          // the child's result lands in the guard (+0x2c)
   uint32_t childFrom = 0;             // its first tick (the thread's wait counter)
   bool childMove = false;             // state 0's move task (the thread is suspended until it ends)
+  bool childMoveDone = false;         // its navigator's event came before a command event gave it a new goal
   int result = 0;                     // +0x2c: 1 success, 2 failure
 };
 
@@ -3352,8 +3353,9 @@ int TickGuard(Sim& sim, lua_State* L, Unit* U, BuildTask& t) {
     g.child = nullptr;
     resumed = true;
   } else if (g.childMove) {
-    if (U->motion.hasGoal) return kTaskRunning;
+    if (U->motion.hasGoal && !g.childMoveDone) return kTaskRunning;
     g.childMove = false;
+    g.childMoveDone = false;
     // The walk of state 0 is a CUnitMoveTask (NewMoveTask 0x6190a0, SetGoal from 0x6190cb); when it ends, its dtor
     // 0x618700 clears Moving (0x6187bd) and then calls the navigator's AbortMove (0x618886): SetSpeedThroughGoal(0)
     // and MakeIdle -> SetWaypoints(0, 0), which rebuilds a brake spline still standing from the unit's state of now
@@ -3431,6 +3433,7 @@ int TickGuard(Sim& sim, lua_State* L, Unit* U, BuildTask& t) {
       MoveTaskWalk(sim, U, Vec3{cx + fp.sizeX * 0.5f, a.y, cz + fp.sizeZ * 0.5f});
       U->unitStates.Insert(US("Moving"));
       g.childMove = true;
+      g.childMoveDone = false;
       t.state = 1;
       break;
     }
@@ -3959,6 +3962,16 @@ void TaskWalkCommandEvent(Sim& sim, UnitCommand& c, Unit* h) {
     cz = static_cast<int>(std::nearbyint(q.z - fp.sizeZ * 0.5f));
   }
   const Vec3 goal{cx + fp.sizeX * 0.5f, p.y, cz + fp.sizeZ * 0.5f};
+  // The move task's result is the navigator's event (its listener 0x618bb0 writes it and wakes the thread); this
+  // listener (0x618c40) only hands the navigator a new goal and leaves that result alone. A walk whose navigator has
+  // already reported (arrived or failed earlier in this beat, its thread not yet run) therefore still ends at its
+  // thread's turn, and the task's dtor aborts the new goal (AbortMove 0x618886). Seen: MP1 17074, army 1's
+  // engineers 0x10005c, 0x10009f, 0x100110, 0x100165, 0x1001bb reach their anchors by the land factory 0x100035
+  // (the navigator's success in the navigator stage); 0x1000e9, earlier in the command stage, retargets their
+  // shared Guard to the factory's upgrade: the original's walks end in that beat (Moving off, the repair from
+  // 17076); ours walked on to the new goal by the upgrade.
+  const bool walkDone = h->motion.arrived || h->motion.failed;
+  if (walkDone && h->task && h->task->gdata && h->task->gdata->childMove) h->task->gdata->childMoveDone = true;
   h->motion.arrived = h->motion.failed = false;
   MotionSetGoal(sim, h, std::vector<Vec3>{goal}, h->motion.nav->speedThroughGoal, sim.tick());
   if (h->walkPrepared) {

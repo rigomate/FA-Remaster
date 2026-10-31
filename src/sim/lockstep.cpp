@@ -210,8 +210,9 @@ void Lockstep::AfterBeat(const std::string& digest) {
               mine_.end());
 }
 
-std::string LockstepDigest(const Sim& sim, uint32_t beat) {
+std::string LockstepDigest(const Sim& sim, uint32_t beat, std::string* stateLine) {
   std::string line = Fingerprint::StateLine(sim, beat);
+  if (stateLine) *stateLine = line;
   // the lua part (heap sizes, serials) differs between clients that look through different armies: not in it, as it
   // is not in the fingerprint's total or its peer check
   if (size_t lua = line.rfind(" lua="); lua != std::string::npos) line.resize(lua);

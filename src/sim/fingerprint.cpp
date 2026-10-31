@@ -485,7 +485,7 @@ bool Fingerprint::PeerLine(uint32_t beat, std::string* line) {
   }
 }
 
-void Fingerprint::WriteDetail(const Sim& sim, uint32_t beat, const std::string& path, const char* why) const {
+void Fingerprint::WriteDetail(const Sim& sim, uint32_t beat, const std::string& path, const char* why) {
   FILE* f = std::fopen(path.c_str(), "wb");
   if (!f) {
     Logf(LogLevel::Warning, "fingerprint: cannot write %s", path.c_str());

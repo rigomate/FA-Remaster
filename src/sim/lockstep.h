@@ -98,6 +98,8 @@ class Lockstep {
 // what one fingerprint line costs (about 1-5 ms): call it only on the beats AfterBeat uses (multiples of
 // kLockstepChecksumPeriod). Needs no MOHO64_FINGERPRINT.
 constexpr uint32_t kLockstepChecksumPeriod = 50;  // sim_ChecksumPeriod's default (0xbdbc33)
-std::string LockstepDigest(const Sim& sim, uint32_t beat);
+// stateLine (optional): the state line it hashed, the lua part included (ui request 51: the desync detail's per-part
+// hashes without making the line twice).
+std::string LockstepDigest(const Sim& sim, uint32_t beat, std::string* stateLine = nullptr);
 
 }  // namespace moho
