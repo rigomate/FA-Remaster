@@ -171,6 +171,29 @@ by the battle estimate of that zone (`Remastered.AIZoneEstimate`, 3.2), with our
   - **Gathering waits for the walk:** a gather commits (or is dropped) after 45 s plus the walk from the start to the
     staging zone at 2.5 world units a second, and at the end at least 30% of the army must be there (the duels
     committed with 9 of 75).
+- **Phase 10, the navy** (`data/ai/lua/remastered/ai/navy.lua`; the observed M28 games had about half of its army at
+  sea, 18,000-21,000 mass of ships at minute 18, and most of what we lost was shelled from the water):
+  - **Home water:** the water zone beside our base nearest the start. **Naval factories:** while the enemy has ships
+    we know of (what was seen fades slowly) or ships shell our coast, 1, plus 1 per 2,000 mass of the enemy's ships, at
+    most 4. Their sites are found once on a grid: water within 160 world units of the start whose shore (land within
+    24) is a land zone our engineers reach within 200 of travel, nearest by that travel. (The first form took the first
+    water on the line to the home water; on SETONS_R that shore was a cliff, and the engineer walked round into the
+    enemy.) An order not yet started counts for 60 s.
+  - **Ships:** the naval factories build the ship with the best build value against the enemy's known ships (frigate,
+    submarine; destroyer, cruiser; battleship by the factory's tech), while ours weigh less than 1.2 x the enemy's (at
+    least 600 while it has ships). A T1 naval factory due for T2 (our land at T2, 1,000 mass of enemy ships seen)
+    builds nothing until its upgrade starts.
+  - **Orders:** the ships go for the ships shelling our coast when the battle estimate there gives us the defend
+    margin, else for the nearest enemy ships by sea when it gives the launch margin, else they hold the home water.
+    `ainavy <army> <tick> defend|attack|hold zone <z> margin <m> | <reason>`.
+- **Phase 10, the air answer to ships:** the water zones beside our structures (and one step further out) with enemy
+  ships that hit the ground are the coast threat. Air factories build the anti-ship aircraft with the best build value
+  (bomber, gunship, torpedo bomber) up to 1.5 x the threat's mass, ahead of fighters; an air factory more per 1,500
+  mass of it; an air factory goes to T2 when our land is at T2. Idle anti-ship aircraft attack-move to the worst water
+  zone (`ainaval`). From minute 8 the air scouts also look at that water.
+- **Phase 10, shelled zones:** an enemy land force with a reach of 40 or more in a zone beside one with our structures,
+  close enough to shell it, counts as in our zone, so the defence goes for it (`aiop ... shelled`). Artillery and
+  missile launchers parked one zone out had shelled our structures from outside every zone the defence looked at.
 - **Phase 9, the trade check:** every 60 s of an attack or push, the army's mass lost is set against the enemy mass it
   killed in that time (the army stats). When it lost twice what it killed, and at least 600 mass, the attack ends
   (`aiop ... withdraw`) and that zone is not picked as a target for 5 minutes. Against M28 the estimate said 0.8 while
@@ -253,6 +276,10 @@ scouting, the army and expansion, not one after the other.
   - **The army kept also grows with our income:** 10 s of the smoothed mass income per minute after the opening, at
     most 120 s (x `armyMatch` / 0.8). While the army is short of it, the investments get half their share.
   - **Up to 20 land factories** (12 before): the mass bar had filled at minute 9-10 with 7-8 factories.
+- **Phase 10, the commander's fallback with ships off the coast:** when ships shell our coast, a hurt commander falls
+  back to the base zone farthest from them that has no water beside it (else the farthest); otherwise away from the
+  middle of every enemy near it, onto land our engineers reach, or to the start. On SETONS_R the start is on the coast:
+  FAF's ships killed the commander there, and a farthest zone on another shore lost it to a submarine's deck gun.
 - **Phase 9, energy after the opening.** "Short" is now under 30% stored and income under 1.2 x what is asked (an
   empty bar alone, a moment when a big build starts, had built 94 T1 generators by minute 14.5: 2,860 energy a second
   against 1,150 asked). Power is also capped first in `NeedPower`. The T2+ engineers kept grow by one every 3 minutes
@@ -1082,6 +1109,24 @@ both-modes check, multicore.md 1).
 
   - Together 153.1 minutes against 124.4 (+23%); four of five games last longer, the seed-1001 game against FAF's AI
     shorter. Faults: 0. The trade check withdrew 0-2 attacks a game.
+- **The phase-10 sets (2026-10-31), the navy with the air answer inside,** against phase 9 on the same engine (main
+  e97f1d1).
+  - **20 minutes, FAF and M28, seeds 1001-4004 (7 games):** all 7 alive at minute 20 with both. Against FAF's AI we lost
+    42,000 mass against 48,500 for the same kills; against M28 171,600 against 185,000 for the same kills, and M28's
+    army at minute 15 was about a tenth smaller.
+  - **60-minute duels:**
+
+    | Game | Phase 10 | Phase 9 | Lost per killed (phase 9) |
+    |---|---|---|---|
+    | recruit vs FAF adaptive | lost at minute 30.2 | lost at minute 31.6 | 2.10 (1.22) |
+    | veteran (turtle) vs FAF adaptive | **no result after 60 minutes** | lost at minute 49.6 | 0.84 (0.87) |
+    | recruit vs M28 | lost at minute 20.5 | lost at minute 25.6 | 9.2 (10.1) |
+    | veteran (turtle) vs M28 | lost at minute 28.2 | lost at minute 20.8 | 15.3 (15.2) |
+    | veteran (rusher) vs M28 without cheats | lost at minute 22.1 | lost at minute 25.5 | 11.3 (13.9) |
+
+  - Together 161.0 minutes against 153.1; two games longer, three shorter: a first form, not yet a clear step. Our
+    ships are 2,000-3,000 mass at minute 18 against M28's 18,000-21,000: against a navy that size the sea cannot be
+    won on our economy yet, and the coast needs holding from the land too.
 - **Then Chris plays it** and judges the feel (decision 8), in the one big check after the UEF polish unless he asks
   sooner.
 
@@ -1095,6 +1140,7 @@ both-modes check, multicore.md 1).
 | 4 (first form built 2026-10-29) | Strategic and operation layers: aggression with hysteresis, objectives, gathering, push, retreat by estimate, raids, navy and air domains, combined arms timing. Built: the zone estimate from the index (fair intel, memory, reinforcements on the way, kiting), defend / attack / push / raid with commit rules and logged decisions, tech upgrades. Not yet: gathering, navy and air, combined arms | Ours vs M28 and FAF's AI, several seeds: the fight scores of section 6; "never fled a weaker force" at zero faults. First duels: 0 faults, 3 losses and one 60-minute game without a result (section 6) |
 | 5 (first form built 2026-10-29) | Economy in parallel with scouting, army and expansion (power ahead but not wasted, factory floor, engineers by distance and away from enemies, reclaim, storage, timed assists); counters by build value; defences as build candidates; investments by payback and danger with a planned dip; the strategy layer's read of the enemy and stances; attacks on armies and expansions with gathering and reinforcements via the staging zone; guard posts; the knobs in one place (decisions 13-16) | The five duels of section 6 (mass / s at 5 / 15 / 30 minutes, mass lost per enemy mass killed); the 16 + B1 / b8 identical; our-key sessions identical at 1 / 32 threads, shuffle, reverse |
 | 6a (first form built 2026-10-30) | Map control: the army kept against the enemy's known army, guard posts sized by the threat and lost zones taken back, reclaim fields; each enemy read on its own (the focus enemy); the player's two sliders (aggression, economy) with bounds; the duels with fog of war | The duels of section 6 with fog; the 16 + B1 / b8 identical; our-key fogged sessions identical at 1 / 32 threads, shuffle, reverse |
+| 10 (first form built 2026-10-31) | The navy (naval factories by our shore, ships by build value, defend / attack / hold), the air answer to ships, shelled zones, the commander's fallback inland | The army set (FAF and M28, seeds 1001-4004, 20 minutes); the duels of section 6 with fog; our-key fogged sessions identical at 1 / 32 threads, shuffle, reverse |
 | 9 (first form built 2026-10-30) | The economy into an army (the army kept by our income, investments halved while short, up to 20 factories), energy after the opening (short by income against asks, power capped first, more T2 engineers), the trade check on attacks | The army set (FAF and M28, three seeds each, 20 minutes: army mass at 10 / 15 minutes, energy stalls, survival, trades); the duels of section 6 with fog; our-key fogged sessions identical at 1 / 32 threads, shuffle, reverse |
 | 8 (first form built 2026-10-30) | The opening: the commander's power after the factory, extractors first, a power floor, factories and upgrades waiting for energy, base sites beyond the start zone, T2 without the mass-bar gate, anti-missile before power | The opening set (FAF and M28, three seeds each: mass a second at minutes 4-5 and 9-10, energy stalls); the duels of section 6 with fog; our-key fogged sessions identical at 1 / 32 threads, shuffle, reverse |
 | 7b (first form built 2026-10-30) | The base first (recall), scouting before a push, T2 engineers kept, the opening's reclaim share | As 7a; the duels of section 6 with fog (about even with 7a) |

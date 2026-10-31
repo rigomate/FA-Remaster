@@ -42,6 +42,8 @@ local kTradeWindow = 600   -- ticks over which an attack's real trade is judged 
 local kTradeLoss = 2.0     -- an attack that lost this many times the mass it killed over kTradeWindow ...
 local kTradeMin = 600      -- ... and at least this much mass, withdraws: the estimate is missing what fog hides
 local kTradeMemory = 3000  -- ticks a zone we withdrew from is not picked as a target again
+local kShellRange = 40     -- world units: an enemy land force reaching this far is artillery-like (phase 10)
+local kShellSlack = 60     -- ... and shells a neighbouring zone of ours whose centre is within its range + this
 local kPeakFade = 0.99     -- the enemy's strength seen fades by this a think (5 s): half in about 6 minutes
 
 -- Personalities (docs/ai-architecture.md 2.7) and their knobs: personality.lua. Teacher mode (2.8): never a push
@@ -91,6 +93,7 @@ local function Front(R)
     local info = Remastered.AIMapInfo()
     local ours, theirs = 0, 0
     local enemyZones, threatened, ownEconomy = {}, {}, {}
+    local ownStruct = {}
     R.enemyAt = {}  -- (the zones the enemy is known in: the engineers keep out of them)
     R.enemySeen = R.enemySeen or {}  -- zone -> the last tick the enemy was known there (defence sites)
     for z = 1, info.zones do
@@ -107,10 +110,80 @@ local function Front(R)
             R.enemyAt[z] = true
             R.enemySeen[z] = R.tick
             table.insert(enemyZones, { zone = z, strength = e, economy = f.enemy.economyMass,
-                structures = f.enemy.structure.count, army = f.enemy.land.mass })
+                structures = f.enemy.structure.count, army = f.enemy.land.mass, range = f.enemy.land.maxRange })
             if f.own.structure.count > 0 then table.insert(threatened, z) end
         end
+        if f.own.structure.count > 0 then ownStruct[z] = true end
     end
+    -- the shelled zones (phase 10): an enemy land force with a long reach (kShellRange or more) in a zone beside ours
+    -- whose structures it can reach is treated as in our zone, so the defence goes for it. Artillery and missile
+    -- launchers parked one zone out had shelled our structures from outside every zone the defence looked at: against
+    -- M28 they destroyed 16,000 mass of our structures in 20 minutes with no answer (kill probe, seed 2002).
+    local listed = {}
+    for _, z in ipairs(threatened) do listed[z] = true end
+    for _, e in ipairs(enemyZones) do
+        if not listed[e.zone] and e.range >= kShellRange then
+            local ez = Remastered.AIZone(e.zone)
+            for _, n in ipairs(Remastered.AIZoneNeighbours(e.zone)) do
+                if ownStruct[n.zone] and not n.coast then
+                    local nz = Remastered.AIZone(n.zone)
+                    local dx, dz = nz.x - ez.x, nz.z - ez.z
+                    if dx * dx + dz * dz <= (e.range + kShellSlack) * (e.range + kShellSlack) then
+                        table.insert(threatened, e.zone)
+                        listed[e.zone] = true
+                        if R.tick - ((R.shellLogged or {})[e.zone] or -10000) >= 600 then
+                            R.shellLogged = R.shellLogged or {}
+                            R.shellLogged[e.zone] = R.tick
+                            LOG(string.format('aiop %d %d shelled zone %d margin 0.00 ratio 0.00 | an enemy force of range %.0f beside our zone %d: the defence goes for it',
+                                R.army, R.tick, e.zone, e.range, n.zone))
+                        end
+                        break
+                    end
+                end
+            end
+        end
+    end
+    -- the coast under fire (phase 10): water zones beside a zone with our structures where enemy ships that can hit
+    -- the ground are known (the index's naval strength against ground); the air answers them (brain.lua). The kill
+    -- probe against M28 (seed 2002): one modded T2 ship (bss0206, range 110) destroyed 13,400 mass of our coastal base,
+    -- and nothing of ours could reach it.
+    R.zoneDomain = R.zoneDomain or {}
+    local coast, coastMass = {}, 0
+    for z, _ in pairs(ownStruct) do  -- (collected into a sorted list below: the order does not matter here)
+        for _, n in ipairs(Remastered.AIZoneNeighbours(z)) do
+            if n.coast and not coast[n.zone] then coast[n.zone] = true end
+        end
+    end
+    -- (and the water zones one step further out: a ship of range 110 shells our coast from beyond the first water
+    -- zone; those are also the zones our air scouts now look at, R.coastWater)
+    local outer = {}
+    for w, _ in pairs(coast) do
+        for _, n in ipairs(Remastered.AIZoneNeighbours(w)) do
+            if not n.coast and not coast[n.zone] then outer[n.zone] = true end
+        end
+    end
+    for w, _ in pairs(outer) do coast[w] = true end
+    local coastList = {}
+    for w, _ in pairs(coast) do table.insert(coastList, w) end
+    table.sort(coastList)
+    R.coastWater = coastList
+    R.coastThreat = {}
+    for _, w in ipairs(coastList) do
+        local f = Remastered.AIZoneForces(R.army, w)
+        if f.enemy.naval.ground > 0 then
+            table.insert(R.coastThreat, { zone = w, mass = f.enemy.naval.mass, ground = f.enemy.naval.ground })
+            coastMass = coastMass + f.enemy.naval.mass
+        end
+    end
+    table.sort(R.coastThreat, function(a, b)
+        if a.ground ~= b.ground then return a.ground > b.ground end
+        return a.zone < b.zone
+    end)
+    R.coastMass = coastMass
+    -- (phase 10, the navy) the enemy's ships known anywhere, what we saw of them fading by kPeakFade a think
+    local naval = 0
+    for z = 1, info.zones do naval = naval + Remastered.AIZoneForces(R.army, z).enemy.naval.mass end
+    R.enemyNavalPeak = math.max(naval, (R.enemyNavalPeak or 0) * kPeakFade)
     R.enemyKnownZones = table.getn(enemyZones)
     R.ownEconomy = ownEconomy
     return ours, theirs, enemyZones, threatened, ownEconomy

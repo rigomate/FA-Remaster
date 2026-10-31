@@ -2758,6 +2758,16 @@ void Sim::Tick() {
   singleStep = false;  // step 14 (sim+0x8e4 = 0)
   frozen = endGame;    // Sync copies sim+0x8dc to sim+0x8dd
   phases.Lap(PhaseTimer::kDestroySync);
+  {  // MOHO64_VERIFY_LAYER (units.h LayerString): the counts at exit
+    static struct LayerVerifyReport {
+      ~LayerVerifyReport() {
+        if (g_verifyLayer)
+          std::fprintf(stderr, "moho64 verify layer: checked %llu, mismatches %llu\n",
+                       static_cast<unsigned long long>(g_layerChecked.load()),
+                       static_cast<unsigned long long>(g_layerMismatches.load()));
+      }
+    } report;
+  }
   {  // MOHO64_VERIFY_STATES=1: every unit's state bits against its set of names (units.h UnitStateSet::BitsAgree);
      // a difference stops the program. The count of checks goes to stderr at exit.
     static const bool verify = getenv("MOHO64_VERIFY_STATES") != nullptr;
