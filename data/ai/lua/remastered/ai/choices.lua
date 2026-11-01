@@ -28,6 +28,7 @@ local kDipSeconds = 120        -- the investments under way may cost at most K.i
 -- (the defence mark-down, the defences per site and under construction, the stall tolerance, the investment share
 -- and its safe margin are the knobs of personality.lua)
 local kLandSpeed = 3           -- world units a second: how far the enemy's land army travels in the payback window
+local kInvestEnergy = 0.5      -- stored energy share under which no new extractor upgrade starts (phase 8)
 local kHoldLogTicks = 600      -- a "hold" decision for the same kind of investment is logged at most this often
 
 -- the land candidates by factory tech (blueprint suffixes; the faction prefix is added): direct-fire, artillery,
@@ -149,6 +150,58 @@ end
 function EnemyAir(brain)
     local _, _, gm, am = Mix(brain.Remaster)
     return am, gm
+end
+
+-- ---- the air answer to ships (phase 10) ----
+
+-- the air candidates against ships by air factory tech (blueprint suffixes): bombers, gunships, torpedo bombers
+local kNavalAir = { { 'a0103' }, { 'a0203', 'a0204' }, { 'a0304' } }
+
+-- the enemy's ships as known ({id, count}), from the whole known enemy
+local function NavalMix(R)
+    local list, mass = {}, 0
+    for _, e in ipairs(Remastered.AIEnemyMix(R.army, true)) do
+        local bp = __blueprints[e[1]]
+        local naval = false
+        if bp and bp.Categories then
+            for _, c in ipairs(bp.Categories) do if c == 'NAVAL' then naval = true end end
+        end
+        if naval and bp.Categories then
+            local mobile = false
+            for _, c in ipairs(bp.Categories) do if c == 'MOBILE' then mobile = true end end
+            if mobile then
+                table.insert(list, { e[1], e[2] })
+                mass = mass + e.mass
+            end
+        end
+    end
+    return list, mass
+end
+
+-- what an air factory of `tech` builds against the ships (the best build value against the known ships, id on ties),
+-- worked out again every kCounterTicks; nil when no candidate kills anything
+function NavalAirPick(brain, tech)
+    local R = brain.Remaster
+    R.navalPick = R.navalPick or {}
+    local c = R.navalPick[tech]
+    if c and R.tick - c.tick < kCounterTicks then return c.id end
+    local ships = NavalMix(R)
+    local best, bestV
+    if ships[1] then
+        for t = tech, 1, -1 do
+            for _, sfx in ipairs(kNavalAir[t] or {}) do
+                local id = brain:Bp(sfx)
+                if Valid(id) then
+                    local v = Remastered.AIBuildValue(id, ships)
+                    if v > 0 and (not bestV or v > bestV or (v == bestV and id < best)) then best, bestV = id, v end
+                end
+            end
+        end
+        LOG(string.format('ainaval %d %d T%d pick %s value %.2f vs %d ship types, coast threat %.0f mass', R.army, R.tick,
+            tech, tostring(best), bestV or 0, table.getn(ships), R.coastMass or 0))
+    end
+    R.navalPick[tech] = { tick = R.tick, id = best }
+    return best
 end
 
 -- ---- defences ----
@@ -276,6 +329,9 @@ function Investments(brain, ctx)
         R.shortSince = nil
     end
     local sustained = R.shortSince and R.tick - R.shortSince >= K.stallTolerance
+    -- (phase 8: an extractor upgrade draws a lot of energy as it builds; while energy is under kInvestEnergy stored, no
+    -- new one starts. The opening set's minutes 5-10 were energy-stalled 20-45% of the time with 7-9 upgrades at once.)
+    local energyLow = brain:GetEconomyStoredRatio('ENERGY') < kInvestEnergy
     -- what the upgrades under way still cost
     local committed = 0
     for _, m in ipairs(ctx.upgrading) do
@@ -287,7 +343,8 @@ function Investments(brain, ctx)
     end
     -- the income the budget counts is smoothed (about a minute), so a burst of reclaim does not pass for an economy
     R.massAvg = (R.massAvg or income) + (income - (R.massAvg or income)) * 0.02
-    local budget = R.massAvg * kDipSeconds * K.investShare + 0.5 * stored - committed
+    -- (phase 9: while the army is short of what the economy should keep, the investments get half the share)
+    local budget = R.massAvg * kDipSeconds * K.investShare * (R.armyShort and 0.5 or 1) + 0.5 * stored - committed
     local enemyKnown = (R.enemyKnownZones or 0) > 0
     local danger = {}  -- zone -> margin, theirs mass (one estimate per zone and payback window)
     for _, m in ipairs(brain:GetListOfUnits(categories.MASSEXTRACTION * categories.STRUCTURE, false)) do
@@ -304,6 +361,11 @@ function Investments(brain, ctx)
                 local z = Remastered.AIZoneAt(p[1], p[3], 'land')
                 if z <= 0 then z = R.startZone end
                 local what = string.format('%s->%s', from, to)
+                if energyLow then
+                    LogHold(R, 'energy', string.format('aiinv %d %d hold %s zone %d payback %.0fs danger - | energy under %.0f%% stored: the upgrades wait for power',
+                        R.army, R.tick, what, z, payback, 100 * kInvestEnergy))
+                    return
+                end
                 if sustained then
                     LogHold(R, 'stall', string.format('aiinv %d %d hold %s zone %d payback %.0fs danger - | mass short for %.0f s: a sustained deficit, not a planned dip',
                         R.army, R.tick, what, z, payback, (R.tick - R.shortSince) / 10))

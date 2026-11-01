@@ -114,6 +114,28 @@ bool ScenarioMarksFixes(const std::string& scenario) {
   return marked;
 }
 
+int ScenarioSimOrder(const std::string& scenario, int* version) {
+  if (version) *version = 0;
+  lua_State* L = lua_open();
+  if (!L) return 0;
+  int order = 0;
+  if (PushSerializedLua(L, scenario) && lua_istable(L, -1)) {
+    lua_pushstring(L, "Options");
+    lua_rawget(L, -2);
+    if (lua_istable(L, -1)) {
+      lua_pushstring(L, "RemasterSimOrder");
+      lua_rawget(L, -2);
+      order = lua_type(L, -1) == LUA_TSTRING && !std::strcmp(lua_tostring(L, -1), "parallel") ? 1 : 0;
+      lua_pop(L, 1);
+      lua_pushstring(L, "RemasterSimOrderVersion");
+      lua_rawget(L, -2);
+      if (version && lua_type(L, -1) == LUA_TNUMBER) *version = static_cast<int>(lua_tonumber(L, -1));
+    }
+  }
+  lua_close(L);
+  return order;
+}
+
 std::optional<ReplayHeader> ReadReplayHeader(const std::string& data, std::string* error) {
   Reader r{data};
   ReplayHeader h;

@@ -77,6 +77,9 @@ the original M28AI v326 and with this variant in FA Remastered and comparing the
    `M28Utilities.VariantCategoryChain`, which builds the category once and gives it again while its parts are the same
    objects. Each place still evaluates in the same order and gives the same category. With
    `M28Utilities.bVariantVerifyNative` each place also builds its expression as written and logs any difference.
+   Since 2026-10-31 the engine keeps these expressions itself when it can (`Remastered.MakeCategoryChain` over the
+   variant's own `VariantCategoryOp`: the same cache, the same `==` on the parts, the same operator calls in the same
+   order when they changed); with `bVariantVerifyNative` both run and their results are compared.
 
 8. **The leaf of FAF's navigational mesh** (2026-10-28). Every label question to FAF's navigational mesh (Jip's
    `/lua/sim/navgenerator.lua`, MIT), and the mesh's own generation, ends in `NavGrid.FindLeafXZ`, a walk down a
@@ -85,5 +88,36 @@ the original M28AI v326 and with this variant in FA Remastered and comparing the
    as FAF's two Lua functions, which it calls itself for anything unusual. `M28Utilities.VariantSwapNavGridLeaf` puts
    it in the NavGrid class, only when the two functions are FAF's own (that file, those lines) and NavUtils is
    FAF's. With `M28Utilities.bVariantVerifyNative` both run on every call and any difference is logged.
+9. **Is a unit valid** (2026-10-31, `lua/AI/M28UnitInfo.lua`, about 47 million calls an hour): `IsUnitValid` is the
+   engine's field test, `Remastered.MakeFieldTest('+UnitId -Dead +GetAIBrain', IsUnitValid)`: the same three reads
+   through the VM's own indexing in the same order, stopping where the Lua `and` stops; anything that is not a table
+   goes to the Lua function itself. `bVariantVerifyNativeUnitInfo` (a switch of that file: M28Utilities is not loaded
+   yet when it runs) runs both and logs any difference.
 
 Every change in the Lua files is marked with a comment that starts "FA Remastered variant".
+
+## How the variant is proven, and what that cannot promise (2026-10-31)
+
+The standard is **every decision identical**: with the test switches on (`bVariantVerifyNative`,
+`bVariantVerifyNativeUnitInfo`, `bVariantVerifyHoverLabel`, `M28VariantBuildCache.bVerify`) each changed function also
+runs the original way on every call and any different answer is logged; the proof runs need 0 of them. On top of that,
+the short and medium sessions (B9: 405 beats, b8: 6,000 beats) must play out identically, beat for beat, with the
+original M28AI v326, with this variant, with this variant on an engine without the `Remastered` helpers ("hidden":
+`MOHO64_NO_REMASTERED=1`, every Lua fallback), and with the test switches on.
+
+A long game (B1: 36,000 beats) is not held to beat-for-beat identity between those, because it cannot be promised. Two
+runs that make every decision identically can still order some of their Lua work differently: Lua tables keyed by
+objects (units, tables, functions) are walked in an order that follows how many objects were made before, and the
+variant (or its fallbacks, or its test switches) makes a different number of them than the original. Where such a walk
+calls the engine, the engine's own order follows: FA itself moves an entity to the end of its "dirty" list on every
+SetHealth / AdjustHealth (and intel call), and that list decides the order units are put back into the collision grid,
+which decides the order of a weapon's candidate targets. Seen on B1 (2026-10-31, main 7a07d14): the fingerprints of
+the original M28, the variant and the hidden variant were identical for 33,234 beats, while the dirty-list order
+already differed from beat 30,673 (original vs variant) and 31,292 (original vs hidden); at beat 33,223 the same four
+units had their health adjusted from Lua in another order, at 33,235 two of army 4's Ahwassas got their candidate
+targets in another grid order and one weapon picked another target. The engine keeps this order as FA does (making it
+canonical would break the original's replays); games in FA Remastered's own parallel mode sort the grid's lists by
+creation serial and do not depend on it.
+
+So the hidden mode is a check for the short and medium sessions only, and a long game against M28 is expected to be
+identical between the original and the variant only while both make their Lua objects in the same order.

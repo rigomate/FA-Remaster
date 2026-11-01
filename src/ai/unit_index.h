@@ -152,7 +152,8 @@ struct BattleResult {
 // holds because its main weapons outrange the other and is faster backs off as the other closes, keeping the gap at
 // its own engage range (a kiting player's micro).
 BattleResult EstimateBattle(const std::vector<ForceStack>& ours, const std::vector<ForceStack>& theirs,
-                            float startDistance, const std::map<std::pair<int, int>, float>& beats, bool kite = false);
+                            float startDistance, const std::map<std::pair<int, int>, float>& beats, bool kite = false,
+                            bool soak = false);  // soak: every unit takes fire by its health and counts (before phase 12)
 // The build value (Chris's decision 11, the counter-pick): the unit, as many as the enemy force's mass, fought against
 // it (EstimateBattle from the longer range): the enemy mass killed per own mass lost (own losses counted at least 5%
 // of what was spent, so a clean win reads high but finite). killed / lost: the shares of each side's mass.

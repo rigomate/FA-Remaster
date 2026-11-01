@@ -24,6 +24,9 @@ class Vfs;
 class ScriptState;
 class ThreadScheduler;
 }  // namespace moho
+namespace moho::net {
+class LobbyCore;
+}
 
 namespace moho::ui {
 
@@ -43,6 +46,46 @@ namespace sound {
 class SoundSystem;
 }
 
+// One client of a network game (GetSessionClients, CWldUiInterface 0x88d540: name, uid, connected, ping, quiet, local,
+// authorizedCommandSources, ejectedBy).
+struct SessionClient {
+  std::string name;
+  int uid = 0;
+  bool connected = true, local = false;  // (connected: not ejected by this program, CClientBase::NoEjectionPending 0x53c960)
+  double ping = 0, quiet = 0;
+  std::vector<int> sources;    // 0-based command sources (the scripts get them 1-based)
+  std::vector<int> ejectedBy;  // 0-based clients that asked to eject it (CollectEjecters 0x53cc60; 1-based to the scripts)
+  int maxSP = 50;              // FAF's exe's field (0x1291178: client+0xd4, message 57)
+};
+
+// What a network game has for its interface since the last frame (NetGameLink::TakeEvents), in the original's order
+// of arrival; each goes to the game's scripts as the original hands it over.
+struct NetEvents {
+  int waiting = 0;  // 1: the provider's StartWaitingDialog (DoPostInitializing 0x88c72d), -1: StopWaitingDialog (0x88c781)
+  std::vector<std::pair<uint32_t, std::vector<std::string>>> desyncs;  // uimain.ShowDesyncDialog(beat, names) (0x895434)
+  std::vector<std::pair<int, int>> speeds;  // uimain.NoteGameSpeedChanged(client + 1, rate) (0x83d670)
+  std::vector<std::pair<std::string, std::string>> chats;  // gamemain.ReceiveChat(name, message) (0x83ebd0); bytes: SerializeLua
+  std::vector<std::string> disconnects;  // "<LOC Engine0002>%s disconnected." to the console (0x88b9d0)
+  std::vector<std::string> notes;  // ours, to the console after those: which parts of the state a desync touched
+};
+
+// A network game's side for its interface state (the host's: GameSession over net/beat_exchange_net.h).
+class NetGameLink {
+ public:
+  virtual ~NetGameLink() = default;
+  virtual std::vector<SessionClient> Clients() = 0;  // in the session's client order (GetSessionClients)
+  virtual void Eject(int client) = 0;                 // 0-based, not the local one (EjectSessionClient's checks are its own)
+  virtual void SendChat(const std::vector<int>& clients, const std::string& message) = 0;  // 0-based; SerializeLua bytes
+  virtual void RequestSpeed(int rate) = 0;            // SetGameSpeed
+  virtual NetEvents TakeEvents() = 0;
+  // moho64ui_NetTestForTests: "freeze" (from now on this program sends and hears nothing, as one that stopped
+  // answering), "corrupt" (its checksum of `beat` changed: a desync; with `arg` a part's name, that part of its state
+  // line too, the state itself left as it is), "move" (at `beat` the unit of army `arg` with the lowest id is moved a
+  // quarter of a unit on this copy only: a true desync of that army's units), "draw" (at `beat` one random number more
+  // is drawn on this copy: a true desync of the random stream). GameSession::NetTestSwitch.
+  virtual void TestSwitch(const std::string& what, uint32_t beat, const std::string& arg) = 0;
+};
+
 class UserState {
  public:
   struct Config {
@@ -56,6 +99,10 @@ class UserState {
     // Starts a session from the game configuration table at stack index `config` when the lobby
     // launches a game; false with the reason for the script's LaunchFailed. Unset: nothing starts.
     std::function<bool(lua_State* L, int config, std::string* why)> launchSession;
+    // The same from a network lobby (a connector with peers): the lobby's network goes to the game (CLobby::LaunchGame
+    // 0x7c38c0 makes the client manager over the lobby's connector); `lobby` is the lobby's network side. Unset: such
+    // a launch fails.
+    std::function<bool(lua_State* L, int config, net::LobbyCore* lobby, std::string* why)> launchNetworkSession;
     // Starts a single-player session (LaunchSinglePlayerSession: the campaign's operations) from
     // FAF's single-player table at stack index `info`; false with the reason. Unset: none starts.
     std::function<bool(lua_State* L, int info, std::string* why)> launchSinglePlayer;
@@ -90,6 +137,10 @@ class UserState {
     // 0x7a66a0: (beat + fraction) * 0.1; paused with the game, at its speed): the camera's game clock
     // (UseGameClock). Unset: there is no game.
     std::function<double()> gameTime;
+    // A network game's side (the host's; nullptr: a local game, its one player): GetSessionClients, EjectSessionClient,
+    // chat, game speed, the dialogs; and whether the game is a network one (SessionIsMultiplayer).
+    NetGameLink* net = nullptr;
+    bool multiplayer = false;
     // The command source the player's orders are written for (the focus army's first source).
     int commandSource = 0;
     // The army that source belongs to, 0-based (-1: none, a replay's viewer): SetFocusArmy's checks.
@@ -233,6 +284,7 @@ class UserState {
   uint64_t syncCount = 0;  // the beats' syncs delivered so far (what was asked before one is old after it)
   float economyCopy[12] = {};
   std::string focusNickname;  // the focus army's player name (GetSessionClients)
+  std::vector<int> speedNotes;  // a local game's or a replay's speeds asked for since the last frame (SetGameSpeedTo)
   int focusArmyCopy = -1;     // the simulation's focusArmy, 0-based (GetFocusArmy)
   uint32_t tickCopy = 0;      // its tick (GameTick, GameTime, GetGameTimeSeconds, GetGameTime)
   // The part of a tick the game's clock is past the last sync (0..1), as the original's session keeps
@@ -360,8 +412,6 @@ bool IssueTransportOrderAt(lua_State* L, const std::string& order, uint32_t enti
 // A Script order at a place for the selected units, as the game's own script allows it
 // (VerifyScriptCommand): FAF's attack-move, an ability. True when the click is used up.
 bool IssueScriptAt(lua_State* L, float x, float y, float z, bool clear);
-// FAF's attack-move to a place for the selected units (Alt and a right click on the ground).
-bool IssueAttackMoveAt(lua_State* L, float x, float y, float z, bool clear);
 // Where the main camera listens from, for the world's sounds (worldview.cpp): its eye, the place
 // it looks at, the direction to the screen's right along the ground, and its zoom. False before
 // the camera is placed.
@@ -859,8 +909,12 @@ std::string TakeOrders(lua_State* L);
 void SendSimCommand(lua_State* L, const std::string& command);
 void TeleportSelectedUnits(lua_State* L);
 void SelectionOrdersItself(lua_State* L, bool destroy);
-// The chat messages the script has sent since the last frame come back to it (session_bindings.cpp).
+// The chat messages the script has sent since the last frame come back to it (session_bindings.cpp); in a network
+// game also what the other players sent, and the rest of the network game's NetEvents.
 void DeliverChat(lua_State* L);
+// A network game's NetEvents since the last frame to its scripts (session_bindings.cpp).
+void DeliverNetEvents(lua_State* L);
+void DeliverSpeedNotes(lua_State* L);  // (a local game's or a replay's: uimain.NoteGameSpeedChanged)
 // CWldSession::RequestFocusArmy with its checks (session_bindings.cpp): a 0-based army, or -1 for none; for the Lua
 // SetFocusArmy and the console's SetFocusArmy.
 void RequestFocusArmyChecked(lua_State* L, int wanted);

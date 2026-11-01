@@ -47,6 +47,12 @@ class SimCache {
     if (!p) p = std::make_shared<C>();
     return *static_cast<C*>(p.get());
   }
+  // The container if it was made (a read only: for code that may not make it, e.g. a task played ahead).
+  template <class S>
+  const C* Peek(const S& sim) const {
+    const std::shared_ptr<void>& p = sim.caches[slot_];
+    return p ? static_cast<const C*>(p.get()) : nullptr;
+  }
 
  private:
   size_t slot_;

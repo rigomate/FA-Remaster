@@ -3,7 +3,7 @@ project(moho64 C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD 99)
 
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
@@ -54,8 +54,7 @@ if(NOT MSVC)
 endif()
 
 add_library(mohocore STATIC
-  src/core/speculate.cpp
-  src/core/log.cpp src/core/profile.cpp src/core/workers.cpp src/core/crash.cpp src/core/hostfs.cpp src/core/zip.cpp src/core/vfs.cpp
+  src/core/log.cpp src/core/profile.cpp src/core/workers.cpp src/core/speculate.cpp src/core/crash.cpp src/core/hostfs.cpp src/core/zip.cpp src/core/vfs.cpp
   src/script/script_state.cpp src/script/core_bindings.cpp src/script/fastlib.cpp src/script/fastlib_reclaim.cpp src/script/mods.cpp
   src/script/threads.cpp src/script/script_handle.cpp src/script/mount.cpp src/sim/script_object.cpp src/sim/blueprints.cpp src/sim/replay.cpp
   src/sim/terrain.cpp src/sim/sim.cpp src/sim/entities.cpp src/sim/effects.cpp src/sim/bp_reflect.cpp
@@ -67,14 +66,32 @@ add_library(mohocore STATIC
   src/sim/ai_brain.cpp
   src/sim/commands.cpp src/sim/economy.cpp src/sim/build.cpp src/sim/collision.cpp
   src/sim/combat.cpp src/sim/damage.cpp src/sim/projectile.cpp src/sim/anim.cpp src/sim/intel.cpp src/sim/recorder.cpp src/sim/fingerprint.cpp
-  src/sim/script_bits.cpp src/sim/command_stream.cpp src/sim/session.cpp src/sim/sim_view.cpp src/sim/command_writer.cpp src/sim/ai_personality.cpp src/sim/ai_platoon.cpp
+  src/sim/script_bits.cpp src/sim/command_stream.cpp src/sim/session.cpp src/sim/sim_view.cpp src/sim/command_writer.cpp src/sim/lockstep.cpp src/sim/ai_personality.cpp src/sim/ai_platoon.cpp
   src/sim/ai_build.cpp src/sim/moments.cpp
   src/ai/map_analysis.cpp src/ai/scripts.cpp src/ai/unit_index.cpp)
 target_include_directories(mohocore PUBLIC src)
 target_link_libraries(mohocore PUBLIC gpglua zlibinflate)
 
-add_executable(moho64 src/app/main.cpp)
-target_link_libraries(moho64 PRIVATE mohocore)
+# The interface's network transport (ui/net/, no interface dependencies): moho64 --net plays a network game between
+# two copies (sim/lockstep.h) over it.
+add_library(mohonet STATIC
+  ui/net/socket.cpp ui/net/message.cpp ui/net/connector_tcp.cpp ui/net/connector_udp.cpp ui/net/beat_exchange_net.cpp)
+target_include_directories(mohonet PUBLIC ui)
+target_link_libraries(mohonet PUBLIC mohocore)
+if(WIN32)
+  target_link_libraries(mohonet PUBLIC ws2_32)
+else()
+  find_package(Threads REQUIRED)
+  target_link_libraries(mohonet PUBLIC Threads::Threads)
+endif()
+
+add_executable(moho64 src/app/main.cpp src/app/new_delete.cpp)
+target_link_libraries(moho64 PRIVATE mohocore mohonet)
+if(MOHO64_MIMALLOC)
+  # the program's own new and delete on mimalloc (src/app/new_delete.cpp; this program only)
+  target_link_libraries(moho64 PRIVATE mimalloc)
+  set_source_files_properties(src/app/new_delete.cpp PROPERTIES COMPILE_DEFINITIONS MOHO64_MIMALLOC=1)
+endif()
 if(WIN32)
   target_link_libraries(moho64 PRIVATE shell32)
 endif()
@@ -87,4 +104,5 @@ target_include_directories(slot_sort_test PRIVATE src)
 
 add_executable(dialect_test tests/dialect_test.cpp)
 target_include_directories(dialect_test PRIVATE src)
+# (gpglua's lapi.c calls moho::ObjectCount, which is in mohocore)
 target_link_libraries(dialect_test PRIVATE gpglua mohocore)

@@ -26,6 +26,18 @@ namespace moho {
 class Sim;
 class Unit;
 
+// MOHO64_PAR_NAV (sim/landnav.cpp): a unit test of a navigator's turn played ahead: kind 0 UnitInLine (a = ax, az,
+// bx, bz), 1 PathUnitBlocked (a = x, z), its flags and its answer
+struct NavQuery {
+  uint8_t kind = 0, flags = 0;
+  float a[4] = {0, 0, 0, 0};
+  bool result = false;
+};
+struct NavAhead {
+  // the recorded answers: [b, b + n) of the worker w's array of this round (sim/landnav.cpp LandNavAheadRun)
+  uint32_t w = 0, b = 0, n = 0;
+};
+
 struct LandNav {
   PathTraveler pf;
   bool active = false;   // a goal is being worked on
@@ -72,8 +84,13 @@ void LandNavSetGoalRect(Sim& sim, Unit* u, int x0, int z0, int x1, int z1, bool 
 // The unit's move is aborted: the navigator forgets its goal (no event).
 void LandNavStop(Sim& sim, Unit* u);
 void LandNavSetSpeedThrough(Unit* u, bool on);
-// Per tick, after the units moved: every navigator's Execute, then the armies' path queues.
-void LandNavTickAll(Sim& sim);
+// Per tick, the navigators' stages. CArmyImpl::OnTick 0x6ffd70 runs each army's brain stages in turn, army by army
+// (0x6ffe83..0x6ffe9f: navigators brain+0xa8, steering +0xac, attackers +0xb0), so an army's navigators come after
+// the armies before it have steered and fired: LandNavStageBegin once, LandNavTickUnits with each army's units in
+// its turn (Sim::Tick), then LandNavStageEnd (the path queues' work and what it delivered).
+void LandNavStageBegin(Sim& sim);
+void LandNavTickUnits(Sim& sim, const std::vector<Unit*>& units);
+void LandNavStageEnd(Sim& sim);
 // The steering's push ended (Func1 0x5a3e80).
 void LandNavPoke(Unit* u);
 bool LandNavActive(const Unit* u);

@@ -25,6 +25,7 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <mmsystem.h>
 #include <shlobj.h>
 #endif
 
@@ -493,6 +494,8 @@ int main(int argc, char** argv) {
   session.fastForwardTo = fastForward;
   session.wantPicture = !noWorld;
   session.waitForWindow = windowed && directWindow;  // (a launched table's picture opens on the window)
+  // (the game's time at the PC's clock: a window, or MOHO64UI_REAL_TIME below; then a local game measures its maxSP)
+  session.paceByClock = windowed || std::getenv("MOHO64UI_REAL_TIME") != nullptr;
   // A game in a window: its simulation on all the machine's cores (the engine, Chris's item 20: his snapshot games ran
   // one thread, as MOHO64_THREADS was unset; the result is the same beat for beat). MOHO64_THREADS, when set, decides.
   if (windowed && !std::getenv("MOHO64_THREADS")) session.simThreads = static_cast<int>(std::thread::hardware_concurrency());  // (0 if unknown: as unset)
@@ -507,6 +510,9 @@ int main(int argc, char** argv) {
   if (!m28Variant.empty()) session.scanMounts.push_back({m28Variant, "/mods/m28-variant"});
   session.scanTicks = scanTicks;
   cfg.launchSession = [&session](lua_State* L, int config, std::string* why) { return session.Launch(L, config, why); };
+  cfg.launchNetworkSession = [&session](lua_State* L, int config, net::LobbyCore* lobby, std::string* why) {
+    return session.LaunchNetwork(L, config, lobby, why);
+  };
   cfg.launchSinglePlayer = [&session](lua_State* L, int info, std::string* why) { return session.LaunchSinglePlayer(L, info, why); };
   // The player's own files (replays, saved games) live beside the preferences file (special_files.cpp);
   // every game is written there as LastGame.SCFAReplay, and the Replay dialog plays them back.
@@ -738,6 +744,12 @@ int main(int argc, char** argv) {
     out->up = up && out->state->Boot();
     out->stateMs = ms(t0, t1), out->rulesMs = ms(t1, t2), out->bootMs = ms(t2, Clock::now());
   };
+  // A network game's links for the game's state: SessionIsMultiplayer, and its side of the game (GetSessionClients and
+  // so the disconnect dialog, EjectSessionClient, chat, game speed, the waiting and desync dialogs).
+  auto linkNetwork = [&session](ui::UserState::Config& gameCfg) {
+    gameCfg.multiplayer = session.networkGame();
+    gameCfg.net = session.netLink();
+  };
   auto startGameInterface = [&]() {
     if (game) return;
     // A launch loads the original's way (its session states, WLD_Frame 0x88cae0): the
@@ -761,7 +773,9 @@ int main(int argc, char** argv) {
         ui::UserState::Config gameCfg = cfg;
         gameCfg.bootScript = "/lua/SessionInit.lua";
         gameCfg.launchSession = nullptr;
+        gameCfg.launchNetworkSession = nullptr;
         gameCfg.launchReplay = nullptr;  // (a replay starts from the front end)
+        linkNetwork(gameCfg);
         session.prepareInterface = [&prepared, &vfs, makeGameState, gameCfg](Sim* sim, const std::vector<std::string>& uids,
                                                                              const std::string& sessionMods) {
           makeGameState(gameCfg, sim, uids, sessionMods, &prepared);
@@ -835,8 +849,10 @@ int main(int argc, char** argv) {
     gameCfg.bootScript = "/lua/SessionInit.lua";
     gameCfg.modUids = session.modUids();
     gameCfg.launchSession = nullptr;
+    gameCfg.launchNetworkSession = nullptr;
     gameCfg.launchReplay = nullptr;  // (a replay starts from the front end)
     gameCfg.liveSim = session.sim();
+    linkNetwork(gameCfg);
     gameCfg.waitForBeat = [&session]() { session.WaitForWorker(); };
     gameCfg.groundHeight = [&session](float x, float z) { return session.TerrainHeight(x, z); };
     gameCfg.beatRunning = [&session]() { return session.BeatRunning(); };
@@ -932,6 +948,9 @@ int main(int argc, char** argv) {
         if (auto code = hostfs::ReadFile(gameLuaFile)) game->RunString(*code, "@" + gameLuaFile);
         else Logf(LogLevel::Error, "cannot read %s", gameLuaFile.c_str());
       }
+      // A network game: READY to the others now that the screen is up (the original's DoInitializing ends so,
+      // 0x88c664); its beats wait for theirs. (After the test's Lua file, so that a test may stop it first.)
+      session.NetReady();
       session.onSync = [&game](const std::string& sync) { game->DeliverSync(sync); };
       session.takeOrders = [&game]() { return ui::TakeOrders(game->L()); };
     }
@@ -1037,13 +1056,32 @@ int main(int argc, char** argv) {
     session.WaitForBeat();  // (a beat still on its thread at the end: done before anything looks at the game again)
     if (done < 0) ok = false;
   } else {
+    // Without a window each frame is 1/60 s of the game, as fast as the frames go. MOHO64UI_REAL_TIME=1 (tests): at
+    // most 60 frames a second of the PC's clock, each the time since the last (at most 0.25 s, as a window's), so the
+    // beats come as in a live window (a network game over a link with latency: TASK_netlat).
+    static const bool realTime = std::getenv("MOHO64UI_REAL_TIME") != nullptr;
+    using Clock = std::chrono::steady_clock;
+    auto last = Clock::now();
+    if (realTime) {
+#ifdef _WIN32
+      timeBeginPeriod(1);  // (sleeps of a millisecond, as the window's)
+#endif
+      Logf(LogLevel::Info, "moho64ui: without a window, at the PC's clock (MOHO64UI_REAL_TIME)");
+    }
     for (; done < o.frames && !ui::ExitRequested(); ++done) {
-      shown->Frame(1.0 / 60.0);
-      session.Advance(1.0 / 60.0);
+      double seconds = 1.0 / 60.0;
+      if (realTime) {
+        const auto now = Clock::now();
+        seconds = (std::min)(0.25, std::chrono::duration<double>(now - last).count());
+        last = now;
+      }
+      shown->Frame(seconds);
+      session.Advance(seconds);
       listen();
-      sounds.Update(1.0f / 60.0f);
+      sounds.Update(static_cast<float>(seconds));
       leaveOrRestart();
       startGameInterface();
+      if (realTime) std::this_thread::sleep_until(last + std::chrono::microseconds(16667));
     }
   }
   if (o.frames) Logf(LogLevel::Info, "moho64ui: ran %d frames", done);

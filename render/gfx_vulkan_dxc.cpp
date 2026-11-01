@@ -24,6 +24,10 @@
 #include <thread>
 
 namespace render::gfx {
+// The interfaces have external linkage (not in the unnamed namespace below): their only implementations are in
+// DXC's library, and with internal linkage and no overrider in this file an optimiser may take the pure calls
+// for unreachable.
+namespace dxc_abi {
 
 // --- the part of DXC's interface used (dxcapi.h: IDxcCompiler3, IDxcResult, IDxcBlob) ---
 struct Guid {
@@ -39,6 +43,8 @@ struct DxcUnknown {
   virtual int32_t QueryInterface(const Guid& iid, void** out) = 0;
   virtual uint32_t AddRef() = 0;
   virtual uint32_t Release() = 0;
+  // (the same three entries on every platform: DXC's IUnknown outside Windows, WinAdapter.h, has had no virtual
+  // destructor since v1.7.2212; older Linux and macOS builds, which had one, are not supported)
 };
 struct DxcBlob : DxcUnknown {
   virtual void* GetBufferPointer() = 0;
@@ -64,8 +70,9 @@ struct DxcCompiler3 : DxcUnknown {
 };
 using CreateInstanceFn = int32_t (*)(const Guid& clsid, const Guid& iid, void** out);
 
-// These interfaces are implemented by the loaded library. Keep external linkage
-// so optimizers cannot assume that their pure virtual methods have no overrides.
+}  // namespace dxc_abi
+using namespace dxc_abi;
+
 namespace {
 
 template <typename T>

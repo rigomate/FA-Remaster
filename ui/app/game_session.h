@@ -5,6 +5,8 @@
 // then runs its beats, ten a second. There is no in-game interface yet and nothing is drawn of the
 // world: the host only reports that the simulation runs.
 #pragma once
+#include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <functional>
@@ -31,8 +33,13 @@ namespace moho {
 struct SessionDescription;
 struct ReplayHeader;
 }
+namespace moho::net {
+class LobbyCore;
+}
 
 namespace moho::ui {
+class NetGameLink;
+struct NetEvents;
 
 namespace sound {
 class SoundSystem;
@@ -50,6 +57,49 @@ class GameSession {
   // state: the scenario file is run there). False with the reason the original would give the
   // script's LaunchFailed ("NoConfig", "StartSpots"), or a description.
   bool Launch(lua_State* L, int config, std::string* why);
+  // Start a network game (CLobby::LaunchGame 0x7c38c0 in a lobby with peers) from the game configuration at stack
+  // index `config`: every player's program starts the same session (the seed the host's nonce, the armies the same),
+  // its own army the one whose OwnerID is this lobby's uid; the lobby's connector and connections go to the game
+  // (`lobby`'s GameLink, taken only when the session is described). The beats then run in lockstep: every client's
+  // orders, merged in client order, before each beat (the engine's sim/lockstep.h over net/beat_exchange_net.h);
+  // a beat whose orders are not all in waits, the frame going on without it (a wait of over two seconds is logged).
+  // Each program's load ends by itself; its game's screen is made, and then (NetReady) it tells the others it is
+  // ready (READY, control message 53) and its beats wait until every client is ready or ejected, the provider's
+  // StartWaitingDialog shown meanwhile (the original's DoInitializing 0x88c664, DoPostInitializing 0x88c6d0,
+  // DoWaiting 0x88c750); beat 1 runs after that, not before the screen as in a local game.
+  bool LaunchNetwork(lua_State* L, int config, net::LobbyCore* lobby, std::string* why);
+  bool networkGame() const { return net_ != nullptr; }
+  // A network game's side for the game's interface state (user/user_state.h NetGameLink: GetSessionClients,
+  // EjectSessionClient, chat, game speed, the waiting and desync dialogs); nullptr in a local game or a replay.
+  NetGameLink* netLink() const;
+  // The game's screen is up (after CreateGameInterface): READY to every client, and the lockstep starts (beats 1 ..
+  // the input delay sent empty). Nothing in a local game.
+  void NetReady();
+  // The input delay (beats between writing an order and every client carrying it out): the original's net_Lag of
+  // 500 ms (CSimDriver::ThreadRun 0x73c006, the engine's reading) in whole beats at the game's speed at launch,
+  // floor(500 / msPerBeat), msPerBeat = 100 / 10^(rate / 10): 5 beats at normal speed, 12 at +4; fixed for the game
+  // (the engine's Lockstep v1).
+  static constexpr double kNetLagMs = 500;
+  static uint32_t InputDelay(int rate);
+  // A network game's clients in the session's client order (GetSessionClients); empty in a local game.
+  struct NetClient {
+    std::string name;
+    int uid = -1;
+    uint8_t client = 0;
+    std::vector<int> sources;
+    bool local = false, connected = true;
+    double ping = 0, quiet = 0;
+    std::vector<int> ejectedBy;  // (0-based client indices)
+    int maxSP = 50;
+  };
+  std::vector<NetClient> NetClients() const;
+  // What netLink() passes on (0-based clients): this player's vote to eject one (EjectSessionClient), a chat message
+  // (SerializeLua bytes) to some, a game speed asked for, the interface's events since the last frame, a test switch.
+  void NetEject(int client);
+  void NetChat(const std::vector<int>& clients, const std::string& message);
+  void NetSpeed(int rate);
+  NetEvents NetTakeEvents();
+  void NetTestSwitch(const std::string& what, uint32_t beat, const std::string& arg);
   // Start a single-player session (LaunchSinglePlayerSession: an operation of the campaign) from
   // the table FAF's SinglePlayerLaunch.lua makes, at stack index `info` (the engine's
   // SessionFromSinglePlayerInfo). False with the reason.
@@ -276,6 +326,10 @@ class GameSession {
   // touches the simulation (the interface's scripts and input, orders, sounds, sync) waits until
   // it is done: while BeatRunning(), the window only shows frames.
   bool beatsOnThread = false;
+  // The game's time follows the PC's clock (a window, or MOHO64UI_REAL_TIME): only then does a local game or a replay
+  // measure its maxSP (MaxSimRate). A headless run steps its frames, each waiting for its beats, so its PC always keeps
+  // up (and the run stays the same on a busy machine).
+  bool paceByClock = false;
   // The simulation's worker pool (core/workers.h ThreadsOverride, when the Sim is made): 0 leaves it to MOHO64_THREADS
   // (1 when unset: the headless tests' way, many at once). A game in a window takes the machine's cores (main.cpp).
   int simThreads = 0;
@@ -413,6 +467,7 @@ class GameSession {
   double due_ = 0;  // seconds of beats not run yet
   std::FILE* stream_ = nullptr;  // the game's record (replayOut), open while a game runs
   int recorded_ = 0;             // games recorded in this run
+  std::string recordBase_;       // the running game's record without its extensions (<replayOut>[.n]; empty: none)
   std::string lastTable_;        // the table file of the game recorded last
   bool tableAgain_ = false;      // the game starting is a restart (Relaunch): its table is the last one
   void Record(const std::string& bytes);
@@ -425,6 +480,38 @@ class GameSession {
   bool fpPlayback_ = false;
   bool Fingerprinting() const { return fp_ && sim_ && (!play_ || fpPlayback_); }
   void FingerprintBeat();
+  // A network game (LaunchNetwork; nullptr: a local game or a replay).
+  struct Net;
+  std::unique_ptr<Net> net_;
+  bool lastWasNetwork_ = false;
+  bool LaunchWith(lua_State* L, int config, net::LobbyCore* lobby, std::string* why);
+  bool NetEveryoneReady();                  // (false: the beats wait for the others' READY, the waiting dialog shown)
+  bool NetBeatOrders(std::string* merged);  // (the next beat's merged orders, or false: wait)
+  void NetDigest();                         // (right after that beat, on its thread: the digest of a 50th beat)
+  void NetAfterBeat();                      // (then here: the digest to the lockstep, desyncs to the dialog)
+  // This program's maxSP, in every game (the original's sim driver after each dispatch, CSimDriver+0x1b8..+0x228): each
+  // beat's time not paused, from its orders taken (BeatOrdersTaken) to the end of its tick (NoteBeatTime, on the
+  // thread that ran it; -1: paused, or none), the last 24 kept (RollingFloat<25>, +0x1b8, its first / next at +0x220
+  // / +0x224), the value sent last (+0x228: 10 at the start, CSimDriver ctor 0x73b767), and a test's value in place of
+  // the measure (a network game's moho64ui_NetTestForTests("maxsp"), a local game's MOHO64UI_FORCE_MAXSP).
+  struct SpeedMeasure {
+    std::chrono::steady_clock::time_point ordersTakenAt{};
+    double beatMs = -1;
+    std::array<float, 25> beatTimes{};
+    int first = 0, next = 0;
+    int sent = 10;
+    bool forced = false;
+  };
+  SpeedMeasure measure_;
+  void BeatOrdersTaken() { measure_.ordersTakenAt = std::chrono::steady_clock::now(); }
+  void NoteBeatTime();   // (right after the beat's tick, on its thread)
+  void MaxSimRate();     // (then here: into the ring; when the value changed, message 57 or the local pace)
+  // (ours, after a desync: this copy's parts of that beat to the client whose checksum differs, and a client's parts
+  // compared with ours: which parts differ, on the console, in the log and in <replay>.desync.txt)
+  void NetSendParts(uint8_t client, uint32_t beat);
+  void NetCompareParts(uint8_t client, const std::string& bytes);
+  std::string NetDesyncBase() const;        // (where the desync's files go: beside the record or the replay)
+  void NetAskDetail();                      // (at the game's first desync: the full listing of the next checksum beat)
   // The last launch, for Relaunch.
   std::unique_ptr<SessionDescription> last_;
   std::vector<std::string> lastUids_;

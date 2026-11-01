@@ -111,6 +111,9 @@
 //           factory (ueb0101, or <from>) at x, z by the cheats' CreateUnit, and `after` beats later (30) it is ordered to
 //           upgrade to its T2 (ueb0201, or <to>) by the simulation's IssueUpgrade (to measure what the upgrade costs); may be
 //           given several times
+// --orders <file>  [r7] with --session: the engine's orders file's "<beat> lua <one line>" lines, each run in the
+//           simulation's state before that beat (its other verbs are not read: a benchmark's set-up, as the engine's
+//           B3 makes its two armies and orders them at each other, docs/benchmarks.md)
 // --noicons, --icon-scale <n>  strategic icons: off, or n screen pixels for each of a symbol's (key I switches them)
 // --ao      ambient occlusion in the modern look: 0 off to 1 full (key O switches it)
 // --msaa    anti-aliasing: samples per pixel of the scene, 1 (off), 2, 4 (the default) or 8
@@ -642,6 +645,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <functional>
 #include <memory>
 #include <string>
@@ -956,6 +960,7 @@ struct Options {
   int pingAt = 0;                                // [pings] --ping
   double hitchLog = -1;                          // [hitches] --hitch-log (below 0: off)
   std::vector<LiveSim::Setup::Upgrade> upgrades;  // [hitches] --upgrade-test
+  std::vector<std::pair<uint32_t, std::string>> luaOrders;  // [r7] --orders
   bool minimapMeshes = false;                    // [pings] --minimap-meshes
   bool minimapResources = true;                  // [minimap deposits] --no-minimap-resources
   int minimapTest = 0, minimapTestSize = 300;    // [spikes] --minimap-test
@@ -1509,6 +1514,18 @@ bool ParseOptions(int argc, char** argv, Options* o) {
       if (from[0] && to[0]) u.from = from, u.to = to;
       o->upgrades.push_back(u);
     }
+    else if (a == "--orders") {  // [r7] the "lua" lines of an orders file
+      std::ifstream f(v);
+      if (!f) return false;
+      std::string line;
+      while (std::getline(f, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        int beat = 0, at = 0;
+        char what[16] = "";
+        if (sscanf(line.c_str(), "%d %15s %n", &beat, what, &at) >= 2 && !strcmp(what, "lua") && at > 0)
+          o->luaOrders.push_back({static_cast<uint32_t>(beat), line.substr(at)});
+      }
+    }
     else if (a == "--pause-at") o->pauseAt = atoi(v);  // <beat>: the commander of --enhance's army is paused then
     else if (a == "--enhance") {  // <beat>,<army>,<enhancement>: that army's commander is ordered to build it then
       char name[128] = "";
@@ -1824,6 +1841,7 @@ int main(int argc, char** argv) {
     setup.pauseAt = static_cast<uint32_t>(std::max(opt.pauseAt, 0));
     setup.pingAt = static_cast<uint32_t>(std::max(opt.pingAt, 0));  // [pings]
     setup.upgrades = opt.upgrades;  // [hitches] --upgrade-test
+    setup.lua = opt.luaOrders;      // [r7] --orders
     live.SetFocusArmy(opt.focus);
     picture.SetVulkan(opt.vulkan);
     picture.SetDebug(opt.debug);  // (photomode: the validation layer for the pixel interface's device too)
@@ -2524,6 +2542,14 @@ int main(int argc, char** argv) {
     return map.water.present ? std::max(y, map.water.elevation) : y;
   };
   camera.target.y = groundHeight(camera.target.x, camera.target.z) + targetLift;
+  // [shorewall] A camera on a unit's own height (--fx-view, --follow-unit) kept with its eye half a unit over the water: a
+  // dived sub (2.5 under it) looked at close put the eye under the sea, where no water is drawn (the game's camera, on the
+  // ground or the water's level, never goes there). The point looked at is raised as far as that needs.
+  auto eyeOverWater = [&](Camera* c) {
+    if (!haveMap || !map.water.present) return;
+    const float under = map.water.elevation + 0.5f - c->Eye().y;
+    if (under > 0) c->target.y += under;
+  };
   // --cine-cam, --cine-path: the cinematic camera (cinecam.h) in place of the game's, over the ground in the map and
   // beyond its edge
   const GroundFn cineGround = MirroredGround(groundHeight, haveMap ? static_cast<float>(map.width) : 0.0f, haveMap ? static_cast<float>(map.height) : 0.0f);
@@ -3305,6 +3331,7 @@ int main(int argc, char** argv) {
           camera.distance = opt.fxView[0];
           camera.pitch = opt.fxView[1] * 3.14159265f / 180;
           camera.heading = std::atan2(forward.x, forward.z) + opt.fxView[2] * 3.14159265f / 180;
+          eyeOverWater(&camera);  // [shorewall]
           framedLive = true;
           break;
         }
@@ -3688,6 +3715,7 @@ int main(int argc, char** argv) {
         camera.distance = opt.fxView[0];
         camera.pitch = opt.fxView[1] * 3.14159265f / 180;
         camera.heading = facing + opt.fxView[2] * 3.14159265f / 180;
+        eyeOverWater(&camera);  // [shorewall]
       }
     }
     if (!zoomPath.keys.empty() && haveMap)  // (cloudzoom) --cam-zoom-path: the zoom, lean and field of view at this time
@@ -3888,10 +3916,21 @@ int main(int argc, char** argv) {
         pose.now = pose.next = u.bones.data();
         pose.nowCount = pose.nextCount = u.bones.size();
       }
-      const bool posed = u.turned >= 0 || !u.bones.empty();
+      // [machinery] a remastered structure's or factory's parts (machinery.h), at rest or in its idle motion: it builds nothing
+      const uint32_t placedId = 0x40000000u | static_cast<uint32_t>(&u - placedUnits.data());
+      float belt = -1;
+      if (u.model->machinery && opt.built >= 1) {
+        if (u.bones.empty() && u.turned < 0) pose.now = pose.next = nullptr, pose.nowCount = pose.nextCount = 0;
+        FrameUnit fu;
+        fu.id = placedId;
+        fu.position[0] = u.position.x, fu.position[1] = u.position.y, fu.position[2] = u.position.z;
+        belt = world.machinery.PoseUnit(fu, *u.model, u.position, Quat{}, std::string(), &pose);
+      }
+      const bool posed = pose.nowCount > 0 || pose.nextCount > 0;
       meshes.Add(u.model, Mat4::FromTRS(u.position, Quat{}, u.model->scale), kArmyColors[0], opt.shielded ? 3.0f : opt.built, posed ? &pose : nullptr);
+      meshes.Belt(belt);
       if (const WearLook* w = world.WearOf(0x40000000u | static_cast<uint32_t>(&u - placedUnits.data()))) meshes.Wear(*w);  // (--wear-test)
-      world.AddLamps(u.model, u.position, Quat{}, posed ? &pose : nullptr, &kArmyColors[0]);
+      world.AddLamps(u.model, u.position, Quat{}, posed ? &pose : nullptr, &kArmyColors[0], placedId, u.building);
       world.water.AddAfloat(u.position, Quat{}, u.model->boundsMin * u.model->scale, u.model->boundsMax * u.model->scale);  // [floatfoam]
       world.MarkOutline(u.model, u.position, kArmyColors[0], u.building, static_cast<uint32_t>(&u - placedUnits.data()), u.icon);  // (as the player's own)
       icons.Add(u.icon, u.position, kArmyColors[0]);

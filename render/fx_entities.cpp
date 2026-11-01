@@ -477,7 +477,10 @@ setmetatable(moho, {__index = function(t, k) local v = setmetatable({}, engineCl
 local brainMethods = {OnUnitKilled = quietSelf, AddUnitStat = quietSelf, SetUnitStat = quietSelf, TrackJammer = quietSelf,
                       OnUnitDestroyed = quietSelf, GetArmyIndex = function() return 1 end, GetFactionIndex = function() return 1 end,
                       -- (a nuke's launch tells its brain, which tells the others: the stand has none to tell; the unit check's Ace)
-                      NuclearLaunchDetected = quietSelf}
+                      NuclearLaunchDetected = quietSelf,
+                      -- (a support factory asks how many HQs its army has, unit.lua's build restrictions: one of each, so that it
+                      -- builds as it does beside its HQ; before, its OnCreate stopped there and it never built in the stand)
+                      CountHQs = function() return 1 end, CountHQsAllLayers = function() return 1 end}
 for k, v in pairs(moho.aibrain_methods) do if brainMethods[k] == nil then brainMethods[k] = v end end
 -- (and any other of the brain's callbacks and bookkeeping, On..., Add..., Remove..., Track..., Register..., does nothing)
 __fxBrain = setmetatable({CheatEnabled = false, BrainType = 'AI', Name = 'ARMY_1', Nickname = 'stand', Army = 1},
@@ -539,6 +542,8 @@ function IsEntity(e) return type(e) == 'table' and rawget(e, '__id') ~= nil end
 function IsProp(e) return type(e) == 'table' and rawget(e, '__prop') == true end
 function IsProjectile(e) return IsEntity(e) and not e.IsUnit and not IsProp(e) end
 function GetTerrainHeight(x, z) return __fxTerrain(x, z) end
+-- (a structure with weapons turns toward the map's middle as it is made, StructureUnit.RotateTowardsEnemy: the map's size)
+function GetMapSize() return __fxMapWidth or 1024, __fxMapHeight or 1024 end
 function GetSurfaceHeight(x, z) return __fxSurface(x, z) end
 -- the map's terrain types (the game's /lua/TerrainTypes.lua, by the code of the map's cell; out of
 -- the map or a code it does not list: 'Default'), as the engine gives them
@@ -710,8 +715,10 @@ function __fxUnitInfo(id, path)
   local p, a = bp.Physics or {}, bp.Air or {}
   local e = bp.Economy or {}
   local beams = bp.Display and bp.Display.MovementEffects and bp.Display.MovementEffects.BeamExhaust
+  local caps = p.BuildOnLayerCaps
   return tostring(p.MotionType or ''), p.Elevation or 0, p.MaxSpeed or 0, a.MaxAirspeed or 0, p.MaxAcceleration or 0,
-         e.BuildTime or 0, e.BuildRate or 0, beams and true or false
+         e.BuildTime or 0, e.BuildRate or 0, beams and true or false,
+         type(caps) == 'table' and caps.LAYER_Water == true and caps.LAYER_Land ~= true
 end
 -- what the engine calls on a unit as it moves (OnMotionHorzEventChange, OnMotionVertEventChange,
 -- OnLayerChange), and the terrain it moves over changing (OnTerrainTypeChange, with the terrain types)
@@ -1020,6 +1027,8 @@ struct Ent {
   int horz = 3;
   bool driveDone = false;
   std::string motion;
+  bool onWater = false;  // [navstand] (StandHeight)
+  uint32_t building = 0;  // [machinery] the unit it builds (--fx-build: its work's progress in the frame, as a game's)
   int terrainCode = -1;
   // --fx-fire: a unit made with its weapons poses its bones with its manipulators (else the scripts' manipulators
   // do nothing in the stand, as before)
@@ -1239,7 +1248,9 @@ struct FxEntities::Impl {
     *way = Length(w) > 1e-6f ? Normalize(w) : Vec3{0, 0, 1};
   }
   // Where a unit of that way of moving stands at a place, and in which layer.
-  float StandHeight(const std::string& motion, float elevation, float x, float z, std::string* layer) const {
+  // ([navstand] `onWater`: a structure built on water only, BuildOnLayerCaps: it stands on the water's surface, as the game
+  // stands it, not on the sea's bottom under it)
+  float StandHeight(const std::string& motion, float elevation, float x, float z, std::string* layer, bool onWater = false) const {
     const float ground = Ground(x, z);
     const bool wet = water && ground < waterLevel;
     if (motion.find("Air") != std::string::npos) {
@@ -1258,7 +1269,7 @@ struct FxEntities::Impl {
       *layer = wet ? "Seabed" : "Land";
       return ground;
     }
-    if (motion.find("Water") != std::string::npos || motion.find("SurfacingSub") != std::string::npos) {
+    if (motion.find("Water") != std::string::npos || motion.find("SurfacingSub") != std::string::npos || (onWater && wet)) {
       *layer = "Water";
       return wet ? waterLevel : ground;
     }
@@ -2744,10 +2755,18 @@ bool FxEntities::Init(moho::Vfs* vfs, uint32_t seed, std::string* error) {
 
 bool FxEntities::InitUnits(std::function<float(float, float)> terrain, bool water, float waterLevel,
                            std::function<const Model*(const std::string&)> unitModel, std::string* error,
-                           std::function<int(float, float)> terrainType) {
+                           std::function<int(float, float)> terrainType, float mapWidth, float mapHeight) {
   Impl& m = *impl_;
   if (!m.state) return false;
   m.units = true;
+  {  // (GetMapSize's: before, only the weapons' world had it, and a structure made without it took the stub's table for a
+     // number: structureunit.lua(178) in --fx-build)
+    lua_State* L = m.state->L();
+    lua_pushnumber(L, mapWidth > 0 ? mapWidth : 1024);
+    lua_setglobal(L, "__fxMapWidth");
+    lua_pushnumber(L, mapHeight > 0 ? mapHeight : 1024);
+    lua_setglobal(L, "__fxMapHeight");
+  }
   m.terrainCode = std::move(terrainType);
   m.terrain = std::move(terrain);
   m.water = water;
@@ -2934,17 +2953,18 @@ uint32_t FxEntities::AddUnit(const std::string& id, Vec3 at, const UnitPlace& ho
   lua_getglobal(L, "__fxUnitInfo");
   lua_pushstring(L, unitId.c_str());
   lua_pushstring(L, path.c_str());
-  if (lua_pcall(L, 2, 8, 0) != 0) {
+  if (lua_pcall(L, 2, 9, 0) != 0) {
     *error = std::string("its blueprint cannot be read: ") + (lua_isstring(L, -1) ? lua_tostring(L, -1) : "?");
     lua_pop(L, 1);
     return 0;
   }
-  if (lua_isstring(L, -8)) motion = lua_tostring(L, -8);
-  elevation = Num(L, -7);
-  landSpeed = Num(L, -6);
-  airSpeed = Num(L, -5);
-  accel = Num(L, -4);
-  lua_pop(L, 8);
+  if (lua_isstring(L, -9)) motion = lua_tostring(L, -9);
+  elevation = Num(L, -8);
+  landSpeed = Num(L, -7);
+  airSpeed = Num(L, -6);
+  accel = Num(L, -5);
+  const bool onWater = lua_toboolean(L, -1) != 0;  // [navstand]
+  lua_pop(L, 9);
   Vec3 forward = how.forward;
   forward.y = 0;
   forward = Length(forward) > 1e-4f ? Normalize(forward) : Vec3{0, 0, 1};
@@ -2959,7 +2979,7 @@ uint32_t FxEntities::AddUnit(const std::string& id, Vec3 at, const UnitPlace& ho
     place = at - forward * (speed * (how.fallAfter + fall));
   }
   std::string layer;
-  place.y = m.StandHeight(motion, elevation, place.x, place.z, &layer);
+  place.y = m.StandHeight(motion, elevation, place.x, place.z, &layer, onWater);
   const bool wet = m.water && m.Ground(place.x, place.z) < m.waterLevel;
   if (!air && !wet && motion.find("Water") != std::string::npos)
     fprintf(stderr, "render: --fx: %s moves on water and is not on water: it stands on the ground all the same\n", unitId.c_str());
@@ -2975,6 +2995,7 @@ uint32_t FxEntities::AddUnit(const std::string& id, Vec3 at, const UnitPlace& ho
   e.born = m.now;
   e.layer = layer;
   e.motion = motion;
+  e.onWater = onWater;
   e.elevation = elevation;
   e.topSpeed = speed;
   e.accel = accel > 0 ? accel : speed;
@@ -3017,8 +3038,9 @@ uint32_t FxEntities::AddUnit(const std::string& id, Vec3 at, const UnitPlace& ho
 
 void FxEntities::Build(uint32_t builder, uint32_t unit, const std::string& order, float seconds) {
   Impl& m = *impl_;
-  const Ent* b = m.Find(builder);
+  Ent* b = m.Find(builder);
   if (!m.state || !b || !m.Find(unit)) return;
+  b->building = unit;  // [machinery]
   Echo echo;
   m.spawnOriginal = b->original;
   m.spawnSide = b->side;
@@ -3061,7 +3083,7 @@ void FxEntities::Drive(uint32_t unit, const std::vector<Vec3>& loop, double star
   Vec3 at, way;
   m.OnLoop(*e, 0, &at, &way);
   std::string layer;
-  e->position = {at.x, m.StandHeight(e->motion, e->elevation, at.x, at.z, &layer), at.z};
+  e->position = {at.x, m.StandHeight(e->motion, e->elevation, at.x, at.z, &layer, e->onWater), at.z};
   e->turn = Facing(way);
   e->direction = way;
 }
@@ -3375,7 +3397,7 @@ void FxEntities::Advance(double now) {
         Vec3 at, way;
         m.OnLoop(*e, e->distance, &at, &way);
         std::string layer;
-        e->position = {at.x, m.StandHeight(e->motion, e->elevation, at.x, at.z, &layer), at.z};
+        e->position = {at.x, m.StandHeight(e->motion, e->elevation, at.x, at.z, &layer, e->onWater), at.z};
         e->turn = Facing(way);
         e->direction = way;
         e->velocity = way * e->speed;
@@ -3498,6 +3520,9 @@ void FxEntities::Advance(double now) {
         u.maxHealth = e.maxHealth;
         u.fractionComplete = e.fraction;  // (buildfx: what is under construction, as a game's frame says it)
         u.beingBuilt = e.fraction < 1;
+        if (e.building)  // [machinery] (a builder's work: how far what it builds is, while it is under way)
+          if (const Ent* built = m.Find(e.building))
+            u.workProgress = built->fraction > 0 && built->fraction < 1 ? built->fraction : 0.0f;
         u.firstBone = u.nextFirstBone = static_cast<uint32_t>(m.frame.bones.size());
         u.boneCount = u.nextBoneCount = static_cast<uint32_t>(b.bones.size());
         m.frame.bones.insert(m.frame.bones.end(), b.bones.begin(), b.bones.end());

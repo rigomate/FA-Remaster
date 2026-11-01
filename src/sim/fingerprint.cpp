@@ -313,7 +313,10 @@ const std::vector<const Prop*>& Fingerprint::PropsById(const Sim& sim) const {
   return propsById_;
 }
 
-std::string Fingerprint::Line(const Sim& sim, uint32_t beat) const {
+namespace {
+
+// The line of one beat (Fingerprint::Line), the props given in id order.
+std::string StateLineWith(const Sim& sim, uint32_t beat, const std::vector<const Prop*>& propsById) {
   std::vector<std::pair<std::string, uint64_t>> parts;
   {
     Hash h;
@@ -371,7 +374,7 @@ std::string Fingerprint::Line(const Sim& sim, uint32_t beat) const {
   }
   {
     Hash h;
-    for (const Prop* p : PropsById(sim)) HashEntity(h, p);
+    for (const Prop* p : propsById) HashEntity(h, p);
     parts.emplace_back("props", h.h);
   }
   {
@@ -392,6 +395,12 @@ std::string Fingerprint::Line(const Sim& sim, uint32_t beat) const {
   for (const auto& [name, v] : parts) line += " " + name + "=" + Hex(v);
   return line + " lua=" + lua;
 }
+
+}  // namespace
+
+std::string Fingerprint::Line(const Sim& sim, uint32_t beat) const { return StateLineWith(sim, beat, PropsById(sim)); }
+
+std::string Fingerprint::StateLine(const Sim& sim, uint32_t beat) { return StateLineWith(sim, beat, ById(sim.props)); }
 
 bool Fingerprint::Beat(const Sim& sim, uint32_t beat) {
   if (!headerDone_) {
@@ -476,7 +485,7 @@ bool Fingerprint::PeerLine(uint32_t beat, std::string* line) {
   }
 }
 
-void Fingerprint::WriteDetail(const Sim& sim, uint32_t beat, const std::string& path, const char* why) const {
+void Fingerprint::WriteDetail(const Sim& sim, uint32_t beat, const std::string& path, const char* why) {
   FILE* f = std::fopen(path.c_str(), "wb");
   if (!f) {
     Logf(LogLevel::Warning, "fingerprint: cannot write %s", path.c_str());

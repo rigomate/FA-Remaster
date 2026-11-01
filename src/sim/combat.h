@@ -291,6 +291,8 @@ bool BpInCategory(Sim& sim, const BlueprintInfo* bp, const char* name);
 // BpInCategory's answer for every blueprint index at once (the same cached vector; the reference stays good for
 // the sim's life): BpInCategory(bp) == bp && bp->entityIndex >= 0 && index < size && mask[index].
 const std::vector<bool>& BpCategoryMask(Sim& sim, const char* name);
+// The mask if BpCategoryMask made it already (nothing made here)
+const std::vector<bool>* BpCategoryMaskIfMade(const Sim& sim, const char* name);
 
 // Called when a unit's weapon was created (after its OnCreate).
 void InitUnitWeapon(lua_State* L, UnitWeapon* w);
@@ -312,6 +314,7 @@ struct AimAhead {
   AimAhead();
   SpecMode mode;
   SpecCounts counts;
+  size_t minItems = 0;  // the pass's units a beat below which nothing is walked ahead (Sim::Start; on:N)
   bool active() const { return mode != SpecMode::kOff; }
 };
 void AimMuzzlesAhead(Sim& sim, const std::vector<Unit*>& order);
@@ -320,7 +323,8 @@ void ProjectilesTick(Sim& sim);
 void ProjectileStep(Sim& sim, Projectile* p);
 void BeamsTick(Sim& sim);
 void BeamTick(Sim& sim, class CollisionBeam* b);  // one collision beam's beat
-void WeaponsTick(Sim& sim);
+void WeaponsStageDebug(Sim& sim);                                     // (MOHO64_DEBUG_COMBAT's lines)
+void WeaponsTickUnits(Sim& sim, const std::vector<Unit*>& units);  // one army's attacker stage
 // A unit leaves the world.
 void ReleaseUnitCombat(Sim& sim, Unit* u);
 // The unit is deleted (EntityDb::Purge, after the destroy queue): ~Unit deletes its CAniActor (0x6a714c ->

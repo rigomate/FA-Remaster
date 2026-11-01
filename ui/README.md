@@ -350,7 +350,40 @@ moho64ui --init <the game's init .lua> [--mods uids.txt] [--prefs <our preferenc
   frame; GetPeer / GetPeers give name, id, status, ping, quiet, established peers; ValidateIPAddress resolves
   "host:port"; the discovery service lists LAN games (UDP 15000, `net/discovery.h`). A game's orders between the
   players: `net/beat_exchange_net.h` (the engine's `src/sim/beat_exchange.h`, the original's stream with an
-  Advance per beat), written and tested, not used by the program yet. Tests: three programs at once over loopback
+  Advance per beat). A network game (since 2026-10-30): LaunchGame in a lobby with peers hands the lobby's
+  connector and connections to the game (`LobbyCore::TakeForGame`); every program starts the same session (the
+  host's nonce as the seed; the clients numbered as the original's LaunchGame does: human armies in army order, then
+  observers, client i speaking for source i), and `app/game_session.cpp` runs each beat through the engine's
+  `Lockstep` (`src/sim/lockstep.h`) over a `NetBeatExchange`: the player's orders go to everyone for a later beat,
+  every client's merged orders are recorded and applied before the beat (so the game's replay plays back like any
+  other), and a beat whose orders are not all in waits while the frames go on. Beside the orders the clients send
+  the original's control messages (`net/beat_exchange_net.h`, read from CClientBase::Process 0x53bf30): ACK (a beat
+  runs only once every client still in the game has acknowledged every client's part of it, as the original's
+  available beat), READY (each program's load ends by itself; once its game screen is up it says READY, and the beats
+  wait, FAF's "Waiting For Other Players..." shown through the provider, until every client is ready or ejected),
+  EJECT (EjectSessionClient, the disconnect dialog's button: this program's vote; the client is left out, its
+  command sources terminated, after the smallest "last beat" any client asked for, once every client still in has
+  asked), CHAT (SessionSendChatMessage to the clients named, heard as gamemain.ReceiveChat(sender, message)) and GAME
+  SPEED (SetGameSpeed where the game's speed is adjustable: every client ends on the newest request,
+  uimain.NoteGameSpeedChanged tells who). GetSessionClients lists the clients (connected = not ejected here, ping,
+  quiet, ejectedBy, FAF's maxSP), SessionIsMultiplayer is true, uimain.UpdateDisconnectDialog runs each frame, and a
+  checksum difference shows uimain.ShowDesyncDialog(beat, names); then, ours (Chris approved, 2026-10-30), the two
+  programs swap their state's parts of that beat (message 60, ours) and each says on the console which parts differ
+  and from which beat ("Desync at beat 250 with Host: Joiner's economy (army 2) differs (first between beats 201 and
+  250)"), the same in the log and in `<replay>.desync.txt`, with the full listing of the next checksum beat beside it
+  (docs/ui-net-game.md, "A desync's parts"). As in the original (and FAF, Chris 2026-10-30: "Just
+  keep faf behaviour"): a connection that ends ejects its player at once ("X disconnected." on the console, 0x53c2c3),
+  and a player only gone quiet goes through FAF's disconnect dialog and its vote (its Eject button after
+  DisconnectionDelay02, its forced eject later). The input delay is the original's
+  net_Lag (500 ms) in beats at the game's speed at launch (5 at normal). Tests: two programs over loopback
+  (`ui/tests/net_game_host.lua`, `net_game_join.lua`): a 2-player game with orders from both, chat both ways, the
+  speed changed by each, a pause, a desync on purpose (and the part it names), the two programs' fingerprints equal at
+  every beat, then the
+  joiner quits and the host ejects it at once and runs on; variants with the joiner frozen mid-game (quiet: the host
+  ejects it as the dialog's button does and
+  runs on; `net_game_replay.lua` plays the host's replay with the same fingerprints) and frozen before it is ready
+  (the host's waiting ends with the eject).
+  Tests of the lobby: three programs at once over loopback
   (`ui/tests/net_host.lua`, `net_join1.lua`, `net_join2.lua`, over TCP and, as copies, over UDP), the LAN pair
   (`net_lan_host.lua`, `net_lan_browse.lua`; the suite's net_lobby runs them last), and two programs of their own
   (`ui/net/tests/udp_test.cpp`, `beat_test.cpp`: how to build them is in their headers).
@@ -1211,9 +1244,14 @@ moho64ui --init <the game's init .lua> [--mods uids.txt] [--prefs <our preferenc
   `SetGameSpeed`, `GetGameSpeed`, and the console commands `WLD_IncreaseSimRate`,
   `WLD_DecreaseSimRate`, `WLD_ResetSimRate`, `WLD_GameSpeed <n>` with the original's bounds (-10
   to 50) are built. As in the original the speed only changes where the game's option
-  `GameSpeed` is "adjustable" ("fast" starts at 4, "normal" stays). `GetSimRate` gives the speed
-  asked for, not the speed the simulation manages; at high speeds the host runs at most ten
-  beats a frame. The game's clock in seconds (`GameTime`, `GetGameTimeSeconds`, `GetGameTime`)
+  `GameSpeed` is "adjustable" ("fast" starts at 4, "normal" stays). `GetGameSpeed` gives the
+  speed asked for, `GetSimRate` the speed run: as in the original, in every game the smaller of
+  the speed asked for and each client's maxSP, the sim driver's measure of its PC's speed (the
+  median of the last beats' times; a local game's or a replay's own, a network game's every
+  client's: `docs/ui-net-game.md`, "maxSP"); a change of speed reaches the game's scripts
+  (uimain.NoteGameSpeedChanged, the score panel's "(asked / run)"). A headless run's stepped
+  frames measure nothing (`MOHO64UI_FORCE_MAXSP=<n>` puts a value in its place, for tests); at
+  high speeds the host runs at most ten beats a frame. The game's clock in seconds (`GameTime`, `GetGameTimeSeconds`, `GetGameTime`)
   is the last sync's tick plus the part of the next tick gone by since, as the original's session
   keeps it (CWldSession+0x460, SessionFrame 0x895b40): it runs smoothly between beats, stands a
   tenth past the last tick while paused, and goes on from there; `GameTick()` is the last sync's

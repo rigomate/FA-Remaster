@@ -286,6 +286,8 @@ void SteeringCheckCollisions(Sim& sim, Unit* u);
 // navigators and then its steering (brain+0xa8, brain+0xac, beat_order.md): a collision record a navigator's
 // steering Stop writes is looked at in this beat by a unit of this army or a later one, in the next by an earlier.
 void SteeringNavStageArmy(Sim& sim, int army);
+// UnitFootprintGrid's grid is already made for this sim (it would not be made now)
+bool UnitFootprintGridReady(Sim& sim, const Unit* u);
 // Navigator interface (sim/landnav.cpp): a move starts (no waypoint yet: it coasts), the steering
 // gets a waypoint (through: drive through it, else brake to it), the move ended.
 void MotionNavBegin(Unit* u);
@@ -293,7 +295,8 @@ void MotionSetWaypoint(Sim& sim, Unit* u, const Vec3& p, bool through);
 void MotionNavDone(Unit* u, bool succeeded);
 // The steering stage (CAiSteeringImpl::OnTick, before motion; sim/steering.cpp): new waypoints,
 // spline batches, push ends, predicted collisions and their reactions (engine-ref unit_collision.md).
-void SteeringTickAll(Sim& sim);
+// One army's steering stage, its units in creation order, in that army's turn (landnav.h: LandNavStageBegin).
+void SteeringTickUnits(Sim& sim, const std::vector<Unit*>& units);
 // Place a unit on the ground/water at its current position (SnapToGround / SnapToWater).
 void SnapUnit(const Sim& sim, Unit* u);
 // The raised platform the unit stands on (motion+0x114), and that platform's height at (x, z) above its own

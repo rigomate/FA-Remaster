@@ -11,6 +11,7 @@
 #include <cstring>
 
 #include "blasts.h"
+#include "machinery.h"  // [machinery]
 #include "build_effects.h"
 #include "card_scenery.h"  // [gpuscenery]
 #include "effect_files.h"
@@ -132,6 +133,10 @@ cbuffer MeshKind : register(b3) {
                 // frame's alpha (ModelLod::rgbOnly: the original writes its colour alone); z: what sways, a group of
                 // trees: model units a step of where each tree stands (ModelLod::treeStep; 0: none); w: the scene's
                 // samples a pixel (NearFade)
+  float4 kind12;  // [machinery] a factory's belt (machinery.h): x where its strip of the texture begins along its axis, y how
+                  // long it is, z the bone whose vertices are the belt (-1: none), w its axis (0: u, 1: v)
+  float4 kind13;  // [machinery] x: the model's bones, when after their rows come how strongly each glows (one float each,
+                  // four a row); 0: none
 #ifdef PLANTS
   float4 kind7, kind8;  // [plants] (plants.h) PlantLife::Constants
 #endif
@@ -173,6 +178,8 @@ struct VOut {
   float3 rest : TEXCOORD4;
   float3 restNormal : TEXCOORD5;
   nointerpolation float4 wear : TEXCOORD6;  // (the instance's: unit_wear.h)
+  nointerpolation float belt : TEXCOORD10;   // [machinery] how far its belt has moved along its strip (-1: not on a belt)
+  nointerpolation float glow : TEXCOORD11;   // [machinery] how strongly it glows (1: as its texture says)
 #ifdef PLANTS
   nointerpolation float4 plants : TEXCOORD7;  // [plants] how it is burnt (PlantsBurnLook: black, brown, lower, embers)
 #endif
@@ -286,7 +293,15 @@ VOut VS(VIn i, uint instance : SV_InstanceID) {
   o.color = n.color;
   o.wear = n.wear;
   o.tint = n.bones.yzw;
+  o.belt = -1;
+  o.glow = 1;
+  [branch] if (kind13.x > 0.5 && n.bones.x >= 0) {  // [machinery] (its bone's glow, after the rows)
+    uint g = (uint)n.bones.x + (uint)(kind13.x + 0.5) * 3 + i.bones.x / 4;
+    o.glow = boneRows[g][i.bones.x % 4];
+  }
   [branch] if (n.bones.y < -0.5) {
+    // [machinery] (y -2: a factory whose belt moves, z how far: its vertices on the belt's bone)
+    if (n.bones.y < -1.5 && kind12.z >= 0 && i.bones.x == (uint)(kind12.z + 0.5)) o.belt = n.bones.z;
     // a tank's treads, scrolled as it drives, as the original's ComputeScrolledTexcoord does it: the two
     // strips at the foot of its texture, each by its tread's amount (bones.z, bones.w), across both sets;
     // where the level's mesh says its treads scroll
@@ -671,6 +686,7 @@ float4 Shade(VOut i, bool front) {
     spec = specularMap.Sample(samplerAniso, i.uv.xy);
     secondary = secondaryMap.Sample(samplerAniso, i.uv.xy);  // [grime] (all of it: a unit's masks, unit_grime.h)
   }
+  spec.b *= i.glow;  // [machinery] (a lit piece pulsing with its lamp)
   float occlusion = secondary.r;
   if (kind2.z > 0.5) spec = float4(0, 0.85, 0, kind2.y > 0.5 ? 0.35 : 0);  // rough, no metal; leaves let some light through
   // holes: cut where the alpha is not above the mark; leaves get a soft edge a pixel wide instead,
@@ -970,6 +986,13 @@ float4 Shade(VOut i, bool front) {
 
 // a ghost: its shape in one colour, the light and dark of the model kept
 float4 PS(VOut i, bool front : SV_IsFrontFace) : SV_Target {
+  // [machinery] a belt's strip of the texture slid along its axis, wrapped within it
+  [branch] if (i.belt >= 0) {
+    float along = kind12.w > 0.5 ? i.uv.y : i.uv.x;
+    along = kind12.x + frac((along - kind12.x + i.belt) / kind12.y) * kind12.y;
+    if (kind12.w > 0.5) i.uv.y = along;
+    else i.uv.x = along;
+  }
   float4 c = Shade(i, front);
   c.rgb = BeyondScenery(c.rgb, i.world);  // (the trees and rocks of the world beyond the map's edge)
   // glass: as much of it shows as its albedo's alpha and its glow say (never quite nothing, or a
@@ -1438,6 +1461,7 @@ void MeshRenderer::Prepare(const std::vector<const View*>& views) {
     Entry& e = entries_[i];
     e.rows = static_cast<int>(floats / 4);
     floats += e.model->bones.size() * 12;
+    if (e.model->machinery && e.model->machinery->glows) floats += (e.model->bones.size() + 3) / 4 * 4;  // [machinery] (its glows)
     rowsToBuild_.push_back(&e);
   }
   // after them the shells' hits, a row each; the instance's colour says where they begin and how many
@@ -1594,7 +1618,11 @@ void MeshRenderer::BuildRows(Entry* entry, float* rows) {
     }
     const ModelBone& rest = bones[i];
     if ((a && a->hidden) || (!a && b && b->hidden)) {  // hidden: its vertices at no size, where its joint is
-      const float gone[12] = {0, 0, 0, rest.position.x, 0, 0, 0, rest.position.y, 0, 0, 0, rest.position.z};
+      // ([machinery] where it is posed, not where it rests: a conveyor's part hidden for its jump back waits where it comes
+      // back, and the frame it shows again moves its vertices only by its own size there, not from its joint at rest)
+      const FrameBone* h = a ? a : b;
+      const Vec3 at = Vec3{h->position[0], h->position[1], h->position[2]} * toModel;
+      const float gone[12] = {0, 0, 0, at.x, 0, 0, 0, at.y, 0, 0, 0, at.z};
       std::copy(gone, gone + 12, out);
       continue;
     }
@@ -1602,9 +1630,25 @@ void MeshRenderer::BuildRows(Entry* entry, float* rows) {
     auto turn = [&](const FrameBone* f) { return f ? Quat{f->orientation[0], f->orientation[1], f->orientation[2], f->orientation[3]} : rest.rotation; };
     const Quat q = Mul(Nlerp(turn(a), turn(b), pose.blend), Conjugate(rest.rotation));
     const Vec3 t = Lerp(place(a), place(b), pose.blend) - Rotate(q, rest.position);
-    const Mat4 m = Mat4::FromTRS(t, q);
+    Mat4 m = Mat4::FromTRS(t, q);
+    // [machinery] (a part scaled in its own axes at rest: about its joint, before it is turned to where it is)
+    if (pose.scales && i >= pose.scaleFrom && i < pose.scaleFrom + pose.scaleCount) {
+      const float* s = pose.scales + (i - pose.scaleFrom) * 3;
+      if (s[0] != 1 || s[1] != 1 || s[2] != 1) {
+        const Quat posed = Nlerp(turn(a), turn(b), pose.blend);
+        m = Mat4::Translation(Lerp(place(a), place(b), pose.blend)) * Mat4::FromTRS({}, posed) * Mat4::Scale({s[0], s[1], s[2]}) *
+            Mat4::FromTRS({}, Conjugate(rest.rotation)) * Mat4::Translation(rest.position * -1.0f);
+      }
+    }
     for (int r = 0; r < 3; ++r)
       for (int c = 0; c < 4; ++c) out[r * 4 + c] = m.m[r][c];
+  }
+  // [machinery] how strongly each bone glows, after the rows (a model whose machinery has glows: kind13)
+  if (entry->model->machinery && entry->model->machinery->glows) {
+    float* g = rows + static_cast<size_t>(entry->rows) * 4 + bones.size() * 12;
+    for (size_t i = 0; i < (bones.size() + 3) / 4 * 4; ++i) g[i] = 1;
+    if (pose.glows)
+      for (uint32_t k = 0; k < pose.glowCount && pose.glowFrom + k < bones.size(); ++k) g[pose.glowFrom + k] = pose.glows[k];
   }
 }
 
@@ -1682,6 +1726,14 @@ void MeshRenderer::Wear(const WearLook& look) {
     if (look.dirt) wearRows_.insert(wearRows_.end(), look.dirtRows, look.dirtRows + kDirtRows);  // [unit dirt]
     if (look.grime) wearRows_.insert(wearRows_.end(), look.grimeRows, look.grimeRows + kGrimeRows);  // [grime]
   }
+}
+
+void MeshRenderer::Belt(float amount) {
+  if (amount < 0 || entries_.empty()) return;
+  Entry& e = entries_.back();
+  if (e.instance.bones[1] != 0 || e.instance.bones[2] != 0 || e.instance.bones[3] != 0) return;  // (a ghost's tint, treads)
+  e.instance.bones[1] = -2;  // (the vertex shader: y -2, a belt that moves by z)
+  e.instance.bones[2] = amount;
 }
 
 uint32_t MeshRenderer::AddGroup() {
@@ -2132,7 +2184,7 @@ void MeshRenderer::RecordRuns(R& to, const RunSetup& s, size_t from, size_t end,
         batch[i] = items_[at + i].entry->instance;
         batch[i].bones[0] = items_[at + i].bones;
       }
-    float kind[44] = {lod->alphaCut, lod->shell ? 12.0f : lod->impact ? 9.0f + static_cast<float>(lod->impact) : lod->unlit ? 6.0f + static_cast<float>(lod->unlit) : lod->nuke ? 4.0f + static_cast<float>(lod->nuke) : lod->fades ? 4.0f : lod->shield ? 3.0f : lod->frame ? 2.0f : lod->vertexNormals ? 1.0f : 0.0f, lod->teamMask ? 0.0f : 1.0f, lod->labPbr ? 1.0f : 0.0f,
+    float kind[52] = {lod->alphaCut, lod->shell ? 12.0f : lod->impact ? 9.0f + static_cast<float>(lod->impact) : lod->unlit ? 6.0f + static_cast<float>(lod->unlit) : lod->nuke ? 4.0f + static_cast<float>(lod->nuke) : lod->fades ? 4.0f : lod->shield ? 3.0f : lod->frame ? 2.0f : lod->vertexNormals ? 1.0f : 0.0f, lod->teamMask ? 0.0f : 1.0f, lod->labPbr ? 1.0f : 0.0f,
                             static_cast<float>(lod->faction), lod->leaves ? 1.0f : 0.0f, lod->plainMaterial ? 1.0f : 0.0f, lod->border ? 1.0f : 0.0f,
                             lod->sway, 1 / lod->swayHeight, 0, 1,
                             lod->chrome ? 2.0f : lod->wreck ? 1.0f : 0.0f, lod->shieldTint.x, lod->shieldTint.y, lod->shieldTint.z};
@@ -2156,13 +2208,24 @@ void MeshRenderer::RecordRuns(R& to, const RunSetup& s, size_t from, size_t end,
     kind[21] = lod->rgbOnly ? 1.0f : 0.0f;
     kind[22] = lod->sway > 0 ? lod->treeStep : 0.0f;  // [foliage] (a group's trees, each on its own beat)
     kind[23] = static_cast<float>(gSceneSamples);     // [foliage] (NearFade: leaves fade by their coverage)
-    if (reacts) {  // [plants] (kind7, kind8; the game's trees neither pressed nor burnt by the picture: Model::simTree)
-      std::copy(plantsConstants, plantsConstants + 8, kind + 24);
-      if (items_[at].entry->model->simTree) kind[30] = kind[31] = 0;
-      if (shadowPass) kind[30] = 0;  // (shadows: bent as the plants are, but not burnt: it would cost the sun's maps too much)
+    kind[26] = -1;  // [machinery] (kind12: a factory's belt, MachinerySpec)
+    {  // [machinery] (kind13: the model's bones when its glows follow their rows)
+      const Model* of = items_[at].entry->model;
+      kind[28] = of->machinery && of->machinery->glows ? static_cast<float>(of->bones.size()) : 0.0f;
     }
-    if (sinks) std::copy(s.snowK, s.snowK + 12, kind + 32);  // [undersnow] (kind9..11; kind7, kind8 nought when nothing reacts)
-    to.SetConstants(3, kind, static_cast<uint32_t>(sizeof(float) * (sinks ? 44 : reacts ? 32 : 24)));
+    if (const MachinerySpec* m = items_[at].entry->model->machinery.get(); m && m->beltBone >= 0) {
+      kind[24] = m->beltFrom;
+      kind[25] = m->beltLength;
+      kind[26] = static_cast<float>(m->beltBone);
+      kind[27] = static_cast<float>(m->beltAxis);
+    }
+    if (reacts) {  // [plants] (kind7, kind8; the game's trees neither pressed nor burnt by the picture: Model::simTree)
+      std::copy(plantsConstants, plantsConstants + 8, kind + 32);
+      if (items_[at].entry->model->simTree) kind[38] = kind[39] = 0;
+      if (shadowPass) kind[38] = 0;  // (shadows: bent as the plants are, but not burnt: it would cost the sun's maps too much)
+    }
+    if (sinks) std::copy(s.snowK, s.snowK + 12, kind + 40);  // [undersnow] (kind9..11; kind7, kind8 nought when nothing reacts)
+    to.SetConstants(3, kind, static_cast<uint32_t>(sizeof(float) * (sinks ? 52 : reacts ? 40 : 32)));
     to.SetTexture(0, lod->albedo);
     if (!shadowPass) {
       to.SetTexture(1, lod->normals);

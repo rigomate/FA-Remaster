@@ -119,8 +119,8 @@ Vec3 TargetPos(Sim& sim, const UnitCommand& c, Unit* u = nullptr) {
 }
 
 void SetMoving(Unit* u, bool on) {
-  if (on) u->unitStates.insert("Moving");
-  else u->unitStates.erase("Moving");
+  if (on) u->unitStates.Insert(US("Moving"));
+  else u->unitStates.Erase(US("Moving"));
 }
 
 // A unit drops a command: when no unit holds it any more the command object goes, and with it
@@ -359,7 +359,7 @@ void RunPathSearch(Sim& sim, Unit* u, bool /*continuing*/) {
   // the second unit out of a factory does not head for the cell the first one stands on: it gets the nearest free
   // spot of the ring two footprints out.
   if (c.type == CommandType::Move && c.factoryIssued && u->commands.size() == 1 && u->motion.bp &&
-      !u->unitStates.count("TransportLoading") && !u->unitStates.count("Teleporting") && !u->unitStates.count("Guarding")) {
+      !u->unitStates.Has(US("TransportLoading")) && !u->unitStates.Has(US("Teleporting")) && !u->unitStates.Has(US("Guarding"))) {
     Vec3 p{std::nearbyint(goal.x), goal.y, std::nearbyint(goal.z)};
     if (p.x != 0.0f || p.y != 0.0f || p.z != 0.0f) {
       const float none[4] = {0, 0, 0, 0};
@@ -596,7 +596,7 @@ Entity* PatrolReclaimTarget(Sim& sim, Unit* u, PatrolData& p) {
       if (ally) {
         if (!(energyHigh && massHigh)) continue;
         if (c->health >= c->maxHealth * 0.9f) continue;
-        if (c->unitStates.count("BeingReclaimed")) continue;
+        if (c->unitStates.Has(US("BeingReclaimed"))) continue;
         w = 2.0f;
       } else if (c->army && combat::IsEnemy(u->army, c->army)) {
         if (!BpInCategory(sim, c->blueprint, "RECLAIMABLE")) continue;
@@ -648,7 +648,7 @@ BuildTask* StartPatrolTask(Sim& sim, Unit* u, const UnitCommand& c) {
   t->pdata = std::make_shared<PatrolData>();
   t->pdata->aggressive = c.type == CommandType::AggressiveMove;
   t->pdata->goal = TargetPos(sim, c, u);  // (the dispatcher's GetPosition, into the ctor's +0x5c)
-  u->unitStates.insert("Patrolling");
+  u->unitStates.Insert(US("Patrolling"));
   PatrolSearchBox(sim, u, *t->pdata);
   AirSpeedThroughEvent(sim, u);  // the patrol task ctor
   AttackerUnpackStop(sim, u);    // ctor 0x61b009..0x61b067: standing unpacked with AI.NeedUnpack: SetDesiredTarget(none)
@@ -715,7 +715,7 @@ int TickPatrol(Sim& sim, Unit* u, BuildTask& t) {
     return kTaskRunning;
   }
   // (d) move / arrival
-  if (u->unitStates.count("NeedToTerminateTask")) return kTaskDone;
+  if (u->unitStates.Has(US("NeedToTerminateTask"))) return kTaskDone;
   UnitCommand* c = u->commands.empty() ? nullptr : u->commands.front().get();
   if (p.goalIssued && p.ticks > 3 && AtPatrolGoal(sim, u, p)) {
     // the task's formation (+0x58): DispatchTask gives one only to FormPatrol / FormAggressiveMove (0x60984e ->
@@ -748,8 +748,8 @@ void EndPatrol(Sim& sim, Unit* u, BuildTask& t) {
   u->navIgnoreFormation = false;
   if (!vm::SameBits(u->position, u->lastPosition))  // (0x61b1a7..0x61b1c2, memcmp 0x4f0a50)
     MotionStop(u);  // AbortMove only when it moved this tick
-  u->unitStates.erase("NeedToTerminateTask");
-  u->unitStates.erase("Patrolling");
+  u->unitStates.Erase(US("NeedToTerminateTask"));
+  u->unitStates.Erase(US("Patrolling"));
   u->leashPos = {};
 }
 
@@ -777,6 +777,16 @@ void EndPatrol(Sim& sim, Unit* u, BuildTask& t) {
 // (issued with a formation at 4311, only 0x1a left on it) while 0x1a reclaims the tree group 0x2ff00d29 for it: at
 // 5382 the original's reclaim task has no target (+0x44 null, +0x4c set, state 0, not started), ends there and the
 // patrol walks to (737, 270) (SetGoal from NewMoveTask 0x6190cb); ours left formation commands out and reclaimed on.
+void RetargetAttackTasks(Sim& sim, UnitCommand& c) {
+  std::vector<Unit*> holders(c.units.begin(), c.units.end());
+  std::sort(holders.begin(), holders.end(), [](const Unit* a, const Unit* b) { return a->id < b->id; });
+  for (Unit* u : holders) {
+    if (!IsAlive(u) || u->commands.empty() || u->commands.front().get() != &c) continue;
+    if (u->headState != kRunning || !u->task) continue;
+    AttackTaskCommandEvent(sim, u, *u->task, c);
+  }
+}
+
 void RetargetPatrolTasks(Sim& sim, UnitCommand& c) {
   // (whatever the command's type is now: a patrol task under way keeps its listener when the type is changed,
   // HeadTaskType; read, not seen)
@@ -854,7 +864,7 @@ void StartHead(Sim& sim, Unit* u) {
   // lands). Not in the beat of the drop itself: the transport's thread, woken by its arrival, has its turn after
   // the cargo's. What blocks is unit state Attached alone (IAiCommandDispatchImpl::TaskTick 0x598f89, IsUnitState
   // 14), not the attach link: cargo a script took out of that state runs its orders (a DetachFromTransport, say).
-  if (u->unitStates.count("Attached") || u->detachedAt == sim.tick()) {
+  if (u->unitStates.Has(US("Attached")) || u->detachedAt == sim.tick()) {
     u->headState = kNotStarted;
     return;
   }
@@ -872,7 +882,7 @@ void StartHead(Sim& sim, Unit* u) {
   // it in a Lua thread, after the command stage), and on a factory during its roll-off. Seen (MP3, army 2's ACU):
   // a build order given during the warp-in waits until the beat after the clear; ours had started it at once and
   // built two beats early.
-  if (u->unitStates.count("BlockCommandQueue")) {
+  if (u->unitStates.Has(US("BlockCommandQueue"))) {
     u->headState = kNotStarted;
     return;
   }
@@ -1645,6 +1655,12 @@ bool RemoveCommandFromUnit(Sim& sim, Unit* u, UnitCommand& c) {
   if (i == 0) {  // the executing head: its task is interrupted (destructor abort -> AbortMove)
     const bool stopped = HeadTaskStopsMotion(u);  // a pod's task: its dtor's Stop is the last word
     const bool asleep = ThreadAsleepOnMove(u);    // (asked before the teardown changes the head)
+    // A head not dispatched yet has no task: event 3's interrupt (IAiCommandDispatchImpl::OnEvent 0x599030 ->
+    // 0x408d70) tears nothing down, so nothing aborts the move (as the clear of an undispatched head, IssueFromStream).
+    // Seen: MP1 15137, army 1's player gives five ships a Move with clear (0x01000044) and takes it off their queues
+    // in the same message batch; the Move it replaced kept its move (CUnitMoveTask dtor, a Move for a Move): the
+    // original's ships drive on at full speed, speed-through 1, an empty queue; ours stopped them (braking from 15138).
+    const bool undispatched = u->headState == kNotStarted && !u->task;
     EndMoveTaskRect(u);
     if (u->engageId) ClearEngagement(sim, u);
     if (u->task) {
@@ -1656,8 +1672,8 @@ bool RemoveCommandFromUnit(Sim& sim, Unit* u, UnitCommand& c) {
     u->headState = kNotStarted;
     auto& pq = sim.pathQueue;
     pq.erase(std::remove(pq.begin(), pq.end(), u), pq.end());
-    if (!stopped) MotionStop(u);
-    SetMoving(u, false);
+    if (!stopped && !undispatched) MotionStop(u);
+    if (!undispatched) SetMoving(u, false);
     // CUnitCommandQueue::RemoveCommandFromQueue 0x6edef0, index 0: the queue tells its listeners event 3
     // (0x6edf11..0x6edf1c) before the command goes; IAiCommandDispatchImpl::OnEvent 0x599030 takes events 2 and 3:
     // the thread's frame count to 0 and, when it is suspended (a move task's ctor), re-linked at the stage's end
@@ -2603,9 +2619,9 @@ int l_SetImmobile(lua_State* L) {
   Unit* u = U(L);
   u->immobile = lua_toboolean(L, 2) != 0;
   if (u->immobile) {
-    u->unitStates.insert("Immobile");
+    u->unitStates.Insert(US("Immobile"));
   } else {
-    u->unitStates.erase("Immobile");
+    u->unitStates.Erase(US("Immobile"));
   }
   return 0;
 }

@@ -7,6 +7,8 @@
 #include "script/fastlib.h"
 
 #include <cstdlib>
+#include <string>
+#include <vector>
 
 namespace moho {
 namespace {
@@ -249,6 +251,131 @@ int l_MakeNavGridLeafXZ(lua_State* L) {
   return 1;
 }
 
+// The closure MakeCategoryChain returns: f(site, verify, ops, a, b, c, d, e, f, g, h), a category expression kept per
+// call site: the value a ops[1] b ops[2] c ... folded from the left (each step fOp(op, left, right), fOp the script's
+// own operator function, upvalue 2), kept under `site` with its operands (upvalue 1: site -> {[1..n] operands,
+// [9] value, [10] n}); while the same operands come again (the VM's `==`, lua_equal, for the first n of them, n as kept)
+// the kept value is handed back. What a script's
+//   local t = cache[site]; if not t then t = {}; cache[site] = t end
+//   if t.n and t[1] == a and ... then return t.r end; r = a; for each op: r = fOp(op, r, next operand); keep; return r
+// gives, with the same operands and the same answers (`verify`, the script's own test function, is not called here).
+int l_CategoryChain(lua_State* L) {
+  lua_settop(L, 11);
+  size_t len = 0;
+  const char* ops = luaL_checklstring(L, 3, &len);
+  if (len > 7) return luaL_error(L, "CategoryChain: at most 7 operators");
+  lua_pushvalue(L, 1);
+  lua_rawget(L, lua_upvalueindex(1));  // 12: the site's table
+  if (!lua_istable(L, 12)) {
+    lua_pop(L, 1);
+    lua_newtable(L);
+    lua_pushvalue(L, 1);
+    lua_pushvalue(L, 12);
+    lua_rawset(L, lua_upvalueindex(1));
+  }
+  lua_rawgeti(L, 12, 10);  // 13: n as kept
+  if (lua_type(L, 13) == LUA_TNUMBER) {
+    const int n = static_cast<int>(lua_tonumber(L, 13));
+    bool same = true;
+    for (int i = 1; i <= n && same; ++i) {
+      lua_rawgeti(L, 12, i);
+      same = lua_equal(L, -1, 3 + i) != 0;
+      lua_pop(L, 1);
+    }
+    if (same) {
+      lua_rawgeti(L, 12, 9);
+      return 1;
+    }
+  }
+  lua_settop(L, 12);
+  const int n = static_cast<int>(len) + 1;
+  lua_pushvalue(L, 4);  // 13: r = a
+  for (int i = 0; i < static_cast<int>(len); ++i) {
+    lua_pushvalue(L, lua_upvalueindex(2));
+    lua_pushlstring(L, ops + i, 1);
+    lua_pushvalue(L, 13);
+    lua_pushvalue(L, 5 + i);
+    lua_call(L, 3, 1);
+    lua_replace(L, 13);
+  }
+  for (int i = 1; i <= n; ++i) {
+    lua_pushvalue(L, 3 + i);
+    lua_rawseti(L, 12, i);
+  }
+  lua_pushnumber(L, n);
+  lua_rawseti(L, 12, 10);
+  lua_pushvalue(L, 13);
+  lua_rawseti(L, 12, 9);
+  lua_settop(L, 13);
+  return 1;
+}
+
+// Remastered.MakeCategoryChain(fOp): l_CategoryChain over a cache of its own and the script's operator function.
+int l_MakeCategoryChain(lua_State* L) {
+  luaL_checktype(L, 1, LUA_TFUNCTION);
+  lua_newtable(L);
+  lua_pushvalue(L, 1);
+  lua_pushcclosure(L, l_CategoryChain, 2);
+  return 1;
+}
+
+// The closure MakeFieldTest returns: f(v), the value of the Lua expression `v and v.f1 and not v.f2 and ...` as a
+// boolean (spec "+f1 -f2 ...": + the field must be true, - it must be false or nil), for the script function
+// `if v and v.f1 and not(v.f2) ... then return true end return false`. The fields are read in the spec's order through
+// lua_gettable (the VM's own indexing: metamethods as `v.f`), stopping at the first that fails, as `and` stops. A v
+// that is neither false / nil nor a table goes to the script's own function (upvalue 1), so whatever the VM does
+// there (an indexing error, a string's fields) is what that function does.
+int l_FieldTest(lua_State* L) {
+  lua_settop(L, 1);
+  if (!lua_toboolean(L, 1)) {
+    lua_pushboolean(L, 0);
+    return 1;
+  }
+  if (!lua_istable(L, 1)) {
+    lua_pushvalue(L, lua_upvalueindex(1));
+    lua_pushvalue(L, 1);
+    lua_call(L, 1, 1);
+    return 1;
+  }
+  const char* signs = lua_tostring(L, lua_upvalueindex(2));
+  for (int i = 0; signs[i]; ++i) {
+    lua_pushvalue(L, lua_upvalueindex(3 + i));
+    lua_gettable(L, 1);
+    const bool truthy = lua_toboolean(L, -1) != 0;
+    lua_pop(L, 1);
+    if (truthy != (signs[i] == '+')) {
+      lua_pushboolean(L, 0);
+      return 1;
+    }
+  }
+  lua_pushboolean(L, 1);
+  return 1;
+}
+
+// Remastered.MakeFieldTest(spec, fallback): l_FieldTest over the spec's fields (at most 16) and the script's function.
+int l_MakeFieldTest(lua_State* L) {
+  const char* spec = luaL_checkstring(L, 1);
+  luaL_checktype(L, 2, LUA_TFUNCTION);
+  std::string signs;
+  std::vector<std::string> names;
+  for (const char* p = spec; *p;) {
+    while (*p == ' ') ++p;
+    if (!*p) break;
+    if (*p != '+' && *p != '-') return luaL_error(L, "MakeFieldTest: each field starts with + or -");
+    signs += *p++;
+    const char* s = p;
+    while (*p && *p != ' ') ++p;
+    if (p == s) return luaL_error(L, "MakeFieldTest: a field without a name");
+    names.emplace_back(s, p);
+  }
+  if (names.empty() || names.size() > 16) return luaL_error(L, "MakeFieldTest: 1 to 16 fields");
+  lua_settop(L, 2);
+  lua_pushstring(L, signs.c_str());
+  for (const std::string& n : names) lua_pushstring(L, n.c_str());
+  lua_pushcclosure(L, l_FieldTest, 2 + static_cast<int>(names.size()));
+  return 1;
+}
+
 }  // namespace
 
 void RegisterRemasteredLib(lua_State* L) {
@@ -269,6 +396,12 @@ void RegisterRemasteredLib(lua_State* L) {
   lua_rawset(L, -3);
   lua_pushstring(L, "MakeNavGridLeafXZ");
   lua_pushcfunction(L, l_MakeNavGridLeafXZ);
+  lua_rawset(L, -3);
+  lua_pushstring(L, "MakeCategoryChain");
+  lua_pushcfunction(L, l_MakeCategoryChain);
+  lua_rawset(L, -3);
+  lua_pushstring(L, "MakeFieldTest");
+  lua_pushcfunction(L, l_MakeFieldTest);
   lua_rawset(L, -3);
   RegisterRemasteredReclaim(L);
   lua_rawset(L, LUA_GLOBALSINDEX);

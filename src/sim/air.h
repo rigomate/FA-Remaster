@@ -130,6 +130,8 @@ const AirBp& GetAirBp(lua_State* L, const BlueprintInfo& bp);
 void AirInit(Sim& sim, Unit* u);
 // The height a unit spawns at (IUnit::CalcSpawnElevation): surface + elevation for flyers.
 float AirSpawnHeight(const Sim& sim, const BlueprintInfo& bp, lua_State* L, float x, float z, float y);
+// IUnit::CalcSpawnElevation for a unit starting on the Air / Orbit layer: the surface (ground or water) + Physics.Elevation.
+float AirLayerSpawnHeight(const Sim& sim, const BlueprintInfo& bp, lua_State* L, float x, float z);
 // One tick (CUnitMotion::MotionTick, air path, then the navigator's arrival test).
 void AirMotionTick(Sim& sim, Unit* u);
 // The air navigator's formation following (UpdateCurrentTargetFromFormation 0x5a4d80), as its Execute runs it in the
@@ -173,7 +175,7 @@ bool GroundCanReserveRect(Sim& sim, Unit* u, const int r[4]);
 bool GroundCellFits(Sim& sim, Unit* u, int cx, int cz);
 // AbortMove: fly on to the point one second ahead and stay there.
 void AirAbort(Sim& sim, Unit* u);
-// CAiNavigatorAir::Execute's arrival test, in the navigators' stage of the beat (sim/landnav.cpp LandNavTickAll).
+// CAiNavigatorAir::Execute's arrival test, in the navigators' stage of the beat (sim/landnav.cpp LandNavTickUnits).
 bool AirNavArrival(Sim& sim, Unit* u);  // true: Execute re-aimed at its destination entity and returned
 // CUnitMotion::Stop 0x6b8460 with no point: the target is where the aircraft is now.
 void AirStopHere(Sim& sim, Unit* u);

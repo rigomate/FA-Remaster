@@ -457,6 +457,36 @@ function IsUnitValid(oUnit)
     return false
 end
 
+--FA Remastered variant: on FA Remastered with its script fixes on, IsUnitValid is the engine's field test
+--(Remastered.MakeFieldTest: the same reads, oUnit.UnitId, oUnit.Dead, oUnit.GetAIBrain, through the VM's own indexing in
+--the same order, stopping where the `and` above stops; a value that is not a table goes to the function above itself),
+--called directly. On any other engine the function above stays. bVariantVerifyNativeUnitInfo (a test switch of this
+--file, off: M28Utilities is not loaded yet when this runs) runs both on every call, uses the Lua answer and logs any
+--difference.
+bVariantVerifyNativeUnitInfo = false
+iVariantVerifyIsUnitValidChecks = 0
+iVariantVerifyIsUnitValidMismatches = 0
+local tVariantNativeUnitInfo = rawget(_G, 'Remastered') or false
+if tVariantNativeUnitInfo and tVariantNativeUnitInfo.MakeFieldTest then
+    local VariantNativeIsUnitValid = tVariantNativeUnitInfo.MakeFieldTest('+UnitId -Dead +GetAIBrain', IsUnitValid)
+    if bVariantVerifyNativeUnitInfo then
+        local VariantLuaIsUnitValid = IsUnitValid
+        IsUnitValid = function(oUnit)
+            local bLua = VariantLuaIsUnitValid(oUnit)
+            local bNative = VariantNativeIsUnitValid(oUnit)
+            iVariantVerifyIsUnitValidChecks = iVariantVerifyIsUnitValidChecks + 1
+            if not(bLua == bNative) then
+                iVariantVerifyIsUnitValidMismatches = iVariantVerifyIsUnitValidMismatches + 1
+                LOG('VERIFY MISMATCH IsUnitValid lua='..tostring(bLua)..' native='..tostring(bNative)..' mismatches='..iVariantVerifyIsUnitValidMismatches)
+            end
+            if math.mod(iVariantVerifyIsUnitValidChecks, 1000000) == 0 then LOG('VERIFY IsUnitValid checks='..iVariantVerifyIsUnitValidChecks..' mismatches='..iVariantVerifyIsUnitValidMismatches) end
+            return bLua
+        end
+    else
+        IsUnitValid = VariantNativeIsUnitValid
+    end
+end
+
 function GetUnitPathingType(oUnit)
     --Returns Land, Amphibious, Air or Water or None
     --if oUnit and not(oUnit.Dead) and oUnit.GetBlueprint then

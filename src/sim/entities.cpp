@@ -1718,7 +1718,7 @@ Unit* Sim::CreateUnit(lua_State* L, const BlueprintInfo& bp, Army* army, Vec3 po
   sec.To(-1);
   u->fractionComplete = complete ? 1.0f : 0.0f;
   u->beingBuilt = !complete;
-  if (!complete) u->unitStates.insert("BeingBuilt");
+  if (!complete) u->unitStates.Insert(US("BeingBuilt"));
   u->builderId = EntityRef(builder);
   u->lastMaterializeTick = tick_;
   sec.To(prof::kSecCuEconomy);
@@ -1751,6 +1751,8 @@ Unit* Sim::CreateUnit(lua_State* L, const BlueprintInfo& bp, Army* army, Vec3 po
       lua_pop(L, 2);
     } else if (u->motion.bp->motionType == kMotionAir) {
       u->position.y = AirSpawnHeight(*this, bp, L, pos.x, pos.z, pos.y);
+    } else if (startLayer & (kLayerAir | 0x20)) {  // (Air / Orbit without a flying motion: AirLayerSpawnHeight)
+      u->position.y = AirLayerSpawnHeight(*this, bp, L, pos.x, pos.z);
     }
     u->lastPosition = u->position;
   }
@@ -1998,6 +2000,8 @@ void Sim::WarpUnit(lua_State* L, Unit* u, Vec3 pos, Quat q) {
     lua_pop(L, 2);
   } else if (u->motion.bp && u->motion.bp->motionType == kMotionAir) {
     pos.y = AirSpawnHeight(*this, bp, L, pos.x, pos.z, pos.y);
+  } else if (layer & (kLayerAir | 0x20)) {  // (CalcSpawnElevation for Air / Orbit, as CreateUnit)
+    pos.y = AirLayerSpawnHeight(*this, bp, L, pos.x, pos.z);
   }
   u->position = pos;
   u->orientation = q;

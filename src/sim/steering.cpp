@@ -4,7 +4,9 @@
 #include "sim/steering.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -31,21 +33,31 @@ namespace moho {
 namespace {
 
 bool St(const Unit* u, const char* s) { return u->unitStates.count(s) != 0; }
+bool St(const Unit* u, int i) { return u->unitStates.Has(i); }  // (i: US("Name"))
 
 bool Naval(const Unit* u) {
   const MotionBlueprint* b = u->motion.bp;
   if (!b || !u->blueprint) return false;
-  if (b->naval < 0) b->naval = BpInCategory(*Sim::From(u->luaState()), u->blueprint, "NAVAL") ? 1 : 0;
+  if (b->naval < 0) {
+    // (a play-ahead reads the value without storing it: its caller made sure the mask is made, so this only reads)
+    const bool v = BpInCategory(*Sim::From(u->luaState()), u->blueprint, "NAVAL");
+    if (tl_specDryReads) return v;
+    b->naval = v ? 1 : 0;
+  }
   return b->naval == 1;
 }
 bool AirCat(const Unit* u) {
   const MotionBlueprint* b = u->motion.bp;
   if (!b || !u->blueprint) return false;
-  if (b->airCat < 0) b->airCat = BpInCategory(*Sim::From(u->luaState()), u->blueprint, "AIR") ? 1 : 0;
+  if (b->airCat < 0) {
+    const bool v = BpInCategory(*Sim::From(u->luaState()), u->blueprint, "AIR");
+    if (tl_specDryReads) return v;
+    b->airCat = v ? 1 : 0;
+  }
   return b->airCat == 1;
 }
 bool Mobile(const Unit* u) { return u->motion.bp && u->motion.bp->mobile(); }
-bool Immobile(const Unit* u) { return u->immobile || St(u, "Immobile"); }
+bool Immobile(const Unit* u) { return u->immobile || St(u, US("Immobile")); }
 // Entity::GetFootprint (DoCollisionsFor 0x59808b.., ResolvePossibleCollision 0x59741c / 0x59742a): the AltFootprint
 // while the unit uses it
 int FpFlags(const Unit* u) { return u->motion.bp ? UnitFootprint(u).flags : 0; }
@@ -152,20 +164,20 @@ const Unit* MoreInLine(const Unit* A, const Unit* B) {
 Vec3 RotateQuarterTurnY(const Vec3& v) { return RotY(kTurnQuarterPi, v); }
 
 bool SameFormationLayer(const Unit* a, const Unit* b) {
-  if (St(a, "Attacking") || St(b, "Attacking")) return false;
+  if (St(a, US("Attacking")) || St(b, US("Attacking"))) return false;
   return a->form && a->form == b->form;
 }
 
 bool UnitPriority(const Unit* A, const Unit* B) {
-  if (Immobile(A) || St(A, "Upgrading")) return true;
-  if (Immobile(B) || St(B, "Upgrading")) return false;
+  if (Immobile(A) || St(A, US("Upgrading"))) return true;
+  if (Immobile(B) || St(B, US("Upgrading"))) return false;
   bool na = Naval(A), nb = Naval(B);
   if (na != nb) return na;
   bool fa = (FpFlags(A) & 1) != 0, fb = (FpFlags(B) & 1) != 0;
   if (fa != fb) return fa;
   if (A->motion.bp->canFly && A->layer != "Air") return true;  // landed air-capable unit
   if (B->motion.bp->canFly && B->layer != "Air") return false;
-  if (St(A, "WaitingForTransport") && !St(B, "WaitingForTransport")) return true;
+  if (St(A, US("WaitingForTransport")) && !St(B, US("WaitingForTransport"))) return true;
   if (A->guardedId && A->guardedId == EntityRef(B)) return false;  // the guarded unit has priority
   if (B->guardedId && B->guardedId == EntityRef(A)) return true;
   bool same = A->form && A->form == B->form;
@@ -173,7 +185,7 @@ bool UnitPriority(const Unit* A, const Unit* B) {
     if (A->formLeader == EntityRef(A)) return true;
     if (A->formLeader == EntityRef(B)) return false;
   }
-  bool am = St(A, "Moving"), bm = St(B, "Moving");
+  bool am = St(A, US("Moving")), bm = St(B, US("Moving"));
   if (am && !bm) return false;  // a standing unit has priority over a mover
   if (!am && bm) return true;
   if (same) {
@@ -191,16 +203,16 @@ bool UnitIgnores(const Unit* self, const Unit* e, int flags) {
   if (!e || e->dead || e->destroyQueued || e == self || !Mobile(e)) return true;
   if (flags == 1 && !vm::SameBits(e->position, e->lastPosition))
     return true;  // it moved this tick (func_IsSourceUnit 0x62eee9..0x62eefd: memcmp 0x4f0a50 of +0xb4 / +0xd0)
-  if (e->parentId || St(e, "Attached")) return true;
+  if (e->parentId || St(e, US("Attached"))) return true;
   if (self->layer != e->layer) return true;
   if (Naval(self) && !Naval(e)) return true;
   if (AirCat(e) && (e->layer == "Air" || e->transport)) return true;
   if ((FpFlags(self) & 1) && FpFlags(e) == 0) return true;
-  if (St(self, "WaitingForTransport") && St(e, "WaitingForTransport") && self->focusId == e->focusId) return true;
-  if (St(self, "Upgrading") && e->creatorId && e->creatorId == EntityRef(self)) return true;
+  if (St(self, US("WaitingForTransport")) && St(e, US("WaitingForTransport")) && self->focusId == e->focusId) return true;
+  if (St(self, US("Upgrading")) && e->creatorId && e->creatorId == EntityRef(self)) return true;
   if (flags == 2) return false;
   if (AirCat(e) && self->army == e->army) return true;
-  if (!St(self, "WaitingForTransport") && St(e, "WaitingForTransport")) return false;
+  if (!St(self, US("WaitingForTransport")) && St(e, US("WaitingForTransport"))) return false;
   return UnitPriority(self, e);
 }
 
@@ -269,7 +281,7 @@ void DoCollisionsFor(Sim& sim, Unit* self, const std::vector<Hit>& hits) {
   // u+0xd0 is the entity's transform before its last AdvanceCoords. A unit in a transport's beam is advanced a
   // second time each beat, by its task (CUnitCallTransport state 3), so there it is where the unit stood when
   // the last beat ended: last beat's beam position plus last beat's coast.
-  if (self->unitStates.count("Teleporting") && self->lastMoveTick == sim.tick() && self->lastPosTick)
+  if (self->unitStates.Has(US("Teleporting")) && self->lastMoveTick == sim.tick() && self->lastPosTick)
     prev = Add(self->prevLastPosition, self->motion.lastMove);
   static const long dbg = getenv("MOHO64_DEBUG_PUSH") ? atol(getenv("MOHO64_DEBUG_PUSH")) : -1;
   static const bool dbgProp = getenv("MOHO64_DEBUG_PROPHIT") != nullptr;
@@ -332,6 +344,53 @@ namespace {
 // MOHO64_DEBUG_COL: the unit whose collisions are tested, read by BoxBox. Per thread (multicore step 1), as
 // g_bodyDebug.
 thread_local bool g_satDebug = false;
+// BoxBoxSat's x87 step at precision control 24 (below): v's 53-bit significand rounded to 24 bits, to nearest, ties to
+// even, the exponent kept as it is (no float range: a tiny product stays whole). What frexp, the float conversion of
+// the fraction and ldexp give, without their calls: the bits below the 24 kept ones (29 of them) are rounded away by an
+// add (half of them, less one, plus the last kept bit: ties go to even) that carries into the kept bits and, when they
+// were all ones, into the exponent (the next power of two, as the float conversion of 0.11..1 gives 1.0). Both zeros
+// give +0 (as the frexp version's early return), infinities and NaNs come back as they are; a double subnormal (never
+// made here: the inputs are float products and sums) takes the frexp version. Speed only (B1 2026-10-30: the two
+// library calls were 2.2% of the beat time, B3-16k 3.7%).
+double X24Frexp(double v) {
+  if (v == 0.0) return 0.0;
+  int e;
+  const double m = std::frexp(v, &e);
+  return std::ldexp(static_cast<double>(static_cast<float>(m)), e);
+}
+double X24Bits(double v) {
+  if (v == 0.0) return 0.0;
+  uint64_t b;
+  std::memcpy(&b, &v, sizeof b);
+  const uint64_t ex = b & 0x7FF0000000000000ull;
+  if (ex == 0x7FF0000000000000ull) return v;
+  if (ex == 0) return X24Frexp(v);
+  b = (b + 0x0FFFFFFFull + ((b >> 29) & 1u)) & ~uint64_t{0x1FFFFFFF};
+  std::memcpy(&v, &b, sizeof v);
+  return v;
+}
+// MOHO64_VERIFY_X24=1: every x24 is also made the frexp way and compared bit for bit; the counts go to stderr at exit
+// (and the first mismatches as they come). The bit version's answer is the one used.
+struct X24Verify {
+  const bool on = std::getenv("MOHO64_VERIFY_X24") != nullptr;
+  std::atomic<uint64_t> checked{0}, mismatches{0};
+  ~X24Verify() {
+    if (on)
+      std::fprintf(stderr, "moho64 verify x24: checked %llu, mismatches %llu\n",
+                   static_cast<unsigned long long>(checked.load()), static_cast<unsigned long long>(mismatches.load()));
+  }
+};
+X24Verify g_x24Verify;
+double X24(double v) {
+  const double r = X24Bits(v);
+  if (g_x24Verify.on) [[unlikely]] {
+    g_x24Verify.checked.fetch_add(1, std::memory_order_relaxed);
+    const double f = X24Frexp(v);
+    if (std::memcmp(&f, &r, sizeof r) != 0 && g_x24Verify.mismatches.fetch_add(1, std::memory_order_relaxed) < 20)
+      std::fprintf(stderr, "moho64 verify x24: MISMATCH %a: bits %a, frexp %a\n", v, r, f);
+  }
+  return r;
+}
 // BoxBox 0x474830 (prop_collision.md 3.2): A = prop, B = unit. True with the minimum-overlap face normal (pointing
 // from the unit to the prop) and depth; an edge axis gives a zero normal and depth.
 bool BoxBoxSat(const Obb& A, const Obb& B, Vec3* normal, float* depth) {
@@ -343,12 +402,7 @@ bool BoxBoxSat(const Obb& A, const Obb& B, Vec3* normal, float* depth) {
   // bits, but the x87's exponent range keeps a tiny product whole where a float would round it to a denormal; only
   // the fstp at the end makes a float of it. An axis whose components are denormals (the cross product of two
   // nearly level up axes) is projected that way.
-  auto x24 = [](double v) {
-    if (v == 0.0) return 0.0;
-    int e;
-    const double m = std::frexp(v, &e);
-    return std::ldexp(static_cast<double>(static_cast<float>(m)), e);
-  };
+  auto x24 = [](double v) { return X24(v); };  // (above: the x87's 24 bits)
   auto xdot = [&](const Vec3& v, const Vec3& a) {  // (z + y) + x, each product and sum rounded as the x87 does
     const double z = x24(static_cast<double>(v.z) * a.z), y = x24(static_cast<double>(v.y) * a.y);
     return x24(x24(z + y) + x24(static_cast<double>(v.x) * a.x));
@@ -484,7 +538,7 @@ namespace {
 bool SurfaceTakesPart(const Unit* u) {
   const UnitMotion& m = u->motion;
   if (u->layer == "Air" || u->layer == "Sub") return false;
-  if (u->dead || u->beingBuilt || u->parentId || St(u, "Attached")) return false;
+  if (u->dead || u->beingBuilt || u->parentId || St(u, US("Attached"))) return false;
   if (!m.bp || m.bp->canFly) return false;
   if (m.pushed) return false;  // a pushed unit never pushes
   return true;
@@ -668,6 +722,7 @@ void SurfaceContactsAhead(Sim& sim, const std::vector<Unit*>& order) {
   static const bool dbgCol = getenv("MOHO64_DEBUG_COL") != nullptr;
   if (!spec.active() || dbgCol) return;
   const uint32_t round = sim.tick();
+  if (spec.Below(order.size(), round)) return;  // (a small beat: its searches are made at the units' turns)
   for (size_t i = 0; i < order.size(); ++i) {
     order[i]->specItem = static_cast<uint32_t>(i);
     order[i]->specRound = round;
@@ -1093,7 +1148,7 @@ void ProcessSplineMovement(Sim& sim, Unit* u) {
   // 0x5d2d24..0x5d2e4b: a unit in the Immobile state, or a stunned one, loses its spline once (Stop, and the
   // byte steering+0xa0 remembers it) and gets no point while that lasts. When it is let go, a unit that is
   // Moving, Patrolling or Attacking gets a fresh batch toward the same target, from where it stands now.
-  const bool held = u->immobile || u->unitStates.count("Immobile") > 0 || u->stunned;
+  const bool held = u->immobile || u->unitStates.Has(US("Immobile")) > 0 || u->stunned;
   if (!m.heldLatch) {
     if (held) {
       m.heldLatch = true;
@@ -1105,8 +1160,8 @@ void ProcessSplineMovement(Sim& sim, Unit* u) {
     }
   } else {
     if (held) return;
-    if (Driving(u) && (u->unitStates.count("Moving") > 0 || u->unitStates.count("Patrolling") > 0 ||
-                       u->unitStates.count("Attacking") > 0)) {
+    if (Driving(u) && (u->unitStates.Has(US("Moving")) > 0 || u->unitStates.Has(US("Patrolling")) > 0 ||
+                       u->unitStates.Has(US("Attacking")) > 0)) {
       UpdatePath(sim, u, m.steerTarget, true, GetVal(m));
       CheckCollisions(sim, u);
     }
@@ -1195,8 +1250,7 @@ void SteeringCheckCollisions(Sim& sim, Unit* u) {
 
 void SteeringNavStageArmy(Sim& sim, int army) { sim.navStageArmy = army; }
 
-void SteeringTickAll(Sim& sim) {
-  const std::vector<Unit*> all = sim.ArmyStageOrder();  // (brain+0xac: creation order inside each army)
+void SteeringTickUnits(Sim& sim, const std::vector<Unit*>& all) {  // (brain+0xac: creation order inside the army)
   sim.inSteeringStage = true;
   for (size_t i = 0; i < all.size(); ++i) {
     Unit* u = all[i];

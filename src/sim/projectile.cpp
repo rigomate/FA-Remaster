@@ -1102,7 +1102,7 @@ int l_weapon_CreateProjectile(lua_State* L) {
     const Vec3 tpDbg = w->target.type ? TargetPos(sim, w->target, false) : Vec3{};
     Logf(LogLevel::Info, "wproj %u unit %u %s weapon %s randomness %g moving %d target type %d point %.9g %.9g %.9g",
          sim.tick(), u->id, u->blueprint ? u->blueprint->id.c_str() : "?", w->label.c_str(), R,
-         static_cast<int>(u->unitStates.count("Moving")), w->target.type, tpDbg.x, tpDbg.y, tpDbg.z);
+         static_cast<int>(u->unitStates.Has(US("Moving"))), w->target.type, tpDbg.x, tpDbg.y, tpDbg.z);
     Vec3 bp0;
     Quat bq0;
     BoneWorld(u, bone, &bp0, &bq0);
@@ -1168,7 +1168,9 @@ int l_weapon_CreateProjectile(lua_State* L) {
   if (w->bp->projectileLifetime > 0)
     p->expireTick = sim.tick() + static_cast<uint32_t>(std::nearbyint(w->bp->projectileLifetime * 10));
   if (w->bp->projectileLifetimeUsesMultiplier > 0 && w->bp->muzzleVelocity != 0) {
-    float maxR = w->ovMaxRadius >= 0 ? w->ovMaxRadius : w->bp->maxRadius;
+    // 0x6d6988..0x6d69bd: the BLUEPRINT's MaxRadius (wbp+0x5c), never the ChangeMaxRadius override (weapon+0x64):
+    // an enhanced range (the Aeon SACU's StabilitySuppressant, 30 -> 40) keeps the shell's lifetime of the stock range
+    const float maxR = w->bp->maxRadius;
     p->expireTick = sim.tick() + static_cast<uint32_t>(std::nearbyint(
                                      maxR / w->bp->muzzleVelocity * w->bp->projectileLifetimeUsesMultiplier * 10));
   }

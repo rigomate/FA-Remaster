@@ -57,6 +57,37 @@
 
 namespace moho {
 namespace {
+// The entity pass's prefetch (e1, 2026-10-31): the pass asks the memory system for the unit d turns ahead (its object's
+// hot lines) and for the next unit's pose and aim arrays. A prefetch is only a hint: it reads nothing the program sees
+// and writes nothing, so the game is the same bit for bit whatever d is. d = 2 (MOHO64_PREFETCH=<d> overrides; 0: off).
+// Measured (quiet machine, same-moment pairs, 8 threads, 3 repeats): entity pass B3-16k -8.3% (tick -3.5%), B1 -3.0%
+// (-0.5%), b8 -3.3% (-0.4%); d = 4 the same on b8 and less on B3 (-7.5%).
+inline void PrefetchSpan(const void* p, size_t bytes) {
+  const char* c = static_cast<const char*>(p);
+  for (size_t o = 0; o < bytes; o += 64) __builtin_prefetch(c + o, 1, 3);
+}
+void PrefetchUnitObject(const Unit* u) {
+  PrefetchSpan(u, 128);
+  PrefetchSpan(&u->position, 64);
+  PrefetchSpan(&u->poseQ, 64);
+  PrefetchSpan(&u->motion, std::min<size_t>(sizeof(UnitMotion), 640));
+  PrefetchSpan(&u->lastPosition, 64);
+  PrefetchSpan(&u->weapons, 64);
+  PrefetchSpan(&u->aimControllers, 64);
+}
+void PrefetchUnitArrays(const Unit* u) {
+  if (!u->poseQ.empty()) PrefetchSpan(u->poseQ.data(), std::min<size_t>(u->poseQ.size() * sizeof(Quat), 1024));
+  if (!u->poseP.empty()) PrefetchSpan(u->poseP.data(), std::min<size_t>(u->poseP.size() * sizeof(Vec3), 768));
+  size_t k = 0;
+  for (const AimController* c : u->aimControllers) {
+    if (++k > 4) break;
+    PrefetchSpan(c, 192);
+  }
+  if (u->motion.bp) __builtin_prefetch(u->motion.bp, 0, 3);
+}
+}  // namespace
+
+namespace {
 
 const char kSimKey = 0;
 
@@ -878,13 +909,10 @@ Sim::Sim(Vfs* vfs, std::vector<std::string> hookDirs, std::vector<std::string> m
       workers_(std::make_unique<WorkerPool>(ThreadsFromEnvironment(), ParCheckFromEnvironment())),
       surfaceSpec_(std::make_unique<Speculation<SurfaceContacts>>("MOTION")),
       aimAhead_(std::make_unique<AimAhead>()),
+      navSpec_(std::make_unique<Speculation<NavAhead>>("NAV")),
       commandIds(std::make_shared<CommandIdPool>()) {
   prof::InstallLuaTimer();  // MOHO64_PROFILE only (core/profile.h): the Lua timer on the sim's thread
-  if (surfaceSpec_->active())
-    Logf(LogLevel::Info, "moho64: MOHO64_PAR_MOTION=%s: the entity pass's contact searches are made ahead",
-         SpecModeName(surfaceSpec_->mode()));
-  if (aimAhead_->active())
-    Logf(LogLevel::Info, "moho64: MOHO64_PAR_AIM=%s: the aim controllers' muzzles are made ahead", SpecModeName(aimAhead_->mode));
+  // (MOHO64_PAR_MOTION / AIM / NAV: read here as given; Start(SessionDescription) settles their default, ParDefault)
   if (workers_->Threads() > 1 || workers_->Check().mode != ParCheck::kOff)
     Logf(LogLevel::Info, "moho64: the sim's worker pool: %d thread(s)%s", workers_->Threads(),
          workers_->Check().mode == ParCheck::kShuffle   ? ", order check: shuffle (tasks on this thread)"
@@ -902,6 +930,11 @@ Sim::~Sim() {
   }
   if (aimAhead_ && aimAhead_->active()) {
     const std::string line = aimAhead_->counts.Line("AIM (muzzles)");
+    fprintf(stderr, "%s\n", line.c_str());
+    Logf(LogLevel::Info, "%s", line.c_str());
+  }
+  if (navSpec_ && navSpec_->active()) {
+    const std::string line = navSpec_->counts().Line("NAV (navigators' unit tests)");
     fprintf(stderr, "%s\n", line.c_str());
     Logf(LogLevel::Info, "%s", line.c_str());
   }
@@ -1217,11 +1250,72 @@ bool Sim::FixesFor(const SessionDescription& session) {
   return on;
 }
 
+bool Sim::ParDefault() const { return fixes && workers_->Threads() > 1; }
+
+namespace {
+// The multicore stages' minimum items (Sim::Start; MOHO64_PAR_<NAME>=on:N overrides): units in the entity pass a beat
+// for MOTION and AIM; for NAV, navigators that test in one army's navigator stage (the stages run army by army)
+constexpr size_t kParMotionMin = 1024, kParAimMin = 1024, kParNavMin = 110;
+}  // namespace
+
 bool Sim::Start(const SessionDescription& session) {
   SimFpScope fp;
   focusArmy = session.focusArmy;
   isReplay = session.replay;
   fixes = FixesFor(session);
+  // The beat's order (docs/parallel-mode.md 5)
+  {
+    int version = 0;
+    int want = session.simOrder >= 0 ? session.simOrder : ScenarioSimOrder(session.header.scenario, &version);
+    if (session.simOrder >= 0) version = kSimOrderVersion;  // (asked by the host itself: this engine's order)
+    if (const char* o = getenv("MOHO64_SIM_ORDER"); o && *o) {
+      want = !std::strcmp(o, "parallel") ? 1 : 0;
+      version = kSimOrderVersion;
+    }
+    if (want && !fixes) {
+      Logf(LogLevel::Error, "moho64: parallel order needs the engine's script fixes, and this session has them off: not started "
+                            "(docs/parallel-mode.md 5)");
+      return false;
+    }
+    if (want && version > kSimOrderVersion) {
+      Logf(LogLevel::Error, "moho64: this game was made with parallel order version %d; this engine plays version %d: not "
+                            "started (a newer engine is needed)", version, kSimOrderVersion);
+      return false;
+    }
+    if (want && version < kSimOrderVersion)
+      Logf(LogLevel::Warning, "moho64: this game was made with parallel order version %d; this engine plays version %d: it "
+                              "may play differently from how it was played", version, kSimOrderVersion);
+    order = want ? SimOrder::kParallel : SimOrder::kOriginal;
+    orderVersion = want ? kSimOrderVersion : 0;
+    Logf(LogLevel::Info, "moho64: the beat's order: %s", want ? "parallel (docs/parallel-mode.md)" : "the original's");
+  }
+  // The multicore switches' default, now that the fixes are known (ParDefault); one given in the environment stays as
+  // it was read. (The intel stages' switches are settled at their first use in a beat, per sim: sim/intel.cpp.)
+  {
+    const bool on = ParDefault();
+    if (!SpecModeGiven("MOTION")) surfaceSpec_->SetMode(on ? SpecMode::kOn : SpecMode::kOff);
+    if (!SpecModeGiven("AIM")) aimAhead_->mode = on ? SpecMode::kOn : SpecMode::kOff;
+    if (!SpecModeGiven("NAV")) navSpec_->SetMode(on ? SpecMode::kOn : SpecMode::kOff);
+    // The minimum a beat for each (on:N overrides; verify / redo: none). Measured (e1, 2026-10-31, quiet machine, same-
+    // moment pairs): the entity pass's stages (MOTION + AIM) cost more than they save below about 1,000 units in the
+    // pass (b8, B1's first 8000 beats: +0.01..+0.05 ms a beat) and pay above it (B1 at 2,000-2,700 units -0.1..-0.3 ms,
+    // B3-2000 entity pass -6%); the navigators' (NAV, per army's stage since the stages run army by army) cost at 63
+    // and 88 navigators testing in an army's stage (B3-2000 / B3-8000: +5% / +2% of the navigators' phase) and pay at
+    // 138 (B3-16k: -3.5%); the line between them crosses near 106.
+    surfaceSpec_->SetMinItems(SpecMinFromEnvironment("MOTION", kParMotionMin));
+    aimAhead_->minItems = SpecMinFromEnvironment("AIM", kParAimMin);
+    navSpec_->SetMinItems(SpecMinFromEnvironment("NAV", kParNavMin));
+    const char* why = on ? " (the default: a game with the fixes, more than one thread)" : "";
+    if (surfaceSpec_->active())
+      Logf(LogLevel::Info, "moho64: MOHO64_PAR_MOTION=%s%s: the entity pass's contact searches are made ahead (beats of %zu units or more)",
+           SpecModeName(surfaceSpec_->mode()), SpecModeGiven("MOTION") ? "" : why, surfaceSpec_->minItems());
+    if (aimAhead_->active())
+      Logf(LogLevel::Info, "moho64: MOHO64_PAR_AIM=%s%s: the aim controllers' muzzles are made ahead (beats of %zu units or more)",
+           SpecModeName(aimAhead_->mode), SpecModeGiven("AIM") ? "" : why, aimAhead_->minItems);
+    if (navSpec_->active())
+      Logf(LogLevel::Info, "moho64: MOHO64_PAR_NAV=%s%s: the navigators' unit tests are played ahead (an army's stage of %zu navigators or more)",
+           SpecModeName(navSpec_->mode()), SpecModeGiven("NAV") ? "" : why, navSpec_->minItems());
+  }
   // A fix made in the blueprints needs the rules state: the hosts load the rules (LoadRules) before the session
   // says whether the fixes are on, so the rules are the original's. With the fixes, and only in a game that has
   // what such a fix is for (today the stock campaign mod's blueprints, deviations.md 4), they are loaded again,
@@ -1619,6 +1713,25 @@ void EraseById(std::vector<Unit*>& v, Unit* u) {
 }
 }  // namespace
 
+namespace {
+struct UnitGridCounts {
+  std::atomic<uint64_t> entries{0}, entryMismatches{0}, lists{0}, listMismatches{0};
+  ~UnitGridCounts() {
+    if (Sim::kVerifyUnitGrid)
+      std::fprintf(stderr, "moho64 verify unitgrid: entries %llu, mismatches %llu; lists %llu, mismatches %llu\n",
+                   static_cast<unsigned long long>(entries.load()), static_cast<unsigned long long>(entryMismatches.load()),
+                   static_cast<unsigned long long>(lists.load()), static_cast<unsigned long long>(listMismatches.load()));
+  }
+} g_unitGridCounts;
+}  // namespace
+void Sim::VerifyUnitGridEntry(const UnitGridEntry& e) {
+  g_unitGridCounts.entries.fetch_add(1, std::memory_order_relaxed);
+  if (e.army != e.u->army) g_unitGridCounts.entryMismatches.fetch_add(1, std::memory_order_relaxed);
+}
+void Sim::VerifyUnitGridList(bool same) {
+  g_unitGridCounts.lists.fetch_add(1, std::memory_order_relaxed);
+  if (!same) g_unitGridCounts.listMismatches.fetch_add(1, std::memory_order_relaxed);
+}
 void Sim::RebuildUnitGrid() {
   int w = map_ ? (map_->width() + 15) / 16 + 1 : 64, h = map_ ? (map_->height() + 15) / 16 + 1 : 64;
   if (w != gridW_ || h != gridH_) {
@@ -1632,10 +1745,17 @@ void Sim::RebuildUnitGrid() {
     if (u->destroyQueued) continue;
     int cx = std::clamp(static_cast<int>(u->position.x) >> 4, 0, gridW_ - 1);
     int cz = std::clamp(static_cast<int>(u->position.z) >> 4, 0, gridH_ - 1);
-    grid_[static_cast<size_t>(cz) * gridW_ + cx].push_back(u);
+    grid_[static_cast<size_t>(cz) * gridW_ + cx].push_back(UnitGridEntry{u, u->army, 0});
   }
+  for (auto& c : grid_)  // each entry's run of one army (UnitGridEntry::runEnd)
+    for (size_t i = c.size(); i-- > 0;)
+      c[i].runEnd = i + 1 < c.size() && c[i + 1].army == c[i].army ? c[i + 1].runEnd : static_cast<uint32_t>(i + 1);
   gridDirty_ = false;
 }
+namespace combat {
+int Relation(const Army* a, const Army* b);  // (combat.cpp)
+}
+int Sim::ArmyRelation(const Army* a, const Army* b) { return combat::Relation(a, b); }
 
 const std::vector<Unit*>& Sim::CommandOrder() {
   if (cmdOrderDirty_) {
@@ -2303,15 +2423,43 @@ void Sim::Tick() {
   ThreatMapBeat(*this);
   threads_->WakeSignalled();  // (a thread whose event a stage signalled goes to the run order's end at that moment)
   phases.Lap(PhaseTimer::kEconomy);
-  LandNavTickAll(*this);
+  LandNavStageBegin(*this);
+  WeaponsStageDebug(*this);
   phases.Lap(PhaseTimer::kNavigators);
   // CArmyImpl::OnTick 0x6ffd70: the brain's stages in this order: navigators (brain+0xa8), steering (brain+0xac,
   // CAiSteeringImpl::OnTick 0x5d32b0), attackers and weapons (brain+0xb0); only then the sim's command stage. So
   // a waypoint the navigator set this beat already has its spline when a command task stops the unit in the same
   // beat, and the stop turns it into a brake spline (the unit slows down along its hull) instead of a coast.
-  SteeringTickAll(*this);  // the steering stage (spline points, predicted collisions)
-  phases.Lap(PhaseTimer::kSteering);
-  WeaponsTick(*this);
+  // The three run ARMY BY ARMY (0x6ffe83..0x6ffe9f, inside one army's OnTick): an army's steering predicts against
+  // the splines of the armies after it as their navigators left them LAST beat. Seen (oracle probe mp1_16748): MP1
+  // 16748, army 1's Aeon engineer 0x100013 gets a new waypoint and predicts a meeting with army 7's Seraphim engineer
+  // 0x7000e3, still on its spline, and brakes hard (Update mode 4, 0.19 then 0.114 a beat); 0x7000e3's navigator
+  // stops it at its pickup cell only afterwards, in army 7's turn. Ours ran every navigator first: 0x7000e3 had no
+  // spline left by then, no meeting, and 0x100013 turned onto its new course.
+  for (uint32_t a = 0;; ++a) {
+    // the army's units in creation order (ArmyStageOrder: by army, then creation), taken afresh for each stage: a
+    // script run by a stage may create units
+    auto armyUnits = [this](uint32_t army) {
+      const std::vector<Unit*>& all = ArmyStageOrder();
+      auto lo = std::lower_bound(all.begin(), all.end(), army, [](const Unit* u, uint32_t v) { return (u->id >> 20) < v; });
+      auto hi = std::upper_bound(lo, all.end(), army, [](uint32_t v, const Unit* u) { return v < (u->id >> 20); });
+      return std::vector<Unit*>(lo, hi);
+    };
+    {
+      const std::vector<Unit*>& all = ArmyStageOrder();
+      auto next = std::lower_bound(all.begin(), all.end(), a, [](const Unit* u, uint32_t v) { return (u->id >> 20) < v; });
+      if (next == all.end()) break;
+      a = (*next)->id >> 20;  // (the next army that has units)
+    }
+    LandNavTickUnits(*this, armyUnits(a));
+    phases.Lap(PhaseTimer::kNavigators);
+    SteeringTickUnits(*this, armyUnits(a));  // the steering stage (spline points, predicted collisions)
+    phases.Lap(PhaseTimer::kSteering);
+    WeaponsTickUnits(*this, armyUnits(a));
+    phases.Lap(PhaseTimer::kWeapons);
+  }
+  LandNavStageEnd(*this);  // the path queues' work and what it delivered
+  phases.Lap(PhaseTimer::kNavigators);
   threads_->WakeSignalled();
   phases.Lap(PhaseTimer::kWeapons);
   CommandStage(*this);  // stage 0x958 (arrivals from last beat's motion end their commands here)
@@ -2351,8 +2499,13 @@ void Sim::Tick() {
     while (entityProjAt < projectiles.size() && projectiles[entityProjAt]->handle < handle)
       ProjectileStep(*this, projectiles[entityProjAt++]);
   };
+  static const size_t prefetchAhead = getenv("MOHO64_PREFETCH") ? static_cast<size_t>(std::max(0, atoi(getenv("MOHO64_PREFETCH")))) : 2;
   for (size_t i = 0; i < motionOrder.size(); ++i) {
     Unit* u = motionOrder[i];
+    if (prefetchAhead) {  // (MOHO64_PREFETCH: hints only)
+      if (i + prefetchAhead < motionOrder.size()) PrefetchUnitObject(motionOrder[i + prefetchAhead]);
+      if (i + 1 < motionOrder.size()) PrefetchUnitArrays(motionOrder[i + 1]);
+    }
     beamsBefore(u->handle);
     projectilesBefore(u->orderHandle ? u->orderHandle : u->handle);
     // Entity::TaskTick 0x679c40, step 1 (0x679c51): the texture scroller, before the attached test below, so a
@@ -2721,6 +2874,33 @@ void Sim::Tick() {
   singleStep = false;  // step 14 (sim+0x8e4 = 0)
   frozen = endGame;    // Sync copies sim+0x8dc to sim+0x8dd
   phases.Lap(PhaseTimer::kDestroySync);
+  {  // MOHO64_VERIFY_LAYER (units.h LayerString): the counts at exit
+    static struct LayerVerifyReport {
+      ~LayerVerifyReport() {
+        if (g_verifyLayer)
+          std::fprintf(stderr, "moho64 verify layer: checked %llu, mismatches %llu\n",
+                       static_cast<unsigned long long>(g_layerChecked.load()),
+                       static_cast<unsigned long long>(g_layerMismatches.load()));
+      }
+    } report;
+  }
+  {  // MOHO64_VERIFY_STATES=1: every unit's state bits against its set of names (units.h UnitStateSet::BitsAgree);
+     // a difference stops the program. The count of checks goes to stderr at exit.
+    static const bool verify = getenv("MOHO64_VERIFY_STATES") != nullptr;
+    if (verify) {
+      static struct Count {
+        uint64_t n = 0;
+        ~Count() { std::fprintf(stderr, "moho64 verify states: %llu units checked, all agree\n", static_cast<unsigned long long>(n)); }
+      } count;
+      for (const Unit* u : units()) {
+        ++count.n;
+        if (!u->unitStates.BitsAgree()) {
+          std::fprintf(stderr, "moho64 verify states: tick %u unit 0x%x: the bits differ from the set\n", tick_, u->id);
+          std::abort();
+        }
+      }
+    }
+  }
   phases.EndTick(tick_);
   if (orderLatency) orderLatency->Beat(*this);  // (MOHO64_PROFILE only: made by ProfileTrackOrder)
   phases.Report(tick_);

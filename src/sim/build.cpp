@@ -425,6 +425,32 @@ bool UnitCanBuild(const Unit* u, const BlueprintInfo& bp) {
 void ExecuteOccupyGround(Sim& sim, Unit* u) {
   if (!u->bpData || !u->bpData->structure || !u->blueprint) return;
   const NamedFootprint& fp = Footprint(*u->blueprint);
+  // A blueprint with Physics.OccupyRects (bp+0x310, read by 0x5267a0 at 0x6a77b7) holds those rects instead of its
+  // footprint (0x6a77e2: a non-empty list; 0x6a77ea: count = floats / 4, none whole: nothing is held): each entry is
+  // (centre x offset a, centre z offset b, half size x c, half size z d) and covers [floor(a + x - c + 0.5),
+  // floor(x + c + a + 0.5)) x [floor(z + b - d + 0.5), floor(z + d + b + 0.5)) (0x6a7819..0x6a7924, x and z the
+  // position, frndint and one down when above: floor), set in the land grid for footprint caps & 7 and in the water
+  // grid for & 8 (FillRect 0x8d8370 at 0x6a7963 / 0x6a798e), then the path maps told of the rect (0x8e3620). The
+  // quantum gateways have two pillars and the passage between them free. Seen: MP1 14747, army 0's gateway 0x119
+  // (uab0304, 832.5 235.5) rolls its SACU 0x12f off to (832.5, 238.5): the original's goal is the cell (832, 238) in
+  // the passage (it drives straight out, the Move ends at z 238.03); ours had the whole 7 x 7 held and took the free
+  // spot (831, 239), turning 45 degrees left.
+  if (!u->bpData->occupyRects.empty()) {
+    const std::vector<float>& R = u->bpData->occupyRects;
+    const size_t n = R.size() / 4;
+    for (size_t k = 0; k < n; ++k) {
+      const float a = R[4 * k], b = R[4 * k + 1], c = R[4 * k + 2], d = R[4 * k + 3];
+      const Vec3& p = u->position;
+      const int x0 = static_cast<int>(std::floor(a + p.x - c + 0.5f));
+      const int x1 = static_cast<int>(std::floor(p.x + c + a + 0.5f));
+      const int z0 = static_cast<int>(std::floor(p.z + b - d + 0.5f));
+      const int z1 = static_cast<int>(std::floor(p.z + d + b + 0.5f));
+      if (sim.navigation().WouldChangeCells(x0, z0, x1, z1, fp.caps)) LandNavBeforeOccupancy(sim, x0, z0, x1, z1);
+      sim.navigation().AddStructure(EntityRef(u), x0, z0, x1, z1, fp.caps, k > 0);
+      LandNavDirty(sim, x0, z0, x1, z1);
+    }
+    return;
+  }
   int ox = RoundEven(u->position.x - fp.sizeX * 0.5f), oz = RoundEven(u->position.z - fp.sizeZ * 0.5f);
   // The stale clusters' data is made before the grids change (LandNavBeforeOccupancy: from the grid as it still is).
   // When no cell's layer bit changes, the grid stays as it is and that data comes out the same when it is made later,
@@ -452,6 +478,17 @@ void ReleaseStructure(Sim& sim, Unit* u) {
   }
   u->occupiesGround = false;  // (ReleaseOccupyGround 0x6a7b81)
   if (!u->bpData || !u->bpData->structure) return;
+  // ReleaseOccupyGround 0x6a7ab0 clears the blueprint FOOTPRINT's rect at the unit's position (0x6a7acb..0x6a7b7b ->
+  // ReleaseOccupy 0x721b30), OccupyRects or not: a gateway frees its passage cells too.
+  if (!u->bpData->occupyRects.empty() && u->blueprint) {
+    const NamedFootprint& fp = Footprint(*u->blueprint);
+    const int ox = RoundEven(u->position.x - fp.sizeX * 0.5f), oz = RoundEven(u->position.z - fp.sizeZ * 0.5f);
+    const int r[4] = {ox, oz, ox + fp.sizeX, oz + fp.sizeZ};
+    LandNavBeforeOccupancy(sim, r[0], r[1], r[2], r[3]);
+    LandNavDirty(sim, r[0], r[1], r[2], r[3]);
+    sim.navigation().RemoveStructure(EntityRef(u), r);
+    return;
+  }
   for (const auto& r : sim.navigation().Structures())
     if (r.entity == EntityRef(u)) {
       LandNavBeforeOccupancy(sim, r.x0, r.z0, r.x1, r.z1);
@@ -571,7 +608,7 @@ bool UpdateWorkProgress(Sim& sim, lua_State* L, Unit* builder, BuildTask& t) {
     // tick at Entity+0x520, 0x6a9fa3), so an unfinished target of a paused builder does not decay (Unit::MotionTick
     // 0x6a910f: decay when more than a beat has passed). Seen: Skirmish 2071, M28 pauses three upgrades of armies 0
     // and 2 (0x200031, 0x35 and 0x34's builders): the original's health stays where it was; ours decayed from 2073.
-    if (!builder->unitStates.count("Repairing") && target->fractionComplete >= 1.0f) return true;
+    if (!builder->unitStates.Has(US("Repairing")) && target->fractionComplete >= 1.0f) return true;
     Materialize(sim, L, target, 0.0f);
     return false;
   }
@@ -580,7 +617,7 @@ bool UpdateWorkProgress(Sim& sim, lua_State* L, Unit* builder, BuildTask& t) {
   // beat goes to the silo, which turns it into progress; done when the silo no longer builds
   if (t.silo) {
     if (!(LiveCommandCaps(L, target) & 0xc000u)) return true;  // RULEUCC_SiloBuildTactical | SiloBuildNuke
-    if (!target->unitStates.count("SiloBuildingAmmo")) return true;
+    if (!target->unitStates.Has(US("SiloBuildingAmmo"))) return true;
     if (target->silo) {
       float amount[2] = {0, 0};
       if (builder->request) {
@@ -600,7 +637,7 @@ bool UpdateWorkProgress(Sim& sim, lua_State* L, Unit* builder, BuildTask& t) {
   // WorkProgress each beat, so an assisted enhancement ends sooner. Ours added nothing. Seen: MP2 9550, army 1's
   // commander 0x100000 enhances from 8891, its engineer 0x1000c9 assists from 9264: the original's ends at 9550,
   // ours ran on to 9626.
-  if (target->unitStates.count("Enhancing")) {
+  if (target->unitStates.Has(US("Enhancing"))) {
     float p = ScriptFieldNumber(L, target, "WorkProgress");
     if (p >= 1.0f) return true;
     if (rate != 0.0f) {
@@ -660,7 +697,7 @@ void MoveToward(Sim& sim, Unit* u, const Vec3& goal) {
   path.push_back(goal);  // land units: the navigator plans (sim/landnav.cpp)
   u->motion.failed = false;
   MotionSetGoal(sim, u, path, false, sim.tick());
-  u->unitStates.insert("Moving");
+  u->unitStates.Insert(US("Moving"));
 }
 
 // A task's walk (NewMoveTask 0x6190a0 -> CUnitMoveTask ctor 0x6180e0). The ctor asks 0x618a00 (read): not
@@ -675,8 +712,8 @@ void MoveToward(Sim& sim, Unit* u, const Vec3& goal) {
 // point (69, 448) beside the factory's reserved skirt, instead of (69.5, 452.5) by the rock; the MP2 probe at 720
 // shows the ctor's PrepareMove called with the patrol point while the reclaim's goal was another cell.
 void MoveTaskWalk(Sim& sim, Unit* u, const Vec3& goal) {
-  const bool override = !u->unitStates.count("TransportLoading") && !u->unitStates.count("Teleporting") &&
-                        !u->unitStates.count("Guarding") && u->commands.size() == 1 && u->commands.front() &&
+  const bool override = !u->unitStates.Has(US("TransportLoading")) && !u->unitStates.Has(US("Teleporting")) &&
+                        !u->unitStates.Has(US("Guarding")) && u->commands.size() == 1 && u->commands.front() &&
                         u->commands.front()->factoryIssued && u->motion.bp;
   if (!override) {
     TaskMoveToward(sim, u, goal);
@@ -719,7 +756,7 @@ void MoveTaskWalk(Sim& sim, Unit* u, const Vec3& goal) {
 
 void StopMoving(Unit* u) {
   if (u->motion.hasGoal) MotionStop(u);
-  u->unitStates.erase("Moving");
+  u->unitStates.Erase(US("Moving"));
 }
 
 // The o-grid rect a rally-overridden walk reserved (MoveTaskWalk, +0x92) goes with the walk's CUnitMoveTask: its dtor
@@ -748,7 +785,7 @@ void FreeWalkRect(Unit* u) {
 // side-step spline along the old heading (0.152 -> 0.114 -> 0.076 -> 0.038); ours, testing the goal, did not abort,
 // and took the side-step (0.190, turning).
 void EndMoveChild(Unit* u) {
-  u->unitStates.erase("Moving");
+  u->unitStates.Erase(US("Moving"));
   if (!u->clearKeepsMove && u->motion.bp && u->motion.bp->mobile()) MotionStop(u);
   FreeWalkRect(u);
 }
@@ -764,7 +801,7 @@ void EndMoveChild(Unit* u) {
 // patrolling engineer 0xf, whose repair walk ends at 2867 (and the repair with it): the original's byte is 0 from
 // that beat, ours kept 1 until its next walk ended at 2875.
 void EndWalk(Unit* u) {
-  u->unitStates.erase("Moving");
+  u->unitStates.Erase(US("Moving"));
   MotionStop(u);
 }
 
@@ -911,7 +948,7 @@ void EndPropReclaim(Sim& sim, lua_State* L, Unit* u, BuildTask& c) {
     sim.CallMethod(L, u, "OnStopReclaim", 1);
   }
   SetArmAimTarget(sim, u, Vec3{0, 0, 0});  // (the dtor 0x620280: the builder unit+0x554, if any, SetAimTarget(0) +0x9f..+0xd6)
-  u->unitStates.erase("Reclaiming");
+  u->unitStates.Erase(US("Reclaiming"));
   u->focusId = 0;
   u->workProgress = 0;
   if (c.moving) EndMoveChild(u);
@@ -1077,7 +1114,7 @@ int TickPropReclaim(Sim& sim, lua_State* L, Unit* u, BuildTask& c) {
         // engineer whose walk to its reclaim spot ends short (the spot cannot be reached) still reclaims from where it
         // stopped. (Read; seen in the MP3 oracle: army 2's engineer 0x200002 reclaims a rock 7.5 away at 576.)
         float range = maxBD;
-        if (u->unitStates.count("Patrolling")) range = std::max(GuardScanRadiusOf(u), maxBD);
+        if (u->unitStates.Has(US("Patrolling"))) range = std::max(GuardScanRadiusOf(u), maxBD);
         if (gap > range) return kTaskFailed;
       }
       // In range: a target held through the army's recon blip becomes the blip's unit from here on
@@ -1085,6 +1122,20 @@ int TickPropReclaim(Sim& sim, lua_State* L, Unit* u, BuildTask& c) {
       // task's weak link +0x44 set to it by 0x5a6e00). Until then the task's target is the blip (IssueReclaimTask
       // 0x61ef60 with the order's CAiTarget), and its dtor's BeingReclaimed clear (CUnitReclaimTask dtor 0x620280:
       // the target's vt+0x10, no unit for a blip) leaves the unit alone.
+      // The swap is made for ANY blip the task holds (vt+0x1c non-null), whatever the order said: an order on the blip
+      // of a unit already gone (its command holds the blip itself, SetCommandEntityTarget) gets no creator (the blip's
+      // weak link +0x270 is empty), and with no entity left the task ends here (0x61f5c3..0x61f5d1 -> 0x6200d4, -1,
+      // no result written). Seen: MP1 15755, army 0's SACU 0x12f is given a second Reclaim of the blip 0x30400038 of
+      // the wall 0x400038 it reclaimed at 15753: the original drops it at once and reclaims the next wall 0x40004c by
+      // 15756; ours reclaimed the blip as a prop for three beats (0x40004c went at 15759).
+      if (e->kind == Entity::Kind::Blip) {
+        auto* b = static_cast<ReconBlip*>(e);
+        Unit* cr = b->source && !b->source->destroyQueued ? b->source : nullptr;
+        c.goalId = cr ? EntityRef(cr) : 0;
+        if (!cr) return kTaskDone;
+        e = cr;
+        tu = cr;
+      }
       c.targetViaBlip = false;
       // 0x61f5d7..0x61f619: the unit's builder (unit+0x554, CAiBuilderImpl) is told the target's position (vt+0x3c
       // SetAimTarget), whether or not the unit has builder arm controllers; a non-zero aim calls the script's
@@ -1113,14 +1164,14 @@ int TickPropReclaim(Sim& sim, lua_State* L, Unit* u, BuildTask& c) {
       if (gap > maxBD) return kTaskFailed;
       float time, energy, mass;
       if (!ReclaimCosts(sim, L, u, e, &time, &energy, &mass)) return kTaskFailed;
-      u->unitStates.insert("Reclaiming");
+      u->unitStates.Insert(US("Reclaiming"));
       u->focusId = EntityRef(e);
       const float ticks = std::max(1.0f, time * 10.0f);
       float amount = tu->maxHealth / ticks;
       if (tu->regenRate > 0.0f) amount = tu->regenRate * 0.1f + amount;
       if (tu->health > amount) {
         EntityAdjustHealth(L, tu, nullptr, -0.0f - amount);
-        if (Alive(tu)) tu->unitStates.insert("BeingReclaimed");
+        if (Alive(tu)) tu->unitStates.Insert(US("BeingReclaimed"));
         return kTaskRunning;
       }
       // 0x61f955..0x61f975: a builder in state Guarding (4) or AssistingCommander (0x1d) does not take the last step:
@@ -1128,7 +1179,7 @@ int TickPropReclaim(Sim& sim, lua_State* L, Unit* u, BuildTask& c) {
       // Economy 3896, SACU 0xa reclaims mex 0x15 and SACU 0xc, guarding 0xa, helps; 0xa's step leaves 23.5 of it,
       // 0xc's would kill it but the original's 0x15 is still there after the beat; 0xa kills it at 3897 and goes on
       // to reclaim the wreck until 3902. Ours let 0xc kill it at 3896, and 0xa went to its next order.)
-      if (u->unitStates.count("Guarding") || u->unitStates.count("AssistingCommander")) return kTaskRunning;
+      if (u->unitStates.Has(US("Guarding")) || u->unitStates.Has(US("AssistingCommander"))) return kTaskRunning;
       PushObject(L, u);
       sim.CallMethod(L, tu, "OnReclaimed", 1);
       // its wreck (0x620760: the script's CreateWreckageProp with an overkill of 0), then the unit goes
@@ -1172,7 +1223,7 @@ int TickPropReclaim(Sim& sim, lua_State* L, Unit* u, BuildTask& c) {
       // gun's muzzle in the watch lines one float step off now and then).
       c.reclaimPerTick[kEnergy] = energy * c.reclaimStep;
       c.reclaimPerTick[kMass] = mass * c.reclaimStep;
-      u->unitStates.insert("Reclaiming");
+      u->unitStates.Insert(US("Reclaiming"));
       u->focusId = EntityRef(e);
       // 0x61fccd..0x61fd41: m = min(fraction, health / MaxHealth) (0x4178c0), then 0x678e20 with the CHANGE m - fraction:
       // fraction + (m - fraction), clamped to [0, 1], nothing when the change is 0. Two roundings, so a damaged wreck
@@ -1535,7 +1586,7 @@ int TickMobileBuild(Sim& sim, lua_State* L, Unit* u, BuildTask& t) {
         const UnitBpData& sd = GetUnitBpData(L, *t.bp);
         SetArmAimTarget(sim, u, Vec3{t.site.x, t.site.y + sd.sizeY * 0.5f + sd.collisionOffsetY, t.site.z});
       }
-      u->unitStates.insert("Building");
+      u->unitStates.Insert(US("Building"));
       t.state = 2;
       continue;  // return 0
     case 2:  // NeedToFaceTargetToBuild units turn on the spot first (TODO: no FA structure builder sets it)
@@ -1594,7 +1645,7 @@ int TickMobileBuild(Sim& sim, lua_State* L, Unit* u, BuildTask& t) {
         if (!w->destroyQueued) sim.QueueDestroy(w);
       t.rebuildWreck = 0;
       if (!nu || !Alive(nu)) return kTaskFailed;
-      nu->unitStates.insert("NoReclaim");
+      nu->unitStates.Insert(US("NoReclaim"));
       SetFocus(sim, L, u, nu, t);
       t.state = 4;
       return kTaskRunning;
@@ -1615,7 +1666,7 @@ int TickMobileBuild(Sim& sim, lua_State* L, Unit* u, BuildTask& t) {
       }
       if (!UpdateWorkProgress(sim, L, u, t)) return kTaskRunning;
       target = FindUnit(sim, t.targetId);
-      if (target) target->unitStates.erase("NoReclaim");
+      if (target) target->unitStates.Erase(US("NoReclaim"));
       t.completed = true;
       return kTaskDone;
     }
@@ -1645,7 +1696,7 @@ bool FactorySiteBlocked(Sim& sim, lua_State* L, Unit* F, int fr[4]) {
     // original's new factory waits (return 50) under the old one, ours started its first unit at once.)
     if (e == F || e->dead || !e->blueprint) continue;
     if (!e->commands.empty()) continue;  // flag 1: 0x62dbca
-    if (e->parentId || e->unitStates.count("Attached") || e->layer == "Air") continue;
+    if (e->parentId || e->unitStates.Has(US("Attached")) || e->layer == "Air") continue;
     if (!(e->motion.bp && e->motion.bp->mobile())) {
       const FRect r = SkirtRect(*e->blueprint, GetUnitBpData(L, *e->blueprint), e->position.x, e->position.z);
       const float qx0 = static_cast<float>(fr[0]), qz0 = static_cast<float>(fr[1]);
@@ -1691,12 +1742,20 @@ int TickFactoryBuild(Sim& sim, lua_State* L, Unit* u, BuildTask& t) {
       if (!nu || !Alive(nu)) return wait(10);
       nu->fireState = u->fireState;
       SetFocus(sim, L, u, nu, t);
-      u->unitStates.insert("Building");
+      u->unitStates.Insert(US("Building"));
       t.state = 1;
       [[fallthrough]];
     }
     case 1: {
-      Unit* target = FindUnit(sim, t.targetId);
+      // CBuildTaskHelper::IsGood 0x5f5630: the helper's weak pointer (+8) set and the unit not dead (vt+0x28); a unit
+      // whose Destroy is only queued is still good and still built (its dead flag comes with the destroy queue's drain).
+      // Seen: MP1 15589, army 0 gives its Tempest 0x169 away (GiveUnitsToPlayer); FAF's TransferUnitsOwnership
+      // Destroys the cruiser 0x1ec its external factory 0x1d0 is building: the original's factory builds on through
+      // the beat (no OnStopBuild: no SetConsumptionActive call for 0x1d0 in probe mp1_15590) and its grant is spent;
+      // ours stopped the build in the command stage and OnStopBuild handed the beat's whole grant (50.625 E, 5.625 M)
+      // back to army 0 (economy 15590).
+      Unit* target = FindUnitAny(sim, t.targetId);
+      if (target && target->dead) target = nullptr;
       if (!target) {  // helper not good: OnStopBuild(false), build again after 10 ticks
         // (0x5fa97e..0x5fa989: OnStopBuild(false), state 0, return 10, and nothing else: the factory stays Building
         // while it waits, unlike the finish block's 0x5fa9da. Seen: MP3 2660, army 0's factory 0x1 whose engineer
@@ -1708,7 +1767,7 @@ int TickFactoryBuild(Sim& sim, lua_State* L, Unit* u, BuildTask& t) {
       if (!UpdateWorkProgress(sim, L, u, t)) return kTaskRunning;
       target = FindUnit(sim, t.targetId);  // (read before OnStopBuild clears the focus)
       StopBuild(sim, L, u, t, true);       // Lua F:OnStopBuild(u): IssueMoveOffFactory, FinishBuildThread
-      u->unitStates.erase("Building");
+      u->unitStates.Erase(US("Building"));
       t.state = 2;
       if (target) FactoryHandOff(sim, u, target, FindUnit(sim, t.inheritFrom));
       // state 2 (same pass): no rebuild -> workProgress 0, state 3, return 1
@@ -1729,7 +1788,7 @@ int TickUpgrade(Sim& sim, lua_State* L, Unit* u, BuildTask& t) {
     case 0: {
       if (!t.bp) return kTaskFailed;
       if (sim.tick() < t.waitUntil) return kTaskRunning;  // (restarting after a lost upgrade unit, or paused)
-      u->unitStates.insert("Upgrading");  // (the ctor 0x5f8484: +0x4a0 |= 0x40)
+      u->unitStates.Insert(US("Upgrading"));  // (the ctor 0x5f8484: +0x4a0 |= 0x40)
       // State 0 (0x5f88e2..0x5f8932): a mobile upgrader (IsMobile, vt+0x30) that moved in the last beat (its position,
       // u+0xb4, against the one before, u+0xd0, by memcmp 0x4f0a50) and has a navigator (u+0x54c) is told AbortMove
       // (vt+0x10) and asks again a beat later (return 1); otherwise state 1 in the same call. So a unit still rolling
@@ -1749,15 +1808,15 @@ int TickUpgrade(Sim& sim, lua_State* L, Unit* u, BuildTask& t) {
         t.waitUntil = sim.tick() + 9;  // return 10
         return kTaskRunning;
       }
-      u->unitStates.insert("NoCost");  // (0x5f89c3, before the unit is made; cleared by the task's dtor 0x5f855a)
+      u->unitStates.Insert(US("NoCost"));  // (0x5f89c3, before the unit is made; cleared by the task's dtor 0x5f855a)
       // (0x5f8a11: the params of 0x5f54d0 as the factory's, so the new unit is not given the old one's orientation;
       // the layer asked for is the old unit's (+0x120, 0x5f89f1), so +0x25 = 1: its height is kept)
       Unit* nu = sim.CreateUnit(L, *t.bp, u->army, u->position, Quat{}, false, u, true, 0, true);
       if (!nu || !Alive(nu)) {
-        u->unitStates.erase("Upgrading");
+        u->unitStates.Erase(US("Upgrading"));
         return kTaskFailed;
       }
-      nu->unitStates.insert("BeingUpgraded");
+      nu->unitStates.Insert(US("BeingUpgraded"));
       SetFocus(sim, L, u, nu, t);
       t.state = 1;
       // CUnitUpgradeTask::TaskTick 0x5f8890 goes on to its next state in the same call (0x5f8afd -> 0x5f8b01):
@@ -1776,7 +1835,7 @@ int TickUpgrade(Sim& sim, lua_State* L, Unit* u, BuildTask& t) {
         return kTaskRunning;
       }
       if (!UpdateWorkProgress(sim, L, u, t)) return kTaskRunning;
-      u->unitStates.erase("Upgrading");
+      u->unitStates.Erase(US("Upgrading"));
       t.completed = true;
       return kTaskDone;
     }
@@ -1792,7 +1851,7 @@ int TickAssistLegacy(Sim& sim, lua_State* L, Unit* u, BuildTask& t) {
   Unit* g = FindUnit(sim, t.goalId);
   if (!g) {
     if (t.started) StopBuild(sim, L, u, t, true);
-    u->unitStates.erase("Repairing");
+    u->unitStates.Erase(US("Repairing"));
     return kTaskDone;
   }
   if (u->guardedId != EntityRef(g)) SetGuardedUnit(sim, u, g);
@@ -1807,7 +1866,7 @@ int TickAssistLegacy(Sim& sim, lua_State* L, Unit* u, BuildTask& t) {
     if (!InBuildRange(u, *work->blueprint, work->position)) {
       if (t.started) {
         StopBuild(sim, L, u, t, true);
-        u->unitStates.erase("Repairing");
+        u->unitStates.Erase(US("Repairing"));
       }
       if (CanMove(u) && !u->motion.hasGoal) MoveToward(sim, u, work->position);
       return kTaskRunning;
@@ -1816,17 +1875,17 @@ int TickAssistLegacy(Sim& sim, lua_State* L, Unit* u, BuildTask& t) {
     if (!t.started || t.targetId != EntityRef(work)) {
       t.order = "Repair";
       SetFocus(sim, L, u, work, t);
-      u->unitStates.insert("Repairing");
+      u->unitStates.Insert(US("Repairing"));
     }
     if (UpdateWorkProgress(sim, L, u, t)) {
       StopBuild(sim, L, u, t, true);
-      u->unitStates.erase("Repairing");
+      u->unitStates.Erase(US("Repairing"));
     }
     return kTaskRunning;
   }
   if (t.started) {
     StopBuild(sim, L, u, t, true);
-    u->unitStates.erase("Repairing");
+    u->unitStates.Erase(US("Repairing"));
   }
   // stay near the guarded unit
   if (CanMove(u)) {
@@ -1860,7 +1919,7 @@ int TickReclaim(Sim& sim, lua_State* L, Unit* u, BuildTask& t) {
   Entity* e = t.goalId ? sim.FindEntity(t.goalId) : nullptr;
   if (!e || e->destroyQueued || e->dead || e == u) return t.state >= 2 ? kTaskDone : kTaskFailed;
   Unit* tu = e->kind == Entity::Kind::Unit ? static_cast<Unit*>(e) : nullptr;
-  if (tu && tu->unitStates.count("NoReclaim")) return kTaskFailed;
+  if (tu && tu->unitStates.Has(US("NoReclaim"))) return kTaskFailed;
   if (!oldForm) return TickPropReclaim(sim, L, u, t);
   // range: like building, with the target's size
   auto inRange = [&]() {
@@ -1916,7 +1975,7 @@ int TickReclaim(Sim& sim, lua_State* L, Unit* u, BuildTask& t) {
       if (energy < 0 || mass < 0) return kTaskFailed;
       t.reclaimPerTick[kEnergy] = energy * step;
       t.reclaimPerTick[kMass] = mass * step;
-      u->unitStates.insert("Reclaiming");
+      u->unitStates.Insert(US("Reclaiming"));
       u->focusId = EntityRef(e);
       t.state = 1;
       [[fallthrough]];
@@ -2128,6 +2187,7 @@ struct GuardData {
   bool childToGuard = false;          // the child's result lands in the guard (+0x2c)
   uint32_t childFrom = 0;             // its first tick (the thread's wait counter)
   bool childMove = false;             // state 0's move task (the thread is suspended until it ends)
+  bool childMoveDone = false;         // its navigator's event came before a command event gave it a new goal
   int result = 0;                     // +0x2c: 1 success, 2 failure
 };
 
@@ -2213,7 +2273,7 @@ int NavStatus(const Unit* u) {  // navigator GetStatus: 0 idle, 1 thinking, 2 st
 // GuardAbort 0x614170: GuardBusy, then navigator.AbortMove() whenever the unit has a navigator (no goal test:
 // an aircraft re-targets a point 1 s ahead every time, guard_task.md 4 / air_nav.md 4.7)
 void GuardAbort(Unit* u) {
-  u->unitStates.insert("GuardBusy");
+  u->unitStates.Insert(US("GuardBusy"));
   if (u->motion.bp && u->motion.bp->mobile()) MotionStop(u);
 }
 
@@ -2359,7 +2419,11 @@ Unit* CommandSourceUnit(Sim& sim, Unit* U) {
         ++n;
         total += c->count;
       }
-    if ((u == U && n > 0) || n > 1 || total > 1) return u;
+    // (0x611d1d..0x611d3d: U itself with a factory order; two orders; ONE order on a unit that repeats its queue
+    // (u+0x2a2); or a count above 1. Seen: MP1 16924, army 6's naval factory 0x60012b, done at 16917, assists
+    // 0x600129, which repeats its single frigate order (count 1): the original takes 0x600129 as the source and
+    // starts a frigate of its own at its guard's next turn; ours went past it to U and found nothing to build.)
+    if ((u == U && n > 0) || n > 1 || (n > 0 && u->repeatQueue) || total > 1) return u;
     visited.insert(u);
     u = FindUnit(sim, u->guardedId);
   }
@@ -2368,7 +2432,7 @@ Unit* CommandSourceUnit(Sim& sim, Unit* U) {
 
 // TryDispatchFactoryOrUpgradeFromGuardQueues 0x6127f0 (a factory assisting a factory)
 BuildTask* FactoryWork(Sim& sim, Unit* U, GuardData& g, Unit* G) {
-  if (!G || U->unitStates.count("Building") || U->unitStates.count("Repairing")) return nullptr;
+  if (!G || U->unitStates.Has(US("Building")) || U->unitStates.Has(US("Repairing"))) return nullptr;
   for (auto& c : U->commands) {
     if (!c || (c->type != CommandType::BuildFactory && c->type != CommandType::Upgrade)) continue;
     const BlueprintInfo* bp = sim.blueprints().Find(c->blueprintId);
@@ -2445,20 +2509,20 @@ Unit* AssistCandidate(Sim& sim, Unit* U, GuardData& g) {
     if (shieldOn && Cat(sim, G, "SHIELD"))
       if (Entity* s = sim.FindEntity(G->focusId))
         if (s->maxHealth > s->health) return G;
-    if (!G->paused && G->unitStates.count("Enhancing")) return G;
+    if (!G->paused && G->unitStates.Has(US("Enhancing"))) return G;
     Entity* f = G->focusId ? sim.FindEntity(G->focusId) : nullptr;
-    if (f && !G->unitStates.count("Reclaiming")) {
+    if (f && !G->unitStates.Has(US("Reclaiming"))) {
       if (f->kind != Entity::Kind::Unit) return nullptr;
       Unit* fu = static_cast<Unit*>(f);
       if (fu->army != U->army) return fu;
       if (fu->maxHealth > fu->health) return fu;
       if (fu->paused) return nullptr;
-      if (fu->unitStates.count("Enhancing")) return fu;
-      if (fu->unitStates.count("SiloBuildingAmmo")) return fu;
+      if (fu->unitStates.Has(US("Enhancing"))) return fu;
+      if (fu->unitStates.Has(US("SiloBuildingAmmo"))) return fu;
       return nullptr;
     }
     if (G->paused) return nullptr;
-    return G->unitStates.count("SiloBuildingAmmo") ? G : nullptr;
+    return G->unitStates.Has(US("SiloBuildingAmmo")) ? G : nullptr;
   }
   if (g.engAssistFactory || g.engAssistEngineer) return nullptr;
   float r = GuardScanRadiusOf(U);
@@ -2479,7 +2543,7 @@ Unit* AssistCandidate(Sim& sim, Unit* U, GuardData& g) {
     if (!cand) {
       Entity* f = u->focusId ? sim.FindEntity(u->focusId) : nullptr;
       if (f && f->kind == Entity::Kind::Unit) cand = static_cast<Unit*>(f);
-      else if (u->unitStates.count("Enhancing") || u->unitStates.count("SiloBuildingAmmo")) cand = u;
+      else if (u->unitStates.Has(US("Enhancing")) || u->unitStates.Has(US("SiloBuildingAmmo"))) cand = u;
       else continue;
     }
     float dx = cand->position.x - U->position.x, dy = cand->position.y - U->position.y, dz = cand->position.z - U->position.z;
@@ -2500,8 +2564,8 @@ void InitRepair(Sim& sim, Unit* B, BuildTask& t, Unit* target, bool silo) {
   t.order = "Repair";
   t.goalId = EntityRef(target);
   t.silo = silo;
-  t.assist = B->unitStates.count("Guarding") || B->unitStates.count("AssistingCommander");
-  if (target && target->unitStates.count("Enhancing")) {
+  t.assist = B->unitStates.Has(US("Guarding")) || B->unitStates.Has(US("AssistingCommander"));
+  if (target && target->unitStates.Has(US("Enhancing"))) {
     PushObject(sim.L(), target);
     sim.CallMethod(sim.L(), B, "InheritWork", 1);
     t.inheritWork = true;
@@ -2558,7 +2622,7 @@ int TickRepair(Sim& sim, lua_State* L, Unit* u, BuildTask& t) {
     if (tg->health == tg->maxHealth) {
       if (!t.assist) {
         if ((!tg->beingBuilt || tg->fractionComplete == 1.0f) && NothingToRepair(sim, tg)) return kTaskFailed;
-      } else if (t.state < 4 && !t.silo && !tg->unitStates.count("Upgrading") && NothingToRepair(sim, tg)) {
+      } else if (t.state < 4 && !t.silo && !tg->unitStates.Has(US("Upgrading")) && NothingToRepair(sim, tg)) {
         return kTaskFailed;
       }
     }
@@ -2577,7 +2641,7 @@ int TickRepair(Sim& sim, lua_State* L, Unit* u, BuildTask& t) {
         if (t.assist) {
           if (Unit* f = FactoryOf(sim, tg)) {
             R = f;
-          } else if (tg->unitStates.count("Upgrading")) {
+          } else if (tg->unitStates.Has(US("Upgrading"))) {
             if (Unit* f2 = FindUnit(sim, tg->focusId)) {
               t.goalId = EntityRef(f2);
               tg = R = f2;
@@ -2600,7 +2664,7 @@ int TickRepair(Sim& sim, lua_State* L, Unit* u, BuildTask& t) {
           int rr[4] = {x0, z0, x0 + fp.sizeX, z0 + fp.sizeZ};
           GroundReserveRect(sim, u, rr);
           MoveTaskWalk(sim, u, Vec3{x0 + fp.sizeX * 0.5f, a.y, z0 + fp.sizeZ * 0.5f});  // NewMoveTask 0x5f9829
-          u->unitStates.insert("Moving");
+          u->unitStates.Insert(US("Moving"));
           t.moving = true;
           return kTaskRunning;
         }
@@ -2616,7 +2680,7 @@ int TickRepair(Sim& sim, lua_State* L, Unit* u, BuildTask& t) {
         // 0x5f99ab: navigator.AbortMove() whenever there is a navigator (no goal test: an aircraft re-targets a
         // point 1 s ahead)
         if (u->motion.bp && u->motion.bp->mobile()) MotionStop(u);
-        u->unitStates.erase("Moving");
+        u->unitStates.Erase(US("Moving"));
         t.workId = t.goalId;
         // aim = the target's bone -1 world transform (Unit::GetBoneWorldTransform 0x6aa5c0): half its SizeY
         // straight up from its position, in the world's axes (0x6aa637)
@@ -2666,17 +2730,17 @@ int TickRepair(Sim& sim, lua_State* L, Unit* u, BuildTask& t) {
         }
         Unit* w = FindUnitAny(sim, t.workId);
         if (!w) return kTaskFailed;
-        w->unitStates.insert("NoReclaim");
+        w->unitStates.Insert(US("NoReclaim"));
         SetFocus(sim, L, u, w, t);
-        u->unitStates.insert("Repairing");
+        u->unitStates.Insert(US("Repairing"));
         t.state = 4;
         continue;
       }
       case 4: {
-        if (!tg->unitStates.count("Attached") && RepairGap(u, tg) > 2.0f * mbd) return kTaskFailed;
+        if (!tg->unitStates.Has(US("Attached")) && RepairGap(u, tg) > 2.0f * mbd) return kTaskFailed;
         if (!UpdateWorkProgress(sim, L, u, t)) {
           Unit* w = FindUnitAny(sim, t.workId);
-          if (!t.inheritWork || !w || w->unitStates.count("Enhancing")) return kTaskRunning;
+          if (!t.inheritWork || !w || w->unitStates.Has(US("Enhancing"))) return kTaskRunning;
         }
         t.state = 5;
         t.completed = true;
@@ -2697,8 +2761,8 @@ BuildTask* AssistTask(Sim& sim, Unit* U, Unit* c) {
   bool shieldDamaged = false;
   if (shieldOn && Cat(sim, c, "SHIELD"))
     if (Entity* s = sim.FindEntity(c->focusId)) shieldDamaged = s->maxHealth > s->health;
-  if (c->maxHealth > c->health || c->unitStates.count("Enhancing") || shieldDamaged ||
-      c->unitStates.count("SiloBuildingAmmo")) {
+  if (c->maxHealth > c->health || c->unitStates.Has(US("Enhancing")) || shieldDamaged ||
+      c->unitStates.Has(US("SiloBuildingAmmo"))) {
     // 0x613a80: new CUnitRepairTask for any guard in REPAIR (the selection's test, 0x613110), with or without a
     // CAiBuilder (unit+0x554, made only for a blueprint with Economy.BuildableCategory or a REBUILDER, Unit ctor
     // 0x6a600f..0x6a60c2); the repair task asks for the builder only to aim it (0x5f99d5, 0x5f9b37). Seen: MP2 1972,
@@ -2706,7 +2770,7 @@ BuildTask* AssistTask(Sim& sim, Unit* U, Unit* c) {
     // 1978); ours started nothing and stood.
     if (!U->bpData) return nullptr;
     BuildTask* t = NewChild(sim, CommandType::Repair, "Repair");
-    InitRepair(sim, U, *t, c, c->unitStates.count("SiloBuildingAmmo") != 0);
+    InitRepair(sim, U, *t, c, c->unitStates.Has(US("SiloBuildingAmmo")) != 0);
     return t;
   }
   return nullptr;
@@ -2737,7 +2801,7 @@ void CaptureCallback(Sim& sim, lua_State* L, Unit* u, BuildTask& t, bool start) 
   Unit* T = e && e->kind == Entity::Kind::Unit ? static_cast<Unit*>(e) : nullptr;
   if (!T) return;
   if (start) {
-    T->unitStates.insert("BeingCaptured");
+    T->unitStates.Insert(US("BeingCaptured"));
     ++T->capturers;
     PushObject(L, u);
     sim.CallMethod(L, T, "OnStartBeingCaptured", 1);
@@ -2747,7 +2811,7 @@ void CaptureCallback(Sim& sim, lua_State* L, Unit* u, BuildTask& t, bool start) 
   }
   if (T->dead || T->destroyQueued) return;
   if (T->capturers > 0) --T->capturers;
-  if (T->capturers == 0) T->unitStates.erase("BeingCaptured");
+  if (T->capturers == 0) T->unitStates.Erase(US("BeingCaptured"));
   PushObject(L, u);
   sim.CallMethod(L, T, "OnFailedBeingCaptured", 1);
   PushObject(L, T);
@@ -2804,7 +2868,7 @@ int CaptureStep(Sim& sim, lua_State* L, Unit* u, BuildTask& t) {
   }
   const float dx = e->position.x - u->position.x, dz = e->position.z - u->position.z;
   const float gap = std::sqrt(dx * dx + dz * dz) - static_cast<float>(std::max(uf.sizeX, uf.sizeZ)) - tfp;
-  if (T && T->unitStates.count("BeingCaptured") && gap > 10.0f) return kTaskFailed;
+  if (T && T->unitStates.Has(US("BeingCaptured")) && gap > 10.0f) return kTaskFailed;
   switch (t.state) {
     case 0:  // within 5: stay; otherwise a move to a free spot beside the target
       t.state = 1;
@@ -2824,7 +2888,7 @@ int CaptureStep(Sim& sim, lua_State* L, Unit* u, BuildTask& t) {
         int rr[4] = {x0, z0, x0 + uf.sizeX, z0 + uf.sizeZ};
         GroundReserveRect(sim, u, rr);
         MoveTaskWalk(sim, u, Vec3{x0 + uf.sizeX * 0.5f, a.y, z0 + uf.sizeZ * 0.5f});  // NewMoveTask 0x60477d
-        u->unitStates.insert("Moving");
+        u->unitStates.Insert(US("Moving"));
         t.moving = true;
         return kTaskRunning;  // the move child runs; this task again when it ends
       }
@@ -2835,7 +2899,7 @@ int CaptureStep(Sim& sim, lua_State* L, Unit* u, BuildTask& t) {
       GroundFreeRect(sim, u);
       float hy = T->bpData ? T->bpData->sizeY * 0.5f : 0.0f;  // the arm aims at the target's bone -1 (0x6aa637: straight up)
       SetArmAimTarget(sim, u, Vec3{T->position.x, T->position.y + hy, T->position.z});
-      u->unitStates.insert("Capturing");
+      u->unitStates.Insert(US("Capturing"));
       t.state = 2;
       return kCaptureAgain;  // 0x6048d4
     }
@@ -2942,7 +3006,7 @@ void EndCapture(Sim& sim, lua_State* L, Unit* u, BuildTask& t) {
   }
   if (Alive(u)) {
     if (u->focusId == t.goalId) u->focusId = 0;
-    u->unitStates.erase("Capturing");
+    u->unitStates.Erase(US("Capturing"));
     u->workProgress = 0;
     SetArmAimTarget(sim, u, Vec3{});
     if (t.moving) {
@@ -2981,7 +3045,7 @@ int TickSacrifice(Sim& sim, lua_State* L, Unit* u, BuildTask& t) {
       Unit* creator = T->beingBuilt ? UnitOfRef(sim, T->creatorId) : nullptr;
       if (creator && BpInCategory(sim, creator->blueprint, "FACTORY")) {
         G = creator;
-      } else if (T->unitStates.count("Upgrading")) {  // the upgrade being built becomes the task's target
+      } else if (T->unitStates.Has(US("Upgrading"))) {  // the upgrade being built becomes the task's target
         if (Unit* f = UnitOfRef(sim, T->focusId)) {
           G = f;
           t.goalId = EntityRef(f);
@@ -2999,7 +3063,7 @@ int TickSacrifice(Sim& sim, lua_State* L, Unit* u, BuildTask& t) {
         int rr[4] = {x0, z0, x0 + uf.sizeX, z0 + uf.sizeZ};
         GroundReserveRect(sim, u, rr);
         MoveTaskWalk(sim, u, Vec3{x0 + uf.sizeX * 0.5f, a.y, z0 + uf.sizeZ * 0.5f});  // NewMoveTask 0x5fb809
-        u->unitStates.insert("Moving");
+        u->unitStates.Insert(US("Moving"));
         t.moving = true;
       }
       return kTaskRunning;
@@ -3013,7 +3077,7 @@ int TickSacrifice(Sim& sim, lua_State* L, Unit* u, BuildTask& t) {
                         static_cast<float>(std::max(tf.sizeX, tf.sizeZ));
       const float reach = u->bpData ? u->bpData->maxBuildDistance : 0.0f;
       if (gap > reach) return kTaskFailed;
-      if (T->unitStates.count("Enhancing")) {
+      if (T->unitStates.Has(US("Enhancing"))) {
         // T+0x2a0 set, or nothing asked of the economy (T+0x534): no work to add to. (That +0x2a0 is the
         // pause flag and +0x534 the unit's request: inferred.)
         if (T->paused) return kTaskFailed;
@@ -3031,7 +3095,7 @@ int TickSacrifice(Sim& sim, lua_State* L, Unit* u, BuildTask& t) {
       const float energy = d ? d->buildCostEnergy * d->sacrificeMult[kEnergy] : 0.0f;
       // each as a fraction of the target's cost; a cost of 0 counts as a half (0xe4f724), the smaller one is given
       auto share = [](float given, float cost) { return cost > 0.0f ? given / cost : 0.5f; };
-      if (T->unitStates.count("Enhancing")) {
+      if (T->unitStates.Has(US("Enhancing"))) {
         // (unit state 0x26, 0x5fb27d..0x5fb3a9) the target's own Lua fields, as the scripts write them: WorkProgress
         // (0x5fb2aa), WorkItemBuildCostMass (0x5fb2d3), WorkItemBuildCostEnergy (0x5fb31f), then WorkProgress
         // written back (0x5fb392 / 0x5fb3a4). (Ours read and wrote its side table of engine values: the scripts'
@@ -3056,7 +3120,7 @@ int TickSacrifice(Sim& sim, lua_State* L, Unit* u, BuildTask& t) {
 
 void EndSacrifice(Sim& sim, Unit* u, BuildTask& t) {
   if (u && !u->destroyQueued) {
-    u->unitStates.erase("Repairing");  // the dtor clears unit state 16
+    u->unitStates.Erase(US("Repairing"));  // the dtor clears unit state 16
     if (t.moving) {
       t.moving = false;
       EndMoveChild(u);
@@ -3081,7 +3145,7 @@ int TickTeleport(Sim& sim, lua_State* L, Unit* u, BuildTask& t) {
   if (t.state == 0) {
     Vec3 p = t.site;
     if (!LandFreeSpot(sim, u, &p)) return kTaskFailed;  // FindFreeSpot 0x62b200 (whole map)
-    u->unitStates.insert("Teleporting");
+    u->unitStates.Insert(US("Teleporting"));
     if (!tp || tp->dead) return kTaskFailed;  // 0x60ad94..0x60adbf (the dtor clears Teleporting)
     PushObject(L, tp);
     PushVector(L, p.x, 0.0f, p.z);  // the spot's x and z; y is 0
@@ -3099,7 +3163,7 @@ int TickTeleport(Sim& sim, lua_State* L, Unit* u, BuildTask& t) {
   // another unit's beacon that is no longer ready (TransportIsTeleportBeaconReady, vt+0xa8)
   if (!tp || tp->dead || tp->destroyQueued) return kTaskFailed;
   if (tp != u && tp->transport && !TeleportBeaconReady(sim, tp)) return kTaskFailed;
-  if (u->immobile || u->unitStates.count("Immobile")) return kTaskRunning;  // (Unit:SetImmobile keeps a flag here)
+  if (u->immobile || u->unitStates.Has(US("Immobile"))) return kTaskRunning;  // (Unit:SetImmobile keeps a flag here)
   t.state = 2;
   return kTaskDone;
 }
@@ -3117,7 +3181,7 @@ BuildTask* MakeTeleportChild(Sim& sim, Unit* u, Unit* teleporter, const Vec3& de
 
 void EndTeleport(Sim& sim, lua_State* L, Unit* u, BuildTask& t) {
   if (!u || u->destroyQueued) return;
-  u->unitStates.erase("Teleporting");
+  u->unitStates.Erase(US("Teleporting"));
   if (t.state != 2) sim.CallMethod(L, u, "OnFailedTeleport", 0);
   u->motion.surfaceNext = true;  // motion+0x90 = 1: the next motion tick takes the ground again
 }
@@ -3159,11 +3223,11 @@ BuildTask* StartGuardTask(Sim& sim, Unit* u, const UnitCommand& c) {
   t->goalId = c.targetId;
   auto gd = std::make_shared<GuardData>();
   GuardData& g = *gd;
-  u->unitStates.insert("Guarding");
+  u->unitStates.Insert(US("Guarding"));
   if (!u->commands.empty()) g.cmd = u->commands.front();
   Refresh(sim, u, g, c);
   Unit* G = FindUnit(sim, g.G);
-  if (G && (G->beingBuilt || G->unitStates.count("Upgrading")) && !Cat(sim, G, "FACTORY") && !Cat(sim, G, "SHIELD") &&
+  if (G && (G->beingBuilt || G->unitStates.Has(US("Upgrading"))) && !Cat(sim, G, "FACTORY") && !Cat(sim, G, "SHIELD") &&
       !Cat(sim, G, "SILO") && !Mobile(G))
     g.endWhenIdle = true;
   AttackerUnpackStop(sim, u);  // 0x6115a0..: standing unpacked with AI.NeedUnpack: SetDesiredTarget(none)
@@ -3234,7 +3298,7 @@ void GuardRepairChildrenCommandEvent(Sim& sim, UnitCommand& c, Unit* self) {
     BuildTask& ch = *gt->gdata->child;
     const bool asleep = TaskThreadAsleepOnMove(h, &ch);  // (asked before the event changes the child)
     if (ch.workId) {
-      if (Unit* w = FindUnitAny(sim, ch.workId)) w->unitStates.erase("NoReclaim");
+      if (Unit* w = FindUnitAny(sim, ch.workId)) w->unitStates.Erase(US("NoReclaim"));
       h->workProgress = 0;
       if (ch.started) StopBuild(sim, L, h, ch, true);
       ch.workId = 0;
@@ -3289,8 +3353,9 @@ int TickGuard(Sim& sim, lua_State* L, Unit* U, BuildTask& t) {
     g.child = nullptr;
     resumed = true;
   } else if (g.childMove) {
-    if (U->motion.hasGoal) return kTaskRunning;
+    if (U->motion.hasGoal && !g.childMoveDone) return kTaskRunning;
     g.childMove = false;
+    g.childMoveDone = false;
     // The walk of state 0 is a CUnitMoveTask (NewMoveTask 0x6190a0, SetGoal from 0x6190cb); when it ends, its dtor
     // 0x618700 clears Moving (0x6187bd) and then calls the navigator's AbortMove (0x618886): SetSpeedThroughGoal(0)
     // and MakeIdle -> SetWaypoints(0, 0), which rebuilds a brake spline still standing from the unit's state of now
@@ -3342,11 +3407,11 @@ int TickGuard(Sim& sim, lua_State* L, Unit* U, BuildTask& t) {
           GuardWalksCommandEvent(sim, *c);
         }
   }
-  U->unitStates.erase("GuardBusy");
+  U->unitStates.Erase(US("GuardBusy"));
   // (c) validity
   Unit* G = FindUnit(sim, g.G);
   if (g.hasUnit) {
-    if (!G || G->dead || G->destroyQueued || (G->unitStates.count("Attached") && !G->beingBuilt)) return kTaskDone;
+    if (!G || G->dead || G->destroyQueued || (G->unitStates.Has(US("Attached")) && !G->beingBuilt)) return kTaskDone;
   }
   // (d)
   Unit* src = g.factoryGuard ? CommandSourceUnit(sim, U) : G;
@@ -3366,8 +3431,9 @@ int TickGuard(Sim& sim, lua_State* L, Unit* U, BuildTask& t) {
       // Guards, turns speed-through on; the second Guard's walk starts in the same beat and its move task's status
       // call, the queue now holding one, turns it off again (original 0 at 4758). Ours walked without that call.
       MoveTaskWalk(sim, U, Vec3{cx + fp.sizeX * 0.5f, a.y, cz + fp.sizeZ * 0.5f});
-      U->unitStates.insert("Moving");
+      U->unitStates.Insert(US("Moving"));
       g.childMove = true;
+      g.childMoveDone = false;
       t.state = 1;
       break;
     }
@@ -3423,7 +3489,7 @@ int TickGuard(Sim& sim, lua_State* L, Unit* U, BuildTask& t) {
       // target (a tank) was reclaimed and freed in 2024; at 7's turn in 2025 0xa still reads Reclaiming in ours; the
       // original's 7 starts nothing (no GuardBusy), ours started a reclaim of the freed id (it failed at 2026)
       if (g.hasUnit && G && U->bpData && U->bpData->hasBuilder && Cat(sim, U, "RECLAIM") &&
-          G->unitStates.count("Reclaiming") && G->focusId && sim.FindEntity(G->focusId)) {
+          G->unitStates.Has(US("Reclaiming")) && G->focusId && sim.FindEntity(G->focusId)) {
         GuardAbort(U);
         child = NewChild(sim, CommandType::Reclaim, "Reclaim");
         child->goalId = G->focusId;
@@ -3470,12 +3536,12 @@ void EndGuard(Sim& sim, Unit* U, BuildTask& t) {
   // the other way round at 5014.
   // (The rest of the dtor is kept to living units here: the AbortMove and the speed-through status also run for a
   // dying unit in the original, 0x611947..0x611977; not modelled.)
-  U->unitStates.erase("GuardBusy");
-  U->unitStates.erase("Guarding");
+  U->unitStates.Erase(US("GuardBusy"));
+  U->unitStates.Erase(US("Guarding"));
   SetGuardedUnit(sim, U, nullptr);
   if (!IsZero(g.anchor)) GroundFreeRect(sim, U);
   if (!Alive(U)) return;
-  if (g.childMove) U->unitStates.erase("Moving");
+  if (g.childMove) U->unitStates.Erase(US("Moving"));
   // 0x611947..0x611972: the navigator (unit+0x54c) is told AbortMove (vt+0x10) when the unit moved this beat
   // (+0xb4 != +0xd0, 0x4f0a50). No goal test: an aircraft re-targets the point one second ahead. Seen (MP3 487):
   // Cybran build drones (POD) circling a finished mex; their guard ends and the original's targets jump to the
@@ -3565,9 +3631,9 @@ BuildTask* StartBuildTask(Sim& sim, Unit* u, const UnitCommand& c) {
     case CommandType::Sacrifice: {  // DispatchTask 0x609a12
       Unit* T = UnitOfRef(sim, c.targetId);
       if (!T) return nullptr;
-      if (!(T->beingBuilt || T->unitStates.count("Upgrading") || T->maxHealth > T->health)) {
+      if (!(T->beingBuilt || T->unitStates.Has(US("Upgrading")) || T->maxHealth > T->health)) {
         // a builder at work: the sacrifice goes to what it builds
-        T = T->unitStates.count("Building") ? UnitOfRef(sim, T->focusId) : nullptr;
+        T = T->unitStates.Has(US("Building")) ? UnitOfRef(sim, T->focusId) : nullptr;
         if (!T) return nullptr;
       }
       t->order = "Sacrifice";
@@ -3688,7 +3754,7 @@ void EndBuildTask(Sim& sim, Unit* u, BuildTask& t, bool success) {
     // steering holds (MakeIdle -> SetWaypoints(0, 0)), so a unit already braking brakes from its speed of now
     if (Alive(u)) {
       if (u->motion.bp && u->motion.bp->mobile()) MotionStop(u);
-      u->unitStates.erase("Moving");
+      u->unitStates.Erase(US("Moving"));
     }
     return;
   }
@@ -3700,7 +3766,7 @@ void EndBuildTask(Sim& sim, Unit* u, BuildTask& t, bool success) {
     // 0x5f6b66..0x5f6b99: before OnStopBuild the structure the task made (its weak pointer +0xb8) loses NoReclaim
     // (state 40, the high dword's bit 8), finished or not. (Seen: Economy beat 2555, SACU 0x25 ordered to guard
     // from building 0x31 at 70 %: the half-built structure is reclaimable again in the original, not in ours.)
-    if (Unit* w = FindUnitAny(sim, t.targetId)) w->unitStates.erase("NoReclaim");
+    if (Unit* w = FindUnitAny(sim, t.targetId)) w->unitStates.Erase(US("NoReclaim"));
     if (Alive(u)) {
       if (t.started) StopBuild(sim, L, u, t, true);
       if (!t.completed) sim.CallMethod(L, u, "OnFailedToBuild", 0);
@@ -3720,16 +3786,16 @@ void EndBuildTask(Sim& sim, Unit* u, BuildTask& t, bool success) {
     // the script's roll-off (Busy + BlockCommandQueue) is no longer Busy in that beat; BlockCommandQueue stays. Seen:
     // MP1 beat 4088, army 0's factory 0x27 self-destructed in its roll-off: the original's states that beat are NoCost
     // and BlockCommandQueue; ours kept Busy until the unit was gone.
-    u->unitStates.erase("Busy");
+    u->unitStates.Erase(US("Busy"));
     u->busy = false;
-    u->unitStates.erase("Building");
+    u->unitStates.Erase(US("Building"));
     u->workProgress = 0;
     if (t.started && Alive(u)) StopBuild(sim, L, u, t, t.completed);
   } else if (t.type == CommandType::Upgrade) {
     // CUnitUpgradeTask dtor (0x5f84c0): done -> OnStopBuild(true); otherwise the engine destroys the
     // upgrade unit itself (its ground released, the builder's taken back), then OnStopBuild(false)
-    u->unitStates.erase("Upgrading");
-    u->unitStates.erase("NoCost");  // (0x5f855a)
+    u->unitStates.Erase(US("Upgrading"));
+    u->unitStates.Erase(US("NoCost"));  // (0x5f855a)
     // 0x5f856d: the work progress back to 0 BEFORE OnStopBuild (ours did it after, and not at all once FAF's
     // OnStopBuild had destroyed the old unit). Seen: Skirmish 2183, army 4's factory 0x400014 finishes its upgrade
     // 0x400023; M28's threads for both start in that beat's Lua: the original's old factory reads work progress 0, is
@@ -3744,7 +3810,7 @@ void EndBuildTask(Sim& sim, Unit* u, BuildTask& t, bool success) {
       // (913.5, 85.5).
       u->occupiesGround = false;
       // (0x5f859b: the new unit is no longer BeingUpgraded, before OnStopBuild)
-      if (Unit* nu = FindUnit(sim, t.targetId)) nu->unitStates.erase("BeingUpgraded");
+      if (Unit* nu = FindUnit(sim, t.targetId)) nu->unitStates.Erase(US("BeingUpgraded"));
       if (t.started && Alive(u)) StopBuild(sim, L, u, t, true);
     } else {
       Unit* target = FindUnit(sim, t.targetId);
@@ -3778,7 +3844,7 @@ void EndBuildTask(Sim& sim, Unit* u, BuildTask& t, bool success) {
       // given (490,181) instead of (489,181), and its walk's last step at 6225 went another way.
       if (t.state == 1 && !t.noMove) GroundFreeRect(sim, u);
       if (Alive(u)) {
-        u->unitStates.erase("Repairing");
+        u->unitStates.Erase(US("Repairing"));
         u->workProgress = 0;
         SetArmAimTarget(sim, u, Vec3{});
         if (t.moving) {
@@ -3786,7 +3852,7 @@ void EndBuildTask(Sim& sim, Unit* u, BuildTask& t, bool success) {
           EndMoveChild(u);
         }
       }
-      if (Unit* w = FindUnitAny(sim, t.workId)) w->unitStates.erase("NoReclaim");
+      if (Unit* w = FindUnitAny(sim, t.workId)) w->unitStates.Erase(US("NoReclaim"));
     }
     if (t.started && Alive(u)) StopBuild(sim, L, u, t, true);
   } else {
@@ -3808,7 +3874,7 @@ void EndBuildTask(Sim& sim, Unit* u, BuildTask& t, bool success) {
   // the frigate) and the frigate stays BeingReclaimed, as the four reclaim steps of that beat left it. Ours cleared it.
   if (t.type == CommandType::Reclaim && t.goalId && !t.targetViaBlip) {
     Entity* e = sim.FindEntity(t.goalId);
-    if (e && e->kind == Entity::Kind::Unit) static_cast<Unit*>(e)->unitStates.erase("BeingReclaimed");
+    if (e && e->kind == Entity::Kind::Unit) static_cast<Unit*>(e)->unitStates.Erase(US("BeingReclaimed"));
   }
   if (t.reclaimStarted && Alive(u)) {
     // the target as the task's weak pointer holds it (0x620110 -> 0x605600 -> 0x6057d0: the entity's Lua object while
@@ -3825,20 +3891,20 @@ void EndBuildTask(Sim& sim, Unit* u, BuildTask& t, bool success) {
   // CUnitMobileBuildTask's dtor (0x5f6b16) and CFactoryBuildTask's (0x5fa05e) take Building off (unit+0x4a0 &= ~0x20)
   // with no test of the unit's life: a builder killed at work (Unit::Kill empties its queue) is no longer Building.
   // (Seen: Skirmish 2810, army 0's engineer 0x11 killed while building: the original's states lose Building.)
-  if (t.type == CommandType::BuildMobile || t.type == CommandType::BuildFactory) u->unitStates.erase("Building");
+  if (t.type == CommandType::BuildMobile || t.type == CommandType::BuildFactory) u->unitStates.Erase(US("Building"));
   // The same for CUnitReclaimTask's dtor (Reclaiming off, 0x6203c6, and the work progress +0x2ac = 0, 0x6203d9) and
   // CUnitRepairTask's (Repairing off, 0x5f8e89, work progress 0, 0x5f8e9c): a unit killed while it reclaims or
   // repairs loses the state when Unit::KillCleanup empties its queue the beat after. (Seen: MP3 2536, army 1's
   // engineer 0x10000e killed while reclaiming; 2550, army 0's engineers 0xa and 0xc killed while repairing: the
   // original's dying units are without the state, ours kept it until they were gone.)
   if (!Alive(u)) {
-    u->unitStates.erase("Reclaiming");
-    u->unitStates.erase("Repairing");
+    u->unitStates.Erase(US("Reclaiming"));
+    u->unitStates.Erase(US("Repairing"));
     u->workProgress = 0;
     if (walking) FreeWalkRect(u);  // (the walking child's dtor, 0x618891, has no test of the unit's life)
   }
   if (Alive(u)) {
-    u->unitStates.erase("Reclaiming");
+    u->unitStates.Erase(US("Reclaiming"));
     if (t.type == CommandType::Reclaim && u->focusId == t.goalId) u->focusId = 0;
     if (t.type == CommandType::Reclaim) {
       // CUnitReclaimTask's dtor 0x620280: the arm let go (SetAimTarget(0, 0, 0)); a walk still under way gives its
@@ -3849,11 +3915,11 @@ void EndBuildTask(Sim& sim, Unit* u, BuildTask& t, bool success) {
         GroundFreeRect(sim, u);
       }
     }
-    u->unitStates.erase("Building");
-    u->unitStates.erase("Repairing");
+    u->unitStates.Erase(US("Building"));
+    u->unitStates.Erase(US("Repairing"));
     if (!t.child && (t.type == CommandType::BuildAssist || t.type == CommandType::AssistCommander)) {
-      u->unitStates.erase("Guarding");  // (the legacy assist tasks; the guard's own dtor does this for it)
-      u->unitStates.erase("AssistingCommander");
+      u->unitStates.Erase(US("Guarding"));  // (the legacy assist tasks; the guard's own dtor does this for it)
+      u->unitStates.Erase(US("AssistingCommander"));
     }
     u->workProgress = 0;
     // Only a walking child's dtor aborts the move (0x618884); with none running the navigator keeps what it has. (Seen:
@@ -3896,6 +3962,16 @@ void TaskWalkCommandEvent(Sim& sim, UnitCommand& c, Unit* h) {
     cz = static_cast<int>(std::nearbyint(q.z - fp.sizeZ * 0.5f));
   }
   const Vec3 goal{cx + fp.sizeX * 0.5f, p.y, cz + fp.sizeZ * 0.5f};
+  // The move task's result is the navigator's event (its listener 0x618bb0 writes it and wakes the thread); this
+  // listener (0x618c40) only hands the navigator a new goal and leaves that result alone. A walk whose navigator has
+  // already reported (arrived or failed earlier in this beat, its thread not yet run) therefore still ends at its
+  // thread's turn, and the task's dtor aborts the new goal (AbortMove 0x618886). Seen: MP1 17074, army 1's
+  // engineers 0x10005c, 0x10009f, 0x100110, 0x100165, 0x1001bb reach their anchors by the land factory 0x100035
+  // (the navigator's success in the navigator stage); 0x1000e9, earlier in the command stage, retargets their
+  // shared Guard to the factory's upgrade: the original's walks end in that beat (Moving off, the repair from
+  // 17076); ours walked on to the new goal by the upgrade.
+  const bool walkDone = h->motion.arrived || h->motion.failed;
+  if (walkDone && h->task && h->task->gdata && h->task->gdata->childMove) h->task->gdata->childMoveDone = true;
   h->motion.arrived = h->motion.failed = false;
   MotionSetGoal(sim, h, std::vector<Vec3>{goal}, h->motion.nav->speedThroughGoal, sim.tick());
   if (h->walkPrepared) {
@@ -3943,7 +4019,7 @@ void ReclaimTaskCommandEvent(Sim& sim, Unit* u, BuildTask& c, const UnitCommand&
 void MobileBuildCommandEvent(Sim& sim, Unit* u, BuildTask& t, const UnitCommand& cmd) {
   lua_State* L = sim.L();
   if (Unit* w = FindUnitAny(sim, t.targetId)) {
-    w->unitStates.erase("NoReclaim");
+    w->unitStates.Erase(US("NoReclaim"));
     u->workProgress = 0;
     if (t.started && Alive(u)) StopBuild(sim, L, u, t, true);
     t.started = false;
@@ -4107,9 +4183,9 @@ void FactoryHandOff(Sim& sim, Unit* f, Unit* u, Unit* inheritFrom) {
   }
   Unit* chosen = nullptr;
   for (Unit* X : Guards(sim, R)) {
-    if (!BpInCategory(sim, X->blueprint, "TRANSPORTATION") || !X->unitStates.count("Ferrying")) continue;
-    if (!chosen || !X->unitStates.count("Moving")) chosen = X;
-    if (!chosen->unitStates.count("Moving")) break;
+    if (!BpInCategory(sim, X->blueprint, "TRANSPORTATION") || !X->unitStates.Has(US("Ferrying"))) continue;
+    if (!chosen || !X->unitStates.Has(US("Moving"))) chosen = X;
+    if (!chosen->unitStates.Has(US("Moving"))) break;
   }
   if (chosen) {
     // The order's issue data holds a CAiTarget of R made here (CAiTarget::UpdateTarget 0x5d55b0 from 0x5fab9c: one
@@ -4457,22 +4533,22 @@ int l_NotifyUpgrade(lua_State* L) {
 int l_SetBusy(lua_State* L) {
   Unit* u = U(L);
   u->busy = lua_toboolean(L, 2) != 0;
-  if (u->busy) u->unitStates.insert("Busy");
-  else u->unitStates.erase("Busy");
+  if (u->busy) u->unitStates.Insert(US("Busy"));
+  else u->unitStates.Erase(US("Busy"));
   return 0;
 }
 // Unit:SetUnSelectable(flag) 0x6c6a50: sets or clears unit state UnSelectable (bit 33), nothing else
 int l_SetUnSelectable(lua_State* L) {
   Unit* u = U(L);
-  if (lua_toboolean(L, 2)) u->unitStates.insert("UnSelectable");
-  else u->unitStates.erase("UnSelectable");
+  if (lua_toboolean(L, 2)) u->unitStates.Insert(US("UnSelectable"));
+  else u->unitStates.Erase(US("UnSelectable"));
   return 0;
 }
 int l_SetBlockCommandQueue(lua_State* L) {
   Unit* u = U(L);
   u->blockCommandQueue = lua_toboolean(L, 2) != 0;
-  if (u->blockCommandQueue) u->unitStates.insert("BlockCommandQueue");
-  else u->unitStates.erase("BlockCommandQueue");
+  if (u->blockCommandQueue) u->unitStates.Insert(US("BlockCommandQueue"));
+  else u->unitStates.Erase(US("BlockCommandQueue"));
   return 0;
 }
 
@@ -4501,7 +4577,10 @@ bool AttachPlainEntity(Sim& sim, Entity* e, Entity* parent, int bone) {
 // ShieldVerticalOffset below its unit)
 int l_SetParentOffset(lua_State* L) {
   Entity* e = CheckObject<Entity>(L, 1);
-  if (!e->attachParent) return luaL_error(L, "Entity:SetParentOffset: entity is not attached to anything");
+  // (the test is the entity's attach parent, +0x18c: a unit hung on a bone by AttachBoneTo / AttachTo has one too,
+  // its parentId here; its offset goes into AttachedTransform, sim/transport.cpp)
+  const bool unitAttached = e->kind == Entity::Kind::Unit && static_cast<Unit*>(e)->parentId;
+  if (!e->attachParent && !unitAttached) return luaL_error(L, "Entity:SetParentOffset: entity is not attached to anything");
   luaL_checktype(L, 2, LUA_TTABLE);
   float v[3];
   for (int i = 0; i < 3; ++i) {
@@ -4515,7 +4594,7 @@ int l_SetParentOffset(lua_State* L) {
 // Unit state Attached (14) belongs to the unit's motion: a unit without one (a structure, a dummy unit) never
 // shows it (the anchor and external factory units of a Fatboy are attached and not Attached)
 void SetAttachedState(Unit* u) {
-  if (u->motion.bp && u->motion.bp->mobile()) u->unitStates.insert("Attached");
+  if (u->motion.bp && u->motion.bp->mobile()) u->unitStates.Insert(US("Attached"));
 }
 // Unit::AttachTo 0x6ab410 (the attach of AttachBoneTo / AttachTo from Lua): after Entity::AttachTo, a mobile unit's
 // motion hears of it (CUnitMotion::NotifyAttached 0x6b94a0, 0x6ab43a: motion state Attached, horizontal event
@@ -4535,6 +4614,7 @@ int l_AttachBoneTo(lua_State* L) {
   if (!u || !parent) return 0;
   if (u->parentId != EntityRef(parent)) u->attachSeq = S(L)->NextAttachSeq();  // (the views' child order)
   u->parentId = EntityRef(parent);
+  u->attachOffset = {};  // (a new attach info: no relative offset until SetParentOffset)
   u->ownBone = BoneIndex(L, u, 2);
   u->parentBone = BoneIndex(L, parent, 4);
   NotifyAttached(*S(L), u);
@@ -4568,6 +4648,7 @@ int l_AttachTo(lua_State* L) {  // entity:AttachTo(parent, bone)
   if (!u || !parent) return 0;
   if (u->parentId != EntityRef(parent)) u->attachSeq = S(L)->NextAttachSeq();  // (the views' child order)
   u->parentId = EntityRef(parent);
+  u->attachOffset = {};  // (a new attach info: no relative offset until SetParentOffset)
   // Entity:AttachTo 0x68be10 is AttachBoneTo with the entity's own bone 0 (0x68bf14: push 0), not -1: the unit is
   // placed so that ITS bone 0 lies on the parent's bone. Seen: an aircraft a carrier builds while it sails
   // (AircraftCarrier's BuildingState: unitBuilding:AttachTo(self, bone)) sits 0.47 below and 0.06 ahead of the
@@ -4600,7 +4681,7 @@ void Detach(Sim& sim, Unit* u) {
     else u->motion.motionTarget = t;  // (the same SetTarget for a land, hover or naval unit's motion)
   }
   u->parentId = 0;
-  u->unitStates.erase("Attached");
+  u->unitStates.Erase(US("Attached"));
   // NotifyDetached's motion+0x90 asks for a snap only where the motion step reads it: CalcMoveLand (0x6c31b7) and
   // CalcMoveHover. CalcMoveWater 0x6c3480 (any other layer, no hover) sets the unit on the water only when it moved,
   // dives, or still pitches (0x6c34b0 / 0x6c3523): a submarine let go by its naval factory stays at the build bone's
@@ -4623,15 +4704,18 @@ void Detach(Sim& sim, Unit* u) {
   sim.MarkUnitsMoved();
 }
 int l_DetachFrom(lua_State* L) {
-  if (Unit* u = ToObject<Unit>(L, 1)) Detach(*S(L), u);
+  // (the skip flag, arg 2: without it a unit that cannot fly falls, DetachFromFalls in sim/transport.cpp)
+  if (Unit* u = ToObject<Unit>(L, 1)) {
+    if (lua_toboolean(L, 2) || !DetachFromFalls(*S(L), u)) Detach(*S(L), u);
+  }
   else if (Entity* e = ToObject<Entity>(L, 1)) e->attachParent = 0;
   return 0;
 }
 // Unit:SetDoNotTarget(flag) 0x6c6bc0: sets or clears unit state DoNotTarget (bit 34), nothing else
 int l_SetDoNotTarget(lua_State* L) {
   Unit* u = U(L);
-  if (lua_toboolean(L, 2)) u->unitStates.insert("DoNotTarget");
-  else u->unitStates.erase("DoNotTarget");
+  if (lua_toboolean(L, 2)) u->unitStates.Insert(US("DoNotTarget"));
+  else u->unitStates.Erase(US("DoNotTarget"));
   return 0;
 }
 // Unit:HideBone(bone, affectChildren) / Unit:ShowBone(bone, affectChildren) 0x6d14f0: the pose bone's "visible" flag
@@ -4659,12 +4743,21 @@ int l_ShowHideBone(lua_State* L) {
   }
   return 0;
 }
-int l_DetachAll(lua_State* L) {  // entity:DetachAll(bone)
+// Entity:DetachAll(bone, [skipBallistic]) 0x68c6d0: every child on that bone goes through its own DetachFrom (vt+0x60,
+// 0x68c864) with the skip flag of arg 3 (lua_toboolean 0x90c740 / 0x415560 at 0x68c793..0x68c7bd: false when not
+// given), so a unit that cannot fly falls (DetachFromFalls), as with DetachFrom(). Seen: MP1 17803, army 6's
+// unfinished sub 0x60004c let go by the Tempest's external factory (DetachAll(bone)): the original's takes the Air
+// layer (the fall of a unit being built goes nowhere: it stays put), ours kept the Sub layer.
+int l_DetachAll(lua_State* L) {
   Entity* e = ToObject<Entity>(L, 1);
   if (!e) return 0;
   int bone = lua_isnoneornil(L, 2) ? -2 : BoneIndex(L, e, 2);
+  const bool skip = lua_toboolean(L, 3) != 0;
+  std::vector<Unit*> children;  // (a copy: a detach may run scripts)
   for (Unit* o : S(L)->units())
-    if (o->parentId == EntityRef(e) && (bone == -2 || o->parentBone == bone)) Detach(*S(L), o);
+    if (o->parentId == EntityRef(e) && (bone == -2 || o->parentBone == bone)) children.push_back(o);
+  for (Unit* o : children)
+    if (o->parentId == EntityRef(e) && (skip || !DetachFromFalls(*S(L), o))) Detach(*S(L), o);
   return 0;
 }
 int l_GetParent(lua_State* L) {
@@ -4735,6 +4828,26 @@ int l_GetRallyPoint(lua_State* L) {  // 0x6d0650: the target of rally command 0,
   lua_pushnil(L);
   return 1;
 }
+// Unit:CalculateWorldPositionFromRelative(vector) 0x6c74f0: two arguments; the vector (0x4d0080) turned by the unit's
+// orientation (vt+0x18, MultQuadVec 0x452d40) plus its position (vt+0x14), both committed (where the beat began with
+// it until AdvanceCoords), as a new Vector. Seen: MP1 15836, army 6's Tempest 0x600049 finishes the cruiser 0x6000d2;
+// UAS0401's BuildingState.OnStopBuild sends it off with IssueToUnitMoveOffFactory(unit, CalculateWorldPositionFromRelative(
+// {0, 0, -12})): the original's cruiser holds the roll-off Move and the rally (Move x2); ours, with the call a stub that
+// gave nil, only the rally.
+int l_CalculateWorldPositionFromRelative(lua_State* L) {
+  if (lua_gettop(L) != 2)
+    luaL_error(L, "%s\n  expected %d args, but got %d", "Unit:CalculateWorldPositionFromRelative(vector)", 2, lua_gettop(L));
+  Unit* u = U(L);
+  Vec3 v;
+  PosArg(L, 2, &v);
+  const Sim& sim = *S(L);
+  const bool pend = sim.coordsPending && u->lastPosTick == sim.tick();
+  const Vec3 p = pend ? u->lastPosition : u->position;
+  const Quat q = pend ? u->lastOrientation : u->orientation;
+  const Vec3 r = vm::RotateM(q, v);
+  PushVector(L, p.x + r.x, p.y + r.y, p.z + r.z);
+  return 1;
+}
 // unit:GetNumBuildOrders(category): build commands in its queue for blueprints in the category
 int l_GetNumBuildOrders(lua_State* L) {
   Unit* u = U(L);
@@ -4794,6 +4907,7 @@ void RegisterBuildBindings(lua_State* L) {
   SetGlobal(L, "IssueClearFactoryCommands", l_IssueClearFactoryCommands);
   SetGlobal(L, "IssueMoveOffFactory", l_IssueMoveOffFactory);
   SetMethod(L, "Unit", "GetRallyPoint", l_GetRallyPoint);
+  SetMethod(L, "Unit", "CalculateWorldPositionFromRelative", l_CalculateWorldPositionFromRelative);
   SetMethod(L, "Unit", "GetNumBuildOrders", l_GetNumBuildOrders);
   RegisterSiloBindings(L);
   SetMethod(L, "CUnitScriptTask", "GetUnit", l_task_GetUnit);
@@ -5051,7 +5165,7 @@ void SiloTick(Sim& sim, Unit* u) {
       }
       u->consumptionShown[0] = s->perTick[0];
       u->consumptionShown[1] = s->perTick[1];
-      u->unitStates.insert("SiloBuildingAmmo");
+      u->unitStates.Insert(US("SiloBuildingAmmo"));
       s->stage = 2;
       CallWeaponMethod(sim, L, u, "OnSiloBuildStart", wi);
       return;
@@ -5083,7 +5197,7 @@ void SiloTick(Sim& sim, Unit* u) {
         s->request.reset();
       }
       u->consumptionShown[0] = u->consumptionShown[1] = 0;
-      u->unitStates.erase("SiloBuildingAmmo");
+      u->unitStates.Erase(US("SiloBuildingAmmo"));
       u->workProgress = 0;
       int wi = s->weapon[s->kind];
       CallWeaponMethod(sim, L, u, "OnSiloBuildEnd", wi);
@@ -5125,7 +5239,7 @@ int l_StopSiloBuild(lua_State* L) {
         u->silo->request->live = false;
         u->silo->request.reset();
       }
-      u->unitStates.erase("SiloBuildingAmmo");
+      u->unitStates.Erase(US("SiloBuildingAmmo"));
       u->silo->stage = 0;
     }
   }

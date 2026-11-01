@@ -383,6 +383,9 @@ void LiveSim::Run() {
     if (!e.stream && setup_.pingAt && e.sim->tick() == setup_.pingAt) Ping();  // [pings] (a new game's only)
     if (!e.stream)
       for (Setup::Upgrade& u : setup_.upgrades) UpgradeTest(e.sim->tick(), u);  // [hitches] (a new game's only)
+    if (!e.stream)  // [r7] (a new game's only: --orders' "lua" lines of this beat, before it)
+      for (const auto& l : setup_.lua)
+        if (l.first == e.sim->tick()) e.sim->RunString(l.second, "@orders");
     const auto b0 = std::chrono::steady_clock::now();
     e.sim->Tick();
     const float ms = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - b0).count();

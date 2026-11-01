@@ -165,6 +165,22 @@ static const float kGlintFrom = 0.08, kGlintTo = 2.0, kGlintSlopes = 0.006;
 // for the wet beach above the water (WetBeach: as high as the damp band reaches in a storm on an exposed beach)
 static const float kSurfWetRise = 1.5;
 #endif
+#if SURF
+// [shorewall] How much of the sheet's extra height for the surf (kSurfRise, and kSurfWetRise) it takes: all of it but under a
+// camera low over the water (a ship looked at from about its own deck's height), where the raised sheet would
+// lie above the eye: seen from below it was drawn as a wall rising over the beach and the horizon toward the picture's
+// sides (the lifted ocean, whose sheet rises to that height over the shallows alone), or not drawn at all (the flat sheet).
+// The sheet then lies at most three quarters of the way up from the water to the eye (it still covers all the beach lower
+// than that, the run-up's and the wet beach's, and a little room is left for its far side seen edge on); the place each
+// pixel is worked out at is moved down by the same share (PS), so the water stays where it was.
+float SheetRoom() {
+  float extra = kSurfRise;
+#if SURF_WET
+  extra += kSurfWetRise;
+#endif
+  return saturate(((cameraPosition.y - surfaceColor.w) * 0.75 - kRise) / extra);
+}
+#endif
 
 #if LIFT
 // [lift] (ocean.h, World::oceanLift) The water as the camera's grid, lifted by the waves: each vertex of a patch (`corner`
@@ -195,9 +211,10 @@ VOut VS(float2 corner : POSITION, uint instance : SV_InstanceID) {
   // (where it is not lifted the sheet lies as high as the flat one does: the swell's crests, the run-up, the wet beach)
   float rise = kRise;
 #if SURF
-  rise += kSurfRise;
+  float room = SheetRoom();  // [shorewall] (never above the eye)
+  rise += kSurfRise * room;
 #if SURF_WET
-  rise += kSurfWetRise;
+  rise += kSurfWetRise * room;
 #endif
 #endif
   o.world = float3(x0.x + d.x, surfaceColor.w + d.y + rise * (1 - share), x0.y + d.z);
@@ -218,9 +235,10 @@ VOut VS(float2 corner : POSITION) {
   float reach = beyond.z > 0 ? 1 / beyond.z : 0;
 #if SURF
   // [surf] (and as high as the surf's run-up reaches)
-  o.world = float3(lerp(-reach, mapSize.x + reach, corner.x), surfaceColor.w + kRise + kSurfRise, lerp(-reach, mapSize.y + reach, corner.y));
+  float room = SheetRoom();  // [shorewall] (never above the eye)
+  o.world = float3(lerp(-reach, mapSize.x + reach, corner.x), surfaceColor.w + kRise + kSurfRise * room, lerp(-reach, mapSize.y + reach, corner.y));
 #if SURF_WET
-  o.world.y += kSurfWetRise;  // [shore] (with World::waterDetail as high as the beach it wets)
+  o.world.y += kSurfWetRise * room;  // [shore] (with World::waterDetail as high as the beach it wets)
 #endif
 #else
   o.world = float3(lerp(-reach, mapSize.x + reach, corner.x), surfaceColor.w + kRise, lerp(-reach, mapSize.y + reach, corner.y));
@@ -395,6 +413,7 @@ float4 PS(VOut i, out uint coverage : SV_Coverage) : SV_Target {
 #else
   float unlifted = 1;
 #endif
+  unlifted *= SheetRoom();  // [shorewall] (as high as the vertex shader raised it)
 #if SURF_WET
   // ([shore] with World::waterDetail higher again by kSurfWetRise, for WetBeach)
   i.world += normalize(i.world - cameraPosition) * (kSurfWetRise * unlifted / max(normalize(cameraPosition - i.world).y, 1e-3));
@@ -822,8 +841,33 @@ float4 PS(VOut i, out uint coverage : SV_Coverage) : SV_Target {
   {
     float3 p = i.world;
     float stride = 1.2;
-    for (int k = 0; k < 14; ++k) {
-      p += R * stride;
+    int first = 0;
+#if OCEAN
+    // [reflblot] (the ocean, its lifted waves above all: close to the eye a ship's hull is narrower and lower than the first
+    // step of 1.2, and a ray off the water just before it stepped over it, so that under the hull's waterline the sea
+    // mirrored the sky, and the hull showed only where a step happened to end inside it: in patches lying detached in
+    // the sea near the eye, well below the ship. Close to the eye the march starts with steps as short as the water's
+    // distance asks, a sixtieth of it (never under 0.03), and lengthens them by the same 1.35 until they reach 1.2, from
+    // where it goes on as it always did: from the game's height, where the water lies 60 and more away, its steps are as
+    // they were)
+    float startStride = clamp(distance / 60, 0.03, 1.2);
+    first = -int(ceil(log(1.2 / startStride) / log(1.35) - 1e-3));
+    stride = startStride;
+    // (and it goes off the calmer surface the rays' mirror goes off, above, the waves' tilt kept at 45%: off the full tilt,
+    // drawn steeper than the waves are for their shading, the faces of the waves near the eye turned away from it mirrored
+    // the ship's hull in sharp-edged patches far below it, lying amid the sky's mirror image of the faces round them)
+    float3 marchR = reflect(toPixel, normalize(lerp(N, float3(0, 1, 0), 0.55)));
+    marchR.y = max(marchR.y, 0.02);
+    marchR = normalize(marchR);
+#else
+    float3 marchR = R;
+#endif
+    for (int k = first; k < 14; ++k) {
+#if OCEAN
+      if (k == 0) stride = 1.2;
+      float stepped = stride;
+#endif
+      p += marchR * stride;
       stride *= 1.35;
       float4 c = mul(viewProj, float4(p, 1));
       if (c.w <= 0) break;
@@ -833,9 +877,31 @@ float4 PS(VOut i, out uint coverage : SV_Coverage) : SV_Target {
       float here = c.z / c.w;
       if (there > here) {  // the picture has something nearer than this place on the way: it is what is mirrored
         float gap = cameraBack.w / here - cameraBack.w / there;
-        if (gap < stride * 2 + 1) {
+        float slack = stride * 2 + 1;
+#if OCEAN
+        // [reflblot] (and where along the last step the ray went behind what the picture shows, found by halving the step
+        // six times; mirrored only where the ray truly meets it there, not where it passes behind it: its steps grow long
+        // fast, and a step's end well past a hull, where the hull's side high up showed through, was taken for where the
+        // ray met it)
+        {
+          float3 inFront = p - marchR * stepped, atBack = p;
+          for (int j = 0; j < 6; ++j) {
+            float3 m = (inFront + atBack) * 0.5;
+            float4 cm = mul(viewProj, float4(m, 1));
+            float2 atm = float2(cm.x / cm.w * 0.5 + 0.5, 0.5 - cm.y / cm.w * 0.5);
+            if (SCENE_DEPTH(int2(min(saturate(atm) * viewport.xy, viewport.xy - 1)), 0) > cm.z / cm.w) atBack = m; else inFront = m;
+          }
+          c = mul(viewProj, float4(atBack, 1));
+          at = float2(c.x / c.w * 0.5 + 0.5, 0.5 - c.y / c.w * 0.5);
+          there = SCENE_DEPTH(int2(min(saturate(at) * viewport.xy, viewport.xy - 1)), 0);
+          here = c.z / c.w;
+          gap = cameraBack.w / here - cameraBack.w / there;
+          slack = length(atBack - inFront) * 2 + clamp(distance / 200, 0.02, 0.3);  // (what the ray passes behind is not met)
+        }
+#endif
+        if (gap < slack) {
           float2 edge = min(at, 1 - at);
-          float seen = saturate(min(edge.x, edge.y) * 10) * (1 - k / 14.0);
+          float seen = saturate(min(edge.x, edge.y) * 10) * (1 - max(k, 0) / 14.0);  // ([reflblot] its short steps first)
           mirror = lerp(mirror, behind.SampleLevel(samplerLinearClamp, at, 0).rgb, seen);
         }
         break;

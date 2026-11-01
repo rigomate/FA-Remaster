@@ -1,5 +1,9 @@
 // Units, weapons, props and platoons: the engine objects that scripts create and drive.
 #pragma once
+#include <atomic>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <map>
 #include <memory>
@@ -81,6 +85,7 @@ struct UnitBpData {
   std::string buildRestriction;     // Physics.BuildRestriction
   int buildOnLayerCaps = 1;         // Physics.BuildOnLayerCaps (layer bits)
   float skirtOffsetX = 0, skirtOffsetZ = 0, skirtSizeX = 0, skirtSizeZ = 0;
+  std::vector<float> occupyRects;   // Physics.OccupyRects (bp+0x310): centre x, z offsets, half sizes x, z per rect
   bool structure = false;           // no motion type (the build grid applies)
   float maxGroundVariation = 1;
   bool flattenSkirt = false;
@@ -107,7 +112,7 @@ bool IsUnitStateName(const char* name);
 // kUnitStates) is set and cleared with it, so a test of a known state is one bit, not a walk of a tree of strings
 // (B1 at cores: the string tests were 27 s of the sim thread's 729 s, 11.6 s of it in the path searches' unit test).
 // A name outside the list (none is inserted today) is asked of the set itself.
-inline int UnitStateIndex(std::string_view s) {
+constexpr int UnitStateIndex(std::string_view s) {
   switch (s.size()) {
     case 4: if (s == "Busy") return 13; break;
     case 6: if (s == "Moving") return 2; if (s == "Diving") return 17; if (s == "NoCost") return 41; break;
@@ -129,6 +134,14 @@ inline int UnitStateIndex(std::string_view s) {
   }
   return 0;
 }
+// Each index's name (UnitStateIndex backwards; nullptr: no state has it).
+inline constexpr const char* kUnitStateNameOf[] = {nullptr, "Immobile", "Moving", "Attacking", "Guarding", "Building", "Upgrading", "WaitingForTransport", "TransportLoading", "TransportUnloading", "MovingDown", "MovingUp", "Patrolling", "Busy", "Attached", "BeingReclaimed", "Repairing", "Diving", "Surfacing", "Teleporting", "Ferrying", "WaitForFerry", "AssistMoving", "PathFinding", "ProblemGettingToGoal", "NeedToTerminateTask", "Capturing", "BeingCaptured", "Reclaiming", "AssistingCommander", "Refueling", "GuardBusy", "ForceSpeedThrough", "UnSelectable", "DoNotTarget", "LandingOnPlatform", "CannotFindPlaceToLand", "BeingUpgraded", "Enhancing", "BeingBuilt", "NoReclaim", "NoCost", "BlockCommandQueue", "MakingAttackRun", "HoldingPattern", "SiloBuildingAmmo"};
+// A state the source names, as its index, at compile time: US("Moving"). A name that is no EUnitState does not compile.
+consteval int US(std::string_view s) {
+  const int i = UnitStateIndex(s);
+  if (i == 0) throw "not an EUnitState name";
+  return i;
+}
 class UnitStateSet {
  public:
   using Names = std::set<std::string, std::less<>>;
@@ -147,7 +160,31 @@ class UnitStateSet {
     names_.erase(it);
     return 1;
   }
+  // By a known state's index (US("Moving")): the bit alone. For a known name the bit and the set's entry are always set
+  // and cleared together (insert / erase above, Insert / Erase here), so the set is touched only when the bit changes:
+  // the same set, in the same order, as insert / erase by the name give (speed only, 2026-10-30: the string tests
+  // were 2.1% of B1's beat time and 3.8% of B3-16k's).
+  bool Has(int i) const { return (bits_ >> i) & 1u; }
+  void Insert(int i) {
+    if (Has(i)) return;
+    bits_ |= uint64_t{1} << i;
+    names_.emplace(kUnitStateNameOf[i]);
+  }
+  size_t Erase(int i) {
+    if (!Has(i)) return 0;
+    bits_ &= ~(uint64_t{1} << i);
+    names_.erase(names_.find(std::string_view(kUnitStateNameOf[i])));
+    return 1;
+  }
+  // MOHO64_VERIFY_STATES (sim.cpp, each beat's end): the bits are what the set holds, for every known name.
+  bool BitsAgree() const {
+    uint64_t b = 0;
+    for (const std::string& n : names_)
+      if (const int i = UnitStateIndex(n)) b |= uint64_t{1} << i;
+    return b == bits_;
+  }
   size_t size() const { return names_.size(); }
+  const uint64_t* bitsAddress() const { return &bits_; }  // (a read noted by a speculation: core/speculate.h)
   Names::const_iterator begin() const { return names_.begin(); }
   Names::const_iterator end() const { return names_.end(); }
 
@@ -156,11 +193,45 @@ class UnitStateSet {
   uint64_t bits_ = 0;
 };
 
+// A unit's or projectile's layer name ("Land", "Air", "Water", "Sub", "Seabed", ...): a std::string and nothing more (the
+// same object, the same bytes: landnav.cpp's read log packs its size and characters), whose compare with a string literal takes the
+// literal's length from its type: a length test and a compare of those bytes, instead of the library's strlen of the
+// literal before its compare. The same answer for every string (speed only, 2026-10-31: the layer tests' strlen and
+// compares were about 1% of B1's beat time). A compare with anything else (another layer, a const char* constant, a
+// std::string) is the library's. MOHO64_VERIFY_LAYER=1: every literal compare is also made the library's way and the
+// two answers compared; the counts go to stderr at exit (sim.cpp).
+inline const bool g_verifyLayer = std::getenv("MOHO64_VERIFY_LAYER") != nullptr;
+inline std::atomic<uint64_t> g_layerChecked{0}, g_layerMismatches{0};
+struct LayerString : std::string {
+  using std::string::string;
+  using std::string::operator=;
+  LayerString(const std::string& s) : std::string(s) {}
+  LayerString(std::string&& s) : std::string(std::move(s)) {}
+  template <size_t N>
+  bool Is(const char (&lit)[N]) const {
+    const bool r = size() == N - 1 && std::memcmp(data(), lit, N - 1) == 0;
+    if (g_verifyLayer) [[unlikely]] {
+      g_layerChecked.fetch_add(1, std::memory_order_relaxed);
+      if (r != (static_cast<const std::string&>(*this) == static_cast<const char*>(lit)))
+        g_layerMismatches.fetch_add(1, std::memory_order_relaxed);
+    }
+    return r;
+  }
+};
+template <size_t N>
+bool operator==(const LayerString& a, const char (&lit)[N]) { return a.Is(lit); }
+template <size_t N>
+bool operator!=(const LayerString& a, const char (&lit)[N]) { return !a.Is(lit); }
+template <size_t N>
+bool operator==(const char (&lit)[N], const LayerString& a) { return a.Is(lit); }
+template <size_t N>
+bool operator!=(const char (&lit)[N], const LayerString& a) { return !a.Is(lit); }
+
 class Unit : public Entity {
  public:
   Unit() { typeBits |= kTypeUnit; }
   const UnitBpData* bpData = nullptr;
-  std::string layer = "None";
+  LayerString layer = "None";
   std::vector<UnitWeapon*> weapons;
   // The attacker's task stage (attacker+0x44): each weapon's fire task (false) and acquire task (true), in the
   // order they run. A fire thread that was suspended goes to the end when it is woken (WakeFireThread).
@@ -330,6 +401,8 @@ class Unit : public Entity {
   std::vector<uint32_t> blipCacheFake; // per entry: the jammer's FAKE blip the entry is (its entity handle), else 0
   uint32_t blipCacheTick = 0;
   bool blipCacheValid = false;
+  // MOHO64_PAR_NAV: the navigator's turn played ahead is item navSpecItem of round navSpecRound (sim/landnav.cpp)
+  uint32_t navSpecItem = 0, navSpecRound = 0xffffffffu;
   Vec3 lastPosition;               // position at the start of the tick (blacklist reset)
   Quat lastOrientation;            // orientation at the start of the tick (with lastPosition)
   Quat prevLastOrientation;        // ... and at the start of the tick before (the entity's previous transform)
@@ -399,7 +472,7 @@ class Projectile : public Entity {
   Projectile() { typeBits |= kTypeProjectile; }
   Entity* launcher = nullptr;
   Vec3 velocity;  // units per second
-  std::string layer = "None";
+  LayerString layer = "None";
   // Motion (sim/projectile.cpp; the original's Projectile, ctor 0x69afe0)
   Vec3 angVel, scaleVel;
   // The size its mesh is drawn at, per axis (the original's entity scale, +0x84): UniformScale +- MeshScaleRange

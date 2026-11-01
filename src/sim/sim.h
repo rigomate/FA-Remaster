@@ -5,6 +5,7 @@
 // and their brains are created (OnCreateArmyBrain), then BeginSession().
 #pragma once
 #include <cstdio>
+#include <cstdlib>
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
@@ -23,6 +24,7 @@ template <class Out>
 class Speculation;
 struct SurfaceContacts;
 struct AimAhead;
+struct NavAhead;
 }
 #include "sim/blueprints.h"
 #include "sim/economy.h"
@@ -125,6 +127,10 @@ class AiBrain : public ScriptObject {
 
 template <> struct ScriptTypeOf<AiBrain> { static constexpr uint32_t bit = kTypeBrain; };
 
+// The beat's order (docs/parallel-mode.md): the original's, bit for bit (every replay of the original, the gate), or
+// parallel order, our own (new games: the same result at any thread count). Sim::order, decided by Start.
+enum class SimOrder { kOriginal, kParallel };
+
 class Sim {
  public:
   Sim(Vfs* vfs, std::vector<std::string> hookDirs, std::vector<std::string> modUids);
@@ -145,7 +151,7 @@ class Sim {
   // into the sim's state, and the host takes it with TakeRules once Start is done (nullptr when not kept or
   // already taken), copies what it needs into its own state and frees it. Nothing of the sim's state is in it.
   bool keepRules = false;
-  std::unique_ptr<ScriptState> TakeRules();
+  std::unique_ptr<ScriptState> TakeRules();  // (out of line: ScriptState is incomplete here)
   // Start the session described by a replay header (no commands are played yet).
   bool Start(const ReplayHeader& replay);
   // Start the session a lobby launch describes (sim/session.h): the same start, with the launch's focus army.
@@ -434,6 +440,14 @@ class Sim {
   Speculation<SurfaceContacts>& surfaceSpec() { return *surfaceSpec_; }
   // ... and the aim controllers' muzzles (MOHO64_PAR_AIM; sim/combat.h AimMuzzlesAhead)
   AimAhead& aimAhead() { return *aimAhead_; }
+  // The navigators' turns played ahead (MOHO64_PAR_NAV; sim/landnav.cpp).
+  Speculation<NavAhead>& navSpec() { return *navSpec_; }
+  // The multicore switches' default (MOHO64_PAR_MOTION, AIM, NAV, PATH, RECON, BLIPS, INTELCOORDS): on in a game played with the
+  // engine's fixes (a new game; `fixes`, decided by Start(SessionDescription)) whose worker pool has more than one
+  // thread, off otherwise: the original's replays play as they always did, and at one thread the work made ahead
+  // would only be made twice. A switch given in the environment (MOHO64_PAR_<NAME>=0 / 1 / verify / ...) wins. Each
+  // is exact either way (the results are the serial ones, bit for bit), so this decides only the speed.
+  bool ParDefault() const;
   // The command stage (0x958) runs the units' command threads oldest first; a thread suspended on a
   // move and resumed by its navigator is re-linked at the stage's new end (beat_order.md 2.6).
   const std::vector<Unit*>& CommandOrder();
@@ -466,12 +480,53 @@ class Sim {
     if (x1 < 0 || z1 < 0) return;
     for (int cz = cz0; cz <= cz1; ++cz)
       for (int cx = cx0; cx <= cx1; ++cx)
-        for (Unit* u : grid_[static_cast<size_t>(cz) * gridW_ + cx]) {
+        for (const UnitGridEntry& e : grid_[static_cast<size_t>(cz) * gridW_ + cx]) {
+          Unit* u = e.u;
           const Vec3& p = u->position;
           if (p.x >= x0 && p.x <= x1 && p.z >= z0 && p.z <= z1) f(u);
         }
   }
+  // One unit in that grid, with its army and the end of its run: the index after the cell's consecutive entries of the
+  // same army (a cell is filled in id order, and ids are army-major, so each army's units in a cell are one run). A unit
+  // keeps its army for life, so the copy is the unit's own (MOHO64_VERIFY_UNITGRID checks it at every entry looked at).
+  struct UnitGridEntry {
+    Unit* u;
+    const Army* army;
+    uint32_t runEnd;
+  };
+  // ForUnitsInRect for the units whose army is neither `skip`'s own nor allied to it (Relation 2) nor none: a run of such
+  // an army's entries is passed over at once, without touching its units (B3-16k 2026-10-31: BlipsInRange walked a
+  // packed army's own units for 4% of the beat time). The units are given cell by cell, run by run: for a caller to whom
+  // the order does not matter (BlipsInRange sorts what it keeps).
+  template <class F>
+  void ForNonAlliedUnitsInRect(const Army* skip, float x0, float z0, float x1, float z1, F&& f) {
+    if (gridDirty_) RebuildUnitGrid();
+    int cx0 = std::max(0, static_cast<int>(x0) >> 4), cz0 = std::max(0, static_cast<int>(z0) >> 4);
+    int cx1 = std::min(gridW_ - 1, static_cast<int>(x1) >> 4), cz1 = std::min(gridH_ - 1, static_cast<int>(z1) >> 4);
+    if (x1 < 0 || z1 < 0) return;
+    for (int cz = cz0; cz <= cz1; ++cz)
+      for (int cx = cx0; cx <= cx1; ++cx) {
+        const std::vector<UnitGridEntry>& c = grid_[static_cast<size_t>(cz) * gridW_ + cx];
+        for (uint32_t i = 0, n = static_cast<uint32_t>(c.size()); i < n;) {
+          const UnitGridEntry& e = c[i];
+          if (kVerifyUnitGrid) [[unlikely]] VerifyUnitGridEntry(e);
+          if (!e.army || ArmyRelation(skip, e.army) == 2) {
+            i = e.runEnd;
+            continue;
+          }
+          ++i;
+          Unit* u = e.u;
+          const Vec3& p = u->position;
+          if (p.x >= x0 && p.x <= x1 && p.z >= z0 && p.z <= z1) f(u);
+        }
+      }
+  }
+  static int ArmyRelation(const Army* a, const Army* b);  // (combat.cpp Relation)
+  static inline const bool kVerifyUnitGrid = std::getenv("MOHO64_VERIFY_UNITGRID") != nullptr;
+  static void VerifyUnitGridEntry(const UnitGridEntry& e);
+  static void VerifyUnitGridList(bool same);  // BlipsInRange's two lists agreed or not (counts at exit)
   void MarkUnitsMoved() { gridDirty_ = true; }
+  bool UnitGridDue() const { return gridDirty_; }  // (the next ForUnitsInRect / EnsureUnitGrid rebuilds it)
   // The unit grid behind ForUnitsInRect made now if it is due (the searches' pre-pass, sim/hpath.h).
   void EnsureUnitGrid() {
     if (gridDirty_) RebuildUnitGrid();
@@ -497,6 +552,15 @@ class Sim {
   // game's Lua are the hook files of the repository's data/fixes/hook, given to the sim state only with `fixes`
   // (and to the rules state, loaded again, in a game with a mod a blueprint fix is for: RulesFixesWanted).
   bool fixes = false;
+  // The beat's order (docs/parallel-mode.md 5), decided by Start(SessionDescription) after `fixes`: the session's
+  // simOrder, else the scenario's Options.RemasterSimOrder (missing: the original's); MOHO64_SIM_ORDER=original |
+  // parallel overrides it. Parallel order needs the fixes (a session asking for it without them does not start).
+  // orderVersion: the parallel order's version the game was made with (Options.RemasterSimOrderVersion; 0 for the
+  // original's order); kSimOrderVersion is this engine's. (Step 1 of the plan: nothing reads the order yet.)
+  SimOrder order = SimOrder::kOriginal;
+  int orderVersion = 0;
+  static constexpr int kSimOrderVersion = 1;
+  bool ParallelOrder() const { return order == SimOrder::kParallel; }
   // The session's mod list as the lobby sent it (a replay's serialized mods): becomes
   // __active_mods in the rules and sim states. Empty: built from the mod uids instead.
   std::string sessionMods;
@@ -639,7 +703,7 @@ class Sim {
   std::vector<Unit*> dirtyOrder_;
   uint64_t dirtySeqNext_ = 0;
   bool dirtyOrderDirty_ = true;
-  std::vector<std::vector<Unit*>> grid_;
+  std::vector<std::vector<UnitGridEntry>> grid_;
   int gridW_ = 0, gridH_ = 0;
   bool gridDirty_ = true;
   void RebuildUnitGrid();
@@ -678,6 +742,7 @@ class Sim {
   std::unique_ptr<WorkerPool> workers_;  // MOHO64_THREADS (core/workers.h): made once per Sim
   std::unique_ptr<Speculation<SurfaceContacts>> surfaceSpec_;  // MOHO64_PAR_MOTION
   std::unique_ptr<AimAhead> aimAhead_;                         // MOHO64_PAR_AIM
+  std::unique_ptr<Speculation<NavAhead>> navSpec_;  // MOHO64_PAR_NAV
   bool armorLoaded_ = false;
   std::map<std::string, std::map<std::string, float>> armorTypes_;  // armour type -> damage type -> multiplier
 

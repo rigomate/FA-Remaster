@@ -28,6 +28,14 @@ struct Pose {
   const FrameBone* next = nullptr;
   size_t nextCount = 0;
   float blend = 0;
+  // [machinery] bones from `scaleFrom` on (`scaleCount` of them) scaled in their own axes at rest by `scales` (x, y, z each;
+  // a factory's parts: machinery.h); none: all at their size
+  const float* scales = nullptr;
+  uint32_t scaleFrom = 0, scaleCount = 0;
+  // [machinery] how strongly bones from `glowFrom` on glow (`glowCount` of them; 1: as their texture says): a structure's
+  // lit pieces pulsing with their lamp. Only for a model whose machinery has glows (MachinerySpec::glows)
+  const float* glows = nullptr;
+  uint32_t glowFrom = 0, glowCount = 0;
 };
 
 class MeshRenderer {
@@ -56,6 +64,9 @@ class MeshRenderer {
   // The battle scars and snow of the model added last (unit_wear.h; World::unitScars, unitSnow): its look this frame,
   // its marks laid in the bone buffer after the shells' hits (Prepare). Without it a model wears nothing of its own.
   void Wear(const WearLook& look);
+  // [machinery] The model just added is a factory whose belt has moved `amount` along its strip (Machinery::PoseUnit;
+  // below 0: none). Not with a ghost's tint or treads.
+  void Belt(float amount);
   // Scenery that stands still (trees, rocks), in groups (one square of the map's): the renderer keeps
   // each group from one frame to the next, so a frame only says which groups it lists (ListGroup,
   // after Begin), not where each tree stands and how large it is. A group is filled anew

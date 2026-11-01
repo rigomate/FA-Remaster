@@ -81,11 +81,21 @@ struct PathTraveler {
   const void* prepScanned = nullptr;
   uint64_t prepEpoch = 0;
   int prepBox[4] = {0, 0, 0, 0};
+  // HPathTables::SearchesAhead: the round (beat) and the item its search was played ahead as
+  uint32_t aheadRound = 0xffffffffu, aheadItem = 0;
+};
+
+// MOHO64_PAR_PATH: set on a worker while it plays a search ahead; a step that would write shared state (Ready of a
+// dirty or stale cluster, a map or grid made, the unit grid made) throws PathAheadStop instead.
+extern thread_local bool tl_pathAheadDry;
+struct PathAheadStop {
+  int why = 0;  // 1 a dirty cluster, 2 a stale one, 3 no map or grid, 4 the unit grid due, 5 a category cache
 };
 
 class HPathTables {
  public:
-  explicit HPathTables(Navigation* nav, int mapW, int mapH) : nav_(nav), w_(mapW), h_(mapH) {}
+  HPathTables(Navigation* nav, int mapW, int mapH);
+  ~HPathTables();
   // The sim's playable rect (Sim::playableRect, x0 z0 x1 z1), read live by EdgeAllowed as IsInBounds 0x5aa680 reads
   // the STIMap's; null = the whole map.
   const int* playRect = nullptr;
@@ -100,6 +110,17 @@ class HPathTables {
   void Cancel(PathTraveler* t);
   // CArmyImpl::OnTick: every army's queue with 2500 work units.
   void WorkAll(int armies);
+  // MOHO64_PAR_PATH (multicore, the path searches; core/speculate.h), just before WorkAll (after PrepareSearches):
+  // every army's carried search (on a copy, with the 2500 work units it will have) and its next waiting searches (no
+  // limit) played on `pool` by the same code, each up to the first step that would write shared state (a dirty or
+  // stale cluster, a map or grid not made yet, a due unit grid), that step left undone. WorkAll takes a search's
+  // result when its army's work units left cover the steps: the serial loop would have made the same steps from the
+  // same state, as nothing in the loop changes a clean cluster, a unit or a grid. A stopped one goes on serially.
+  void SearchesAhead(WorkerPool& pool, uint32_t round);
+  // MOHO64_PAR_PATH's default, settled once per sim at the stage's first beat (the sim's ParDefault: a game with the
+  // engine's fixes and more than one thread); a value given in the environment wins. Its minimum: searches played
+  // ahead in a beat (all armies' together), below which none is (on:N overrides).
+  void SettleSearchesAhead(bool defaultOn);
   // Synchronous search (CanPathTo's direct probe, 500 units).
   bool SearchNow(PathTraveler* t, int budget);
   // Multicore step 2a, before WorkAll: what the queued searches would make lazily, made now: the occupancy grids
@@ -300,6 +321,18 @@ class HPathTables {
   std::vector<ClusterMap*> mapOrder_;
   std::map<int, ArmyQueue> queues_;
   bool inWork_ = false;  // (WorkAll runs: for aheadCounts.lazyInWork)
+  struct PathSpec;
+  std::unique_ptr<PathSpec> spec_;  // MOHO64_PAR_PATH
+  ClusterMap* DryMap(const NamedFootprint& fp);
+  // (MOHO64_PAR_PATH) a stale cluster a search played ahead read with its data made ahead: Make at the take
+  struct StaleMade {
+    ClusterMap* m;
+    int L, cx, cz;
+  };
+  static thread_local std::vector<StaleMade>* tl_staleMade;
+  void PlayAhead(Search& s, const Search* from, PathTraveler* t, int start, int* steps, int* r, int* why = nullptr,
+                 std::vector<StaleMade>* made = nullptr);
+  bool SameSearch(const Search& a, const Search& b, std::string* why) const;
 };
 
 // Octile distance in the original's float order (max + 0.41421354 * min).

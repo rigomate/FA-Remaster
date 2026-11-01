@@ -4,14 +4,18 @@
 #include "app/window.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
+#include <map>
 #include <mutex>
+#include <set>
 #include <thread>
 #if defined(__APPLE__)
 #include <pthread.h>
@@ -23,11 +27,14 @@
 #include "core/vfs.h"
 #include "core/workers.h"
 #include "maui/font.h"
+#include "net/beat_exchange_net.h"
+#include "net/lobby_core.h"
 #include "script/script_state.h"
 #include "sim/blueprints.h"
 #include "sim/command_stream.h"
 #include "sim/command_writer.h"
 #include "sim/fingerprint.h"
+#include "sim/lockstep.h"
 #include "sim/moments.h"
 #include "sim/replay.h"
 #include "sim/session.h"
@@ -41,6 +48,7 @@
 #endif
 
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 
 #include "sim/sim_view.h"
@@ -1095,7 +1103,93 @@ std::FILE* OpenForWriting(const std::filesystem::path& file) {
 }
 }  // namespace
 
-bool GameSession::Launch(lua_State* L, int config, std::string* why) {
+// A network game's beats (LaunchNetwork): the lockstep over the lobby's connector, and the session's clients.
+struct GameSession::Net {
+  std::unique_ptr<net::NetBeatExchange> exchange;
+  std::unique_ptr<Lockstep> lockstep;
+  std::vector<NetClient> clients;  // (in client order; their links asked when shown: NetClients)
+  uint8_t local = 0;
+  bool readySent = false;      // (NetReady: READY sent, the lockstep started)
+  bool everyoneReady = false;  // (every client READY or ejected: the beats run)
+  bool waitingShown = false;   // (the provider's waiting dialog asked for)
+  NetEvents events;            // (for the interface's next frame: NetGameLink::TakeEvents)
+  std::atomic<uint32_t> corruptAt{0};  // (moho64ui_NetTestForTests("corrupt", beat): our checksum of that beat changed)
+  std::unique_ptr<NetGameLink> link;
+  bool waiting = false;
+  std::chrono::steady_clock::time_point waitingSince{};
+  bool waitTold = false;
+  uint32_t beat = 0;      // the beat whose orders were taken last
+  bool afterDue = false;  // (that beat has run, or runs on its thread: AfterBeat is due)
+  std::string digest;     // its state's digest, every 50th beat (made on the thread that ran it, read after it)
+  // (ours, after a desync: NetSendParts / NetCompareParts) this copy's state line of the last checksum beats (the
+  // engine's Fingerprint::StateLine without its lua part: the line LockstepDigest hashes), and of each of the last
+  // beats its pulse (the random draws so far, the units, the projectiles: a few numbers read, for the first beat a
+  // desync shows in). Both made in NetDigest on the thread that ran the beat and read here after it, as `digest`.
+  std::vector<std::pair<uint32_t, std::string>> lines;
+  struct Pulse {
+    uint32_t beat = 0;
+    uint64_t draws = 0;
+    uint32_t units = 0, projectiles = 0;
+  };
+  std::array<Pulse, 128> pulses{};
+  std::map<uint8_t, uint32_t> firstDesync;           // per client, the checksum beat it was first out of step at
+  std::set<std::pair<uint8_t, uint32_t>> partsSent;  // (client, beat)
+  bool desyncFileStarted = false;
+  std::string detailPath;  // where the full listing of beat detailAt goes (asked for at the game's first desync)
+  uint32_t detailAt = 0;
+  bool detailAsked = false;
+  // the test switches that change this copy's state or its line (NetTestSwitch; set before the game's beats come)
+  std::string corruptPart;
+  std::atomic<uint32_t> moveAt{0}, drawAt{0};
+  std::atomic<int> moveArmy{0};
+  // MOHO64UI_NET_BEAT_LOG=1 (tests): a line per beat, when it began, how long it waited for its orders and how much
+  // of that with every client's orders in (the wait for the ACKs); see NetBeatOrders
+  std::chrono::steady_clock::time_point askedAt{}, inAt{}, lastBegun{};
+  uint32_t askedFor = 0;
+  bool inSeen = false;
+  // (message 57, this program's maxSP: GameSession::measure_, the same in every game)
+};
+
+// The interface's side of it (user/user_state.h): what GetSessionClients, EjectSessionClient, SessionSendChatMessage
+// and SetGameSpeed ask of the game, and the events for the next frame.
+class NetLinkOf final : public NetGameLink {
+ public:
+  explicit NetLinkOf(GameSession* session) : session_(session) {}
+  std::vector<SessionClient> Clients() override {
+    std::vector<SessionClient> out;
+    for (const GameSession::NetClient& c : session_->NetClients()) {
+      SessionClient s;
+      s.name = c.name, s.uid = c.uid, s.connected = c.connected, s.local = c.local, s.ping = c.ping, s.quiet = c.quiet;
+      s.sources = c.sources, s.ejectedBy = c.ejectedBy, s.maxSP = c.maxSP;
+      out.push_back(std::move(s));
+    }
+    return out;
+  }
+  void Eject(int client) override { session_->NetEject(client); }
+  void SendChat(const std::vector<int>& clients, const std::string& message) override { session_->NetChat(clients, message); }
+  void RequestSpeed(int rate) override { session_->NetSpeed(rate); }
+  NetEvents TakeEvents() override { return session_->NetTakeEvents(); }
+  void TestSwitch(const std::string& what, uint32_t beat, const std::string& arg) override {
+    session_->NetTestSwitch(what, beat, arg);
+  }
+
+ private:
+  GameSession* session_;
+};
+
+uint32_t GameSession::InputDelay(int rate) {
+  const double msPerBeat = 100.0 / std::pow(10.0, rate / 10.0);
+  return static_cast<uint32_t>(std::floor(kNetLagMs / msPerBeat + 1e-9));
+}
+
+bool GameSession::Launch(lua_State* L, int config, std::string* why) { return LaunchWith(L, config, nullptr, why); }
+
+bool GameSession::LaunchNetwork(lua_State* L, int config, net::LobbyCore* lobby, std::string* why) {
+  return LaunchWith(L, config, lobby, why);
+}
+
+// (lobby: a network game's lobby; nullptr: a local game)
+bool GameSession::LaunchWith(lua_State* L, int config, net::LobbyCore* lobby, std::string* why) {
   if (config < 0) config = lua_gettop(L) + config + 1;
   if (sim_ || Loading()) {
     *why = "a session is running already";
@@ -1105,7 +1199,86 @@ bool GameSession::Launch(lua_State* L, int config, std::string* why) {
   SessionDescription session;
   LaunchParams params;
   params.seed = seedGiven ? seed : static_cast<uint32_t>(t0.time_since_epoch().count());
+  if (lobby) {  // (the launch info: the seed is the host's nonce, lobby+0xc4; the focus army by our uid, lobby+0xac)
+    params.seed = lobby->Nonce();
+    params.localOwner = lobby->Uid();
+    params.network = true;
+  }
   if (!SessionFromGameConfig(L, config, params, &session, why)) return false;
+
+  // The session's clients (CLobby::LaunchGame 0x7c38c0): the human armies in army order, then the observers, each
+  // owner given a client index (AssignClientIndex 0x7c4e80, called at 0x7c468c / 0x7c4949) and a command source
+  // (AssignCommandSource 0x7c4f60, at 0x7c46b8 / 0x7c497d) on its first appearance, both counted from 0 in the same
+  // walk: so client i speaks for source i, and the host is client 0 only when it has the first human army.
+  std::unique_ptr<Net> net;
+  if (lobby) {
+    net = std::make_unique<Net>();
+    std::vector<int> owners;
+    auto note = [&](int owner, const std::string& name) {
+      for (int o : owners)
+        if (o == owner) return;
+      NetClient c;
+      c.uid = owner, c.name = name, c.client = static_cast<uint8_t>(owners.size());
+      c.sources.push_back(static_cast<int>(owners.size()));
+      c.local = owner == lobby->Uid();
+      owners.push_back(owner);
+      net->clients.push_back(c);
+    };
+    auto ownerOf = [&](int t) {  // (OwnerID is a string read with _atol, 0x7c461c; PlayerName beside it)
+      lua_getfield(L, t, "OwnerID");
+      const int owner = lua_isstring(L, -1) ? std::atoi(lua_tostring(L, -1)) : 0;
+      lua_getfield(L, t, "PlayerName");
+      const std::string name = lua_isstring(L, -1) ? lua_tostring(L, -1) : "";
+      lua_pop(L, 2);
+      note(owner, name);
+    };
+    const int top = lua_gettop(L);
+    for (const ReplayHeader::Army& a : session.header.armies) {
+      if (a.sources.empty()) continue;  // (not human: no client, no source)
+      if (PushSerializedLua(L, a.options) && lua_istable(L, -1)) ownerOf(lua_gettop(L));
+      lua_settop(L, top);
+    }
+    lua_getfield(L, config, "Observers");
+    if (lua_istable(L, -1)) {
+      lua_pushnil(L);
+      while (lua_next(L, top + 1) != 0) {
+        if (lua_istable(L, -1)) ownerOf(lua_gettop(L));
+        lua_pop(L, 1);
+      }
+    }
+    lua_settop(L, top);
+    if (net->clients.size() != session.header.sources.size())
+      Logf(LogLevel::Warning, "moho64ui: the network game has %zu clients but %zu command sources", net->clients.size(),
+           session.header.sources.size());
+    bool inIt = false;
+    for (const NetClient& c : net->clients)
+      if (c.local) inIt = true, net->local = c.client;
+    if (!inIt) {  // INFERRED: the original would go on with no client of its own (index -1); we refuse
+      *why = "this player is neither a player nor an observer of the game";
+      return false;
+    }
+    // The lobby's network goes to the game; each other client is the lobby's connection to its uid (none: lost).
+    net::GameLink link = lobby->TakeForGame();
+    std::vector<net::GameClient> peers;
+    std::vector<LockstepClient> all;
+    for (const NetClient& c : net->clients) {
+      all.push_back(LockstepClient{c.client, c.sources});
+      if (c.local) continue;
+      auto it = link.connByUid.find(c.uid);
+      peers.push_back(net::GameClient{c.client, it != link.connByUid.end() ? it->second : 0});
+      if (it == link.connByUid.end())
+        Logf(LogLevel::Warning, "moho64ui: the network game's client %u (%s, uid %d) has no connection", c.client, c.name.c_str(),
+             c.uid);
+    }
+    net->exchange = std::make_unique<net::NetBeatExchange>(std::move(link.connector), net->local, std::move(peers),
+                                                           session.adjustableSpeed, session.gameSpeed);
+    net->exchange->TakeEarly(std::move(link.early));
+    const uint32_t delay = InputDelay(session.gameSpeed);
+    net->lockstep = std::make_unique<Lockstep>(net->exchange.get(), net->local, std::move(all), delay);
+    net->link = std::make_unique<NetLinkOf>(this);
+    Logf(LogLevel::Info, "moho64ui: a network game: %zu clients, this one is client %u (uid %d); input delay %u beats; seed %u",
+         net->clients.size(), net->local, lobby->Uid(), delay, session.header.seed);
+  }
 
   // The session's mods are the configuration's GameMods, by uid, in order.
   lua_getfield(L, config, "GameMods");
@@ -1125,13 +1298,18 @@ bool GameSession::Launch(lua_State* L, int config, std::string* why) {
     lua_pop(L, 1);
   }
   lua_pop(L, 1);
+  // (a network game runs no beats behind the loading screen (those are ours): its beats wait for every client's READY,
+  // which each one sends once its game screen is up)
+  if (lobby) aheadable_ = false;
   profile_ = ProfileName(L);
   playData_.clear();
   play_.reset();
   PrepareSession(session, uids);
+  net_ = std::move(net);
   last_ = std::make_unique<SessionDescription>(session);
   lastUids_ = uids;
   lastWasReplay_ = false;
+  lastWasNetwork_ = net_ != nullptr;
   return true;
 }
 
@@ -1169,6 +1347,7 @@ bool GameSession::LaunchSinglePlayer(lua_State* L, int info, std::string* why) {
   last_ = std::make_unique<SessionDescription>(session);
   lastUids_ = uids;
   lastWasReplay_ = false;
+  lastWasNetwork_ = false;
   return true;
 }
 
@@ -1253,6 +1432,7 @@ bool GameSession::LaunchReplay(lua_State* L, const std::string& file, std::strin
   last_ = std::make_unique<SessionDescription>(session);
   lastUids_ = uids;
   lastWasReplay_ = true;
+  lastWasNetwork_ = false;
   Logf(LogLevel::Info, "moho64ui: playing the replay %s (%zu bytes, %zu armies)", file.c_str(), playData_.size(), h->armies.size());
   return true;
 }
@@ -1353,6 +1533,7 @@ void GameSession::End() {
   if (sounds) sounds->StopWorld();
   onSync = nullptr;
   takeOrders = nullptr;
+  net_.reset();  // (its connections close: the other players hear us gone)
   picture_.reset();
 #ifdef MOHO64UI_WORLD_PICTURE
   // The window's picture stays: the game's world in it is not shown any more (the interface over black) until the
@@ -1380,6 +1561,10 @@ void GameSession::End() {
 bool GameSession::Relaunch(std::string* why) {
   if (!last_) {
     *why = "no game was launched";
+    return false;
+  }
+  if (lastWasNetwork_) {  // (FAF's scripts offer no restart in a multiplayer game: chat command Restart.lua)
+    *why = "a network game cannot be started over";
     return false;
   }
   relaunching_ = lastWasReplay_;  // (a replay starting over keeps its timeline: its moments, a jump back under way)
@@ -1491,6 +1676,7 @@ std::string GameSession::LoadingMapFolder() const {
 // skirmish's second frame at 4K). Its rule: a picture handed a session is beaten only once swapped in (a map let go of
 // is never beaten: LetGoOfGameMap).
 void GameSession::ServeLoad() {
+  if (net_) net_->exchange->Service();  // (a network game: the others keep hearing from this program while it loads)
 #ifdef MOHO64UI_WORLD_PICTURE
   if (load_ != Load::Running || loadPrepared_ || BeatRunning() || !loadOk_ || !loadSim_) return;
   if (!windowPicture_ || windowPicture_->pending != WindowPicture::Kind::Game) return;
@@ -1549,6 +1735,13 @@ bool GameSession::FinishLoad(std::string* why) {
   PostPrints(*sim_);  // (what the scripts printed while the session started: the original's setup sync)
   pendingSync_.clear();
   if (session.focusArmy >= 0 && session.focusArmy < static_cast<int>(h.armies.size())) commandSource_ = h.armies[session.focusArmy].source;
+  // (a network game: this client's own source, the one AssignCommandSource gave its owner, CLobby::LaunchGame 0x7c46b8 /
+  // 0x7c497d; a player's is its army's, an observer's commands no army (its orders reach every sim and are dropped
+  // there, Sim::IssueCommand 0x749290); without this an observer's orders named source 0, the host's, and the
+  // lockstep dropped them as not its own)
+  if (net_)
+    for (const NetClient& c : net_->clients)
+      if (c.local && !c.sources.empty()) commandSource_ = c.sources.front();
   modUids_ = uids;
   sessionMods_ = h.mods;
   map_ = h.map;
@@ -1557,6 +1750,7 @@ bool GameSession::FinishLoad(std::string* why) {
   due_ = 0;
   StartReplayFile(session);
   if (stream_) std::fclose(stream_), stream_ = nullptr;
+  recordBase_.clear();
   if (!replayOut.empty()) {  // the game's record: see the header
     const std::string base = replayOut + (recorded_ ? "." + std::to_string(recorded_ + 1) : "");
     const std::string table = TableFile();
@@ -1569,6 +1763,7 @@ bool GameSession::FinishLoad(std::string* why) {
     lastTable_ = table;
     tableAgain_ = false;
     ++recorded_;
+    recordBase_ = base;
     stream_ = std::fopen((base + ".stream").c_str(), "wb");
     if (!stream_) Logf(LogLevel::Warning, "moho64ui: cannot write %s.stream", base.c_str());
     else Logf(LogLevel::Info, "moho64ui: this game is recorded in %s.stream (seed %u)", base.c_str(), h.seed);
@@ -1606,8 +1801,20 @@ bool GameSession::FinishLoad(std::string* why) {
     fpBeats_ = 0;
     fpPlayback_ = fp_ != nullptr;
   }
-  pace.rate = session.gameSpeed;
+  pace.rate = pace.asked = session.gameSpeed;
   pace.adjustable = session.adjustableSpeed;
+  // This program's maxSP afresh (the original's sim driver and client manager are made anew for each session): in a
+  // local game or a replay the local client's 50 until the first measure sent, or a test's value (MOHO64UI_FORCE_MAXSP,
+  // as if sent before the first beat).
+  measure_ = SpeedMeasure{};
+  pace.maxSP = 50;
+  pace.replay = play_ != nullptr;
+  if (const char* forced = std::getenv("MOHO64UI_FORCE_MAXSP"); forced && *forced && !net_) {
+    measure_.forced = true;
+    measure_.sent = pace.maxSP = std::atoi(forced);
+    Logf(LogLevel::Info, "moho64ui: our maxSP is %d (MOHO64UI_FORCE_MAXSP)", pace.maxSP);
+  }
+  if (!net_) pace.rate = pace.LocalRate();
   pictureDue_ = false;
   if (wantPicture) {
     // (A window that is still to come: the picture opens on it in its first frame,
@@ -2240,6 +2447,7 @@ bool GameSession::RunDueBeats(bool catchingUp) {
       }
       // (every beat its stream's orders first, as the engine's own player of the original's replays: so the recorded
       // game's pause and its resume are both applied; a paused beat while the recorded game is paused)
+      BeatOrdersTaken();  // (the beat's time for maxSP from here: its orders, then its tick)
       if (!play_->AtEnd() && play_->ApplyUntilAdvance(*sim_)) {
         if (sim_->Paused()) {
           sim_->PausedBeat();
@@ -2249,7 +2457,9 @@ bool GameSession::RunDueBeats(bool catchingUp) {
           return true;
         } else {
           TimedTick();
+          NoteBeatTime();
           FingerprintBeat();
+          MaxSimRate();
         }
       } else {
         continue;  // the replay is over: the game stands where it ended
@@ -2258,30 +2468,606 @@ bool GameSession::RunDueBeats(bool catchingUp) {
       DeliverBeatSync();
       continue;
     }
-    if (takeOrders) {
-      std::string orders = takeOrders();
-      Record(orders);
-      if (!orders.empty() && !ApplyCommands(*sim_, orders)) Logf(LogLevel::Warning, "moho64ui: an order was not understood by the simulation");
+    // The beat's orders: the player's own; in a network game every client's, merged (the engine's Lockstep: the
+    // player's go out to the others for a later beat), and a beat whose orders are not all in waits: the frame goes
+    // on without it (the picture keeps drawing, the interface runs).
+    std::string orders;
+    if (net_) {
+      if (!NetEveryoneReady()) {  // (the time waited does not pile up, as a replay's viewer's hold)
+        due_ = 0;
+        break;
+      }
+      if (takeOrders) net_->lockstep->Queue(takeOrders());
+      if (!NetBeatOrders(&orders)) {
+        due_ += 0.1;
+        if (!window) std::this_thread::sleep_for(std::chrono::milliseconds(1));  // (a run without a window: no spinning)
+        break;
+      }
+    } else if (takeOrders) {
+      orders = takeOrders();
     }
+    BeatOrdersTaken();  // (the beat's time for maxSP from here, in every game: MaxSimRate)
+    Record(orders);
+    if (!orders.empty() && !ApplyCommands(*sim_, orders)) Logf(LogLevel::Warning, "moho64ui: an order was not understood by the simulation");
+    // (a network game's beat 1 runs here, not before the game's screen: its fingerprint's beat 0 as RunFirstBeat's)
+    if (net_ && sim_->tick() == 0 && Fingerprinting()) fp_->Beat(*sim_, 0);
     if (sim_->Paused()) {
       // (recorded as every beat: the original's replays hold their paused beats (the engine: AIR 40, LAND 72), and
       // a paused beat changes the simulation's state, so a playback must run it too)
       sim_->PausedBeat();
+      NetDigest();
       Record(CommandWriter::AdvanceMessage(1));
       FingerprintBeat();
+      NetAfterBeat();
+      MaxSimRate();  // (a paused beat has no time: nothing goes in)
     } else if (onThread) {
       Record(CommandWriter::AdvanceMessage(1));
       StartBeatOnThread();
       return true;
     } else {
       TimedTick();
+      NoteBeatTime();
+      NetDigest();
       Record(CommandWriter::AdvanceMessage(1));
       FingerprintBeat();
+      NetAfterBeat();
+      MaxSimRate();
     }
     NoteBeat();
     DeliverBeatSync();
   }
   return false;
+}
+
+// A network game's next beat's orders: true with every client's, merged (and the beat's AfterBeat then due); false:
+// wait (a client's are not in). A wait of more than two seconds is logged once, with the clients missing.
+bool GameSession::NetBeatOrders(std::string* merged) {
+  Net& n = *net_;
+  const uint32_t beat = n.lockstep->nextBeat();
+  static const bool beatLog = std::getenv("MOHO64UI_NET_BEAT_LOG") != nullptr;
+  if (beatLog && n.askedFor != beat) n.askedFor = beat, n.askedAt = std::chrono::steady_clock::now(), n.inSeen = false;
+  if (!n.lockstep->Ready(merged)) {
+    const auto now = std::chrono::steady_clock::now();
+    if (beatLog && !n.inSeen && n.exchange->OrdersIn(beat)) n.inSeen = true, n.inAt = now;
+    if (!n.waiting) n.waiting = true, n.waitingSince = now, n.waitTold = false;
+    if (!n.waitTold && now - n.waitingSince > std::chrono::seconds(2)) {
+      n.waitTold = true;
+      std::string missing, lost;
+      for (const NetClient& c : n.clients) {
+        if (c.local) continue;
+        if (n.exchange->ReceivedBeats(c.client) < beat) missing += " " + std::to_string(c.client) + " (" + c.name + ")";
+      }
+      for (uint8_t c : n.exchange->LostClients()) lost += " " + std::to_string(c);
+      Logf(LogLevel::Info, "moho64ui: the network game waits for beat %u: missing from client(s)%s; lost:%s", beat,
+           missing.empty() ? " none" : missing.c_str(), lost.empty() ? " none" : lost.c_str());
+    }
+    return false;
+  }
+  if (beatLog) {
+    const auto now = std::chrono::steady_clock::now();
+    auto ms = [](std::chrono::steady_clock::duration d) { return std::chrono::duration<double, std::milli>(d).count(); };
+    Logf(LogLevel::Info, "moho64ui: net beat %u: %.1f ms since the last began; waited %.1f ms, %.1f of it with every client's orders in",
+         beat, n.lastBegun.time_since_epoch().count() ? ms(now - n.lastBegun) : 0.0, ms(now - n.askedAt),
+         n.inSeen ? ms(now - n.inAt) : 0.0);
+    n.lastBegun = now;
+  }
+  if (n.waiting && n.waitTold) Logf(LogLevel::Info, "moho64ui: the network game goes on with beat %u", beat);
+  n.waiting = false;
+  n.beat = beat;
+  n.digest.clear();
+  n.afterDue = true;
+  return true;
+}
+
+// After a network game's beat, on the thread that ran it (the engine's: on the beats' thread right after the beat):
+// its digest for the checksum, every 50th beat only (not free). Beside it, ours for a desync (NetSendParts): the
+// beat's pulse (a few numbers read, every beat) and, every 50th beat, the state line the digest is made of (handed out
+// by LockstepDigest: ui request 51).
+void GameSession::NetDigest() {
+  if (!net_ || !net_->afterDue) return;
+  Net& n = *net_;
+  const uint32_t beat = n.beat;
+  // the test switches that change this copy's state, right after the beat's tick: a true desync from this beat on
+  if (beat == n.drawAt) {
+    sim_->NextUInt32();
+    Logf(LogLevel::Info, "moho64ui: beat %u: one random number more drawn on purpose (moho64ui_NetTestForTests)", beat);
+  }
+  if (beat == n.moveAt) {
+    Unit* pick = nullptr;
+    for (Unit* u : sim_->units())
+      if (u && !u->dead && u->army && u->army->index == n.moveArmy && (!pick || u->id < pick->id)) pick = u;
+    if (pick) {
+      pick->position.x += 0.25f;
+      Logf(LogLevel::Info, "moho64ui: beat %u: unit %#x of army %d moved on purpose (moho64ui_NetTestForTests)", beat,
+           pick->id, n.moveArmy.load());
+    }
+  }
+  Net::Pulse& p = n.pulses[beat % n.pulses.size()];
+  p.beat = beat;
+  p.draws = sim_->rngDraws_;
+  p.units = static_cast<uint32_t>(sim_->units().size());
+  p.projectiles = static_cast<uint32_t>(sim_->projectiles.size());
+  if (beat % kLockstepChecksumPeriod != 0) return;
+  std::string line;
+  n.digest = LockstepDigest(*sim_, beat, &line);
+  if (!n.detailPath.empty() && beat == n.detailAt) {  // (asked for at the game's first desync: NetAskDetail)
+    Fingerprint::WriteDetail(*sim_, beat, n.detailPath + ".detail." + std::to_string(beat),
+                             "the next checksum beat after the game's first desync");
+    if (FILE* f = std::fopen(n.detailPath.c_str(), "w")) {
+      std::fprintf(f, "%s\n", line.c_str());
+      std::fclose(f);
+    }
+    n.detailPath.clear();
+  }
+  if (const size_t lua = line.rfind(" lua="); lua != std::string::npos) line.resize(lua);  // (as LockstepDigest hashes it)
+  if (beat == n.corruptAt && !n.digest.empty()) {  // (the test switch: a desync on purpose)
+    n.digest[0] = static_cast<char>(n.digest[0] ^ 0x5a);
+    // (and, when named, that part of our line, as if the state's part differed: the state itself is left as it is)
+    const size_t at = n.corruptPart.empty() ? std::string::npos : line.find(" " + n.corruptPart + "=");
+    if (at != std::string::npos) {
+      const size_t end = line.find(' ', at + 1);
+      char& c = line[(end == std::string::npos ? line.size() : end) - 1];
+      c = c == '0' ? '1' : '0';
+    }
+    Logf(LogLevel::Info, "moho64ui: beat %u: our checksum is changed on purpose (moho64ui_NetTestForTests)%s%s", beat,
+         at != std::string::npos ? ", and our line's part " : "", at != std::string::npos ? n.corruptPart.c_str() : "");
+  }
+  n.lines.emplace_back(beat, std::move(line));
+  // (kept 300 beats: a peer's parts come a round trip after it found the desync, itself up to its input delay and its
+  // network behind)
+  n.lines.erase(std::remove_if(n.lines.begin(), n.lines.end(), [&](const auto& l) { return l.first + 300 < beat; }),
+                n.lines.end());
+}
+
+// Then, here: the lockstep hears of it (sends our checksum, compares the others'); a difference goes to the desync
+// dialog: as the original's CWldSession::DoBeat 0x894530 after a beat whose sync names desyncs, one
+// uimain.ShowDesyncDialog(beat, strings) (0x895434) with the beat just run (CWldSession+0x458, 0x895429) and, for
+// each difference, the name of the client whose checksum differs (0x895364: its entry in the session's client list;
+// GPGNET_ReportDesync 0x7b9ac0 beside it is not ours). Then ours: our parts of that beat to that client, and the
+// parts other clients sent compared with ours.
+void GameSession::NetAfterBeat() {
+  if (!net_ || !net_->afterDue) return;
+  net_->afterDue = false;
+  net_->lockstep->AfterBeat(net_->digest);
+  std::vector<LockstepDesync>& desyncs = net_->lockstep->desyncs();
+  std::vector<std::string> names;
+  for (const LockstepDesync& d : desyncs) {
+    Logf(LogLevel::Warning, "moho64ui: the network game is out of step at beat %u: client %u's checksum differs", d.beat, d.client);
+    std::string name;
+    for (const NetClient& c : net_->clients)
+      if (c.client == d.client) name = c.name;
+    names.push_back(name);
+    NetSendParts(d.client, d.beat);
+  }
+  if (!names.empty()) net_->events.desyncs.emplace_back(net_->beat, std::move(names));
+  desyncs.clear();
+  for (const auto& [client, bytes] : net_->exchange->TakeDesyncParts()) NetCompareParts(client, bytes);
+}
+
+namespace {
+// QuantizeSimRateSample 0x55ae10: 10 log10(x) (x87: ln x / ln 10.0 (the double at 0xe4f790), times 10.0f, stored as a
+// float), rounded down (frndint, then one less when the float is below it, 0x55ae45..0x55ae53). (Ours in double
+// precision where the original's is in the x87's extended one: the two differ only for a float a hair from a whole
+// number.)
+int QuantizeSimRateSample(float x) {
+  const float v = static_cast<float>(std::log(static_cast<double>(x)) / std::log(10.0) * 10.0);
+  return static_cast<int>(std::floor(v));
+}
+}  // namespace
+
+// This program's maxSP, after each beat, in every game: the original's sim driver after each dispatch (GPG's
+// 0x73da03..0x73dab5, the same in FAF's 0x128ff9f..0x1290051): unless the sim is paused (+0x68, set from the beat's
+// sync by FinalizeSyncDispatchLocked 0x73dcae; INFERRED that the sync's two fields it reads, +0x250 != -1 or +0x270,
+// mean the pause), the beat's time in ms (a Timer from the dispatch's start, 0x128fdf9, to after the sync:
+// CyclesToMilliseconds 0x9554e0) goes into the last 25's ring (when full, the oldest out: 24 kept, 0x128ffbd..
+// 0x1290008); their median (0x48bf00: the kept ones sorted, the one at count / 2) makes x = 1000 / median x 0.1
+// (single precision, 0x1290010..0x129001c: the beats a second this PC could run, over the 10 of normal speed), and
+// QuantizeSimRateSample(x) is sent when it differs from the value sent last (0x129003a..0x1290051: BroadcastIntParam,
+// the client manager's slot 16, 0x53e850: message 57 to every client, this one's own among them).
+// So a client whose beats take 100 ms sends 0, 10 ms 10, 1 ms 20, and the game runs at the smaller of the speed asked
+// for and every connected client's value (GetSimRate 0x53e720). A measure of this PC's speed: the copies' values
+// differ, never their simulations (the speed is not in the sim's state).
+// In every game alike (READ): the sim driver's Dispatch (0x73c250 -> 0x73c393: 0x73d8c0, FAF's jump to 0x128fde0)
+// asks nothing of the clients before it, and the path above only the pause. A single-player session's client manager
+// has one client, the local one (WLD_SetupSessionInfo 0x88cbc0 -> 0x88bbb0: CLIENT_CreateClientManager(1, ...) at
+// 0x88bcb9, CreateLocalClient at 0x88bceb), a replay's two, its CReplayClient (client 0, 0x876c45) and the local one
+// (0x876c9e); BroadcastIntParam gives message 57 to each client's Process: the local client takes it as its own
+// (CLocalClient::Process 0x53d190 -> CClientBase::Process: its +0xd4), a CReplayClient drops it (0x53d99c: types
+// above 53), so its +0xd4 stays the 50 of CClientBase's ctor (0x53be07). So: a network game sends our value to the
+// others (NetBeatExchange::RunRate holds the speed run down by every client's); a local game's or a replay's speed
+// run is the smaller of the speed asked for and ours (GamePace::LocalRate; a replay's 50 too).
+// Ours times the beat from its orders taken (BeatOrdersTaken, in RunDueBeats: a network game's when NetBeatOrders has
+// them, a local game's from the player, a replay's before its stream's) to the end of its tick (NoteBeatTime, on
+// whichever thread ran it); INFERRED: the original's span is the same work (its client manager's UpdateStates hands
+// the beat's messages to the sim, the Advance among them, CDecoder::DecodeAdvance 0x6e4400, runs it) and also holds
+// the sync's making, which ours does after it (TakeBeatSync).
+// Ours, not the original's: a local game or a replay measures only while its time follows the PC's clock
+// (paceByClock: a window, or MOHO64UI_REAL_TIME), not in a headless run's stepped frames (each waits for its beats,
+// so the PC always keeps up, and the run stays the same on a busy machine); and not the beats behind the loading
+// screen (the first, RunFirstBeat, and RunAhead's: M28's start among them, moved there so that the game starts
+// without its stall). A test's switch puts a value of its own in place of the measure (a network game's
+// moho64ui_NetTestForTests("maxsp"), a local game's or a replay's MOHO64UI_FORCE_MAXSP).
+void GameSession::NoteBeatTime() {
+  measure_.beatMs = sim_->Paused() ? -1.0  // (a paused beat has none: the sim driver skips it, 0x128ff9f)
+                                   : std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                                                measure_.ordersTakenAt).count();
+}
+
+void GameSession::MaxSimRate() {
+  SpeedMeasure& m = measure_;
+  const double ms = m.beatMs;
+  m.beatMs = -1;
+  if (ms < 0 || m.forced) return;
+  if (!net_ && (!paceByClock || aheadTo_)) return;
+  constexpr int kKept = 25;  // (RollingFloat<25>: SpeedMeasure::beatTimes)
+  if ((m.next + 1) % kKept == m.first) m.first = (m.first + 1) % kKept;
+  m.beatTimes[m.next] = static_cast<float>(ms);
+  m.next = (m.next + 1) % kKept;
+  std::array<float, kKept> sorted{};
+  size_t count = 0;
+  for (int i = m.first; i != m.next; i = (i + 1) % kKept) sorted[count++] = m.beatTimes[i];
+  std::sort(sorted.begin(), sorted.begin() + count);
+  const float median = sorted[count / 2];
+  if (!(median > 0)) return;  // (a beat of no time: none of ours; the original's would send INT_MIN)
+  const int value = QuantizeSimRateSample(1000.0f / median * 0.1f);
+  if (value == m.sent) return;
+  m.sent = value;
+  if (net_) {
+    net_->exchange->SendMaxSimRate(value);
+  } else {  // (the local client's +0xd4, and the speed run with it at once: GetSimRate asks it each time)
+    pace.maxSP = value;
+    pace.rate = pace.LocalRate();
+  }
+  static const bool netBeatLog = std::getenv("MOHO64UI_NET_BEAT_LOG") != nullptr;
+  static const bool beatLog = std::getenv("MOHO64UI_BEAT_LOG") != nullptr;
+  if (net_ ? netBeatLog : (beatLog || netBeatLog))
+    Logf(LogLevel::Info, "moho64ui: beat %u: our maxSP %s: %d (the median beat %.2f ms of the last %zu)",
+         net_ ? net_->beat : sim_->tick(), net_ ? "sent" : "now", value, static_cast<double>(median), count);
+}
+
+namespace {
+
+// A state line (sim/fingerprint.h: "<beat> <tick> <total> <part>=<hash> ...", the lua part cut) taken apart.
+struct StateParts {
+  std::string beat, tick, total;
+  std::vector<std::pair<std::string, std::string>> parts;  // in the line's order
+};
+
+StateParts SplitStateLine(const std::string& line) {
+  StateParts out;
+  size_t p = 0;
+  for (int field = 0; p < line.size(); ++field) {
+    size_t end = line.find(' ', p);
+    if (end == std::string::npos) end = line.size();
+    const std::string w = line.substr(p, end - p);
+    p = end + 1;
+    if (w.empty()) continue;
+    if (field == 0) out.beat = w;
+    else if (field == 1) out.tick = w;
+    else if (field == 2) out.total = w;
+    else if (const size_t eq = w.find('='); eq != std::string::npos) out.parts.emplace_back(w.substr(0, eq), w.substr(eq + 1));
+  }
+  return out;
+}
+
+// A part of the state line in a player's words, and whether it is plural ("differ" or "differs"): the parts as
+// sim/fingerprint.h lists them; an army's by its player's name when it has one.
+std::pair<std::string, bool> PartInWords(const std::string& part, const Sim& sim) {
+  if (part == "rng") return {"the random numbers", true};
+  if (part == "sim") return {"the game's own state (orders, path searches, pause)", false};
+  if (part == "proj") return {"the projectiles", true};
+  if (part == "props") return {"the props (wrecks, trees, rocks)", true};
+  if (part == "ents") return {"the other entities (shields, beams, blips)", true};
+  if (part == "u0") return {"the units of no army", true};
+  if (part.size() > 1 && (part[0] == 'a' || part[0] == 'u') && std::isdigit(static_cast<unsigned char>(part[1]))) {
+    const int index = std::atoi(part.c_str() + 1);
+    std::string who;
+    for (const auto& a : sim.armies())
+      if (a->index == index) who = a->nickname;
+    const bool units = part[0] == 'u';
+    const std::string what = units ? "units" : "economy";
+    if (who.empty()) return {"army " + std::to_string(index) + "'s " + what, units};
+    return {who + "'s " + what + " (army " + std::to_string(index) + ")", units};
+  }
+  return {"the part " + part, false};
+}
+
+std::string NowText() {
+  const std::time_t t = std::time(nullptr);
+  std::tm tm{};
+#ifdef _WIN32
+  localtime_s(&tm, &t);
+#else
+  localtime_r(&t, &tm);
+#endif
+  char b[40];
+  std::strftime(b, sizeof b, "%Y-%m-%d %H:%M:%S", &tm);
+  return b;
+}
+
+}  // namespace
+
+// Where a desync's files go: beside the game's record (--replay-out) or, without one, its replay
+// (replays/<profile>/LastGame.SCFAReplay: LastGame.desync.txt beside it, overwritten by the next game's desync as
+// the replay is by the next game). Empty: none (the log alone).
+std::string GameSession::NetDesyncBase() const {
+  if (!recordBase_.empty()) return recordBase_;
+  if (currentReplay.empty()) return std::string();
+  const size_t dot = currentReplay.find_last_of('.');
+  const size_t slash = currentReplay.find_last_of("/\\");
+  return dot != std::string::npos && (slash == std::string::npos || dot > slash) ? currentReplay.substr(0, dot) : currentReplay;
+}
+
+// At the game's first desync: this copy's full listing of a beat both sides can still write, the next checksum beat
+// (the beat found out of step has run here already, and its state is gone; both copies find a desync within a few
+// beats of its checksum beat, so both list the same beat). The listing is the engine's (Fingerprint::WriteDetail: one
+// line per army, unit, projectile, prop and entity), written on the beats' thread at that beat (NetDigest):
+// <base>.desync.fp (that beat's line) and <base>.desync.fp.detail.<beat>.
+void GameSession::NetAskDetail() {
+  Net& n = *net_;
+  if (n.detailAsked) return;
+  n.detailAsked = true;
+  const std::string base = NetDesyncBase();
+  if (base.empty()) {
+    Logf(LogLevel::Info, "moho64ui: no record or replay of this game: the desync's listing is not written");
+    return;
+  }
+  n.detailAt = (n.beat / kLockstepChecksumPeriod + 1) * kLockstepChecksumPeriod;
+  n.detailPath = base + ".desync.fp";
+  Logf(LogLevel::Info, "moho64ui: the state of beat %u (the next checksum beat) will be listed in %s.detail.%u",
+       n.detailAt, n.detailPath.c_str(), n.detailAt);
+}
+
+// A desync with `client` at checksum beat `beat` (the lockstep found its checksum differs from ours): our parts of that
+// beat to it, once (ours, message 60: net/beat_exchange_net.h): the beat, then each beat's pulse from the checksum beat
+// before it on (as far as kept: the first beat whose pulse differs narrows where the difference began), then our state
+// line of that beat.
+void GameSession::NetSendParts(uint8_t client, uint32_t beat) {
+  Net& n = *net_;
+  n.firstDesync.emplace(client, beat);
+  NetAskDetail();
+  if (!n.partsSent.insert({client, beat}).second) return;
+  auto mine = std::find_if(n.lines.begin(), n.lines.end(), [&](const auto& l) { return l.first == beat; });
+  if (mine == n.lines.end()) {
+    Logf(LogLevel::Warning, "moho64ui: no state line of ours is kept for beat %u: its parts are not sent", beat);
+    return;
+  }
+  uint32_t from = beat > kLockstepChecksumPeriod ? beat - kLockstepChecksumPeriod + 1 : 1;
+  while (from <= beat && n.pulses[from % n.pulses.size()].beat != from) ++from;  // (the oldest kept)
+  net::MessageWriter w;
+  w.U32(beat).U32(from).U16(static_cast<uint16_t>(beat + 1 - from));
+  for (uint32_t b = from; b <= beat; ++b) {
+    const Net::Pulse& p = n.pulses[b % n.pulses.size()];
+    w.U32(static_cast<uint32_t>(p.draws)).U32(static_cast<uint32_t>(p.draws >> 32)).U32(p.units).U32(p.projectiles);
+  }
+  w.Str(mine->second);
+  n.exchange->SendDesyncParts(client, w.Done(0).payload);
+  Logf(LogLevel::Info, "moho64ui: our state's parts of beat %u sent to client %u", beat, client);
+}
+
+// A client's parts of a beat (NetSendParts on its side) compared with ours: the parts that differ, in a player's words,
+// and the first beat it shows in as closely as the pulses tell: after the checksum beat before (the same then, or the
+// desync would have been found there), and no later than the first beat whose pulse differs. The game's first desync
+// with that client goes to the console (DeliverNetEvents); every one to the log and to <base>.desync.txt.
+void GameSession::NetCompareParts(uint8_t client, const std::string& bytes) {
+  Net& n = *net_;
+  net::MessageReader r(bytes);
+  const uint32_t beat = r.U32(), from = r.U32();
+  const uint16_t count = r.U16();
+  std::vector<Net::Pulse> theirs;
+  for (uint16_t i = 0; i < count && r.Ok(); ++i) {
+    Net::Pulse p;
+    p.beat = from + i;
+    const uint32_t lo = r.U32(), hi = r.U32();
+    p.draws = lo | (static_cast<uint64_t>(hi) << 32);
+    p.units = r.U32();
+    p.projectiles = r.U32();
+    theirs.push_back(p);
+  }
+  const std::string theirLine = r.Str();
+  if (!r.Ok()) {
+    Logf(LogLevel::Warning, "moho64ui: client %u's desync parts could not be read (%zu bytes)", client, bytes.size());
+    return;
+  }
+  auto mine = std::find_if(n.lines.begin(), n.lines.end(), [&](const auto& l) { return l.first == beat; });
+  if (mine == n.lines.end()) {
+    Logf(LogLevel::Warning, "moho64ui: client %u's parts of beat %u came, but ours of that beat are no longer kept", client, beat);
+    return;
+  }
+  std::string name;
+  for (const NetClient& c : n.clients)
+    if (c.client == client) name = c.name;
+  n.firstDesync.emplace(client, beat);
+  NetAskDetail();
+  const bool first = n.firstDesync[client] == beat;
+  // which parts differ (a part only one side has differs too)
+  const StateParts a = SplitStateLine(mine->second), b = SplitStateLine(theirLine);
+  std::vector<std::pair<std::string, bool>> differ;
+  if (a.tick != b.tick) differ.push_back({"the game's tick", false});
+  std::vector<std::string> parts;
+  for (const auto& kv : a.parts) parts.push_back(kv.first);
+  for (const auto& kv : b.parts)
+    if (std::find(parts.begin(), parts.end(), kv.first) == parts.end()) parts.push_back(kv.first);
+  auto valueOf = [](const StateParts& s, const std::string& part) {
+    for (const auto& kv : s.parts)
+      if (kv.first == part) return kv.second;
+    return std::string();
+  };
+  for (const std::string& part : parts)
+    if (valueOf(a, part) != valueOf(b, part)) differ.push_back(PartInWords(part, *sim_));
+  std::string what;
+  const size_t shown = differ.size() > 6 ? 5 : differ.size();
+  for (size_t i = 0; i < shown; ++i)
+    what += (i == 0 ? "" : i + 1 == shown && shown == differ.size() ? " and " : ", ") + differ[i].first;
+  if (shown < differ.size()) what += " and " + std::to_string(differ.size() - shown) + " more parts";
+  if (differ.empty()) what = "every part of the state is the same; only the checksums differ";
+  else what += differ.size() == 1 && !differ[0].second ? " differs" : " differ";
+  // where it began: lo .. hi
+  const uint32_t lo = beat > kLockstepChecksumPeriod ? beat - kLockstepChecksumPeriod + 1 : 1;
+  uint32_t hi = beat, pulseAt = 0;
+  for (const Net::Pulse& t : theirs) {
+    const Net::Pulse& o = n.pulses[t.beat % n.pulses.size()];
+    if (t.beat < lo || t.beat > beat || o.beat != t.beat) continue;
+    if (o.draws != t.draws || o.units != t.units || o.projectiles != t.projectiles) {
+      hi = pulseAt = t.beat;
+      break;
+    }
+  }
+  std::string when;
+  if (!first) when = "out of step since beat " + std::to_string(n.firstDesync[client]);
+  else if (lo == hi) when = "first at beat " + std::to_string(lo);
+  else when = "first between beats " + std::to_string(lo) + " and " + std::to_string(hi);
+  const std::string text = "Desync at beat " + std::to_string(beat) + " with " + name + ": " + what + " (" + when + ")";
+  Logf(LogLevel::Warning, "moho64ui: %s\n  ours   %s\n  theirs %s", text.c_str(), mine->second.c_str(), theirLine.c_str());
+  if (first) n.events.notes.push_back(text);
+  // the same in the desync's file, with both lines and the pulses, for taking it apart afterwards
+  const std::string base = NetDesyncBase();
+  if (base.empty()) return;
+  const std::string file = base + ".desync.txt";
+  std::FILE* f = std::fopen(file.c_str(), n.desyncFileStarted ? "ab" : "wb");
+  if (!f) {
+    Logf(LogLevel::Warning, "moho64ui: cannot write %s", file.c_str());
+    return;
+  }
+  if (!n.desyncFileStarted) {
+    n.desyncFileStarted = true;
+    std::string self;
+    for (const NetClient& c : n.clients)
+      if (c.local) self = c.name;
+    std::fprintf(f,
+                 "# FA Remastered: a network game's desyncs as this copy saw them (docs/ui-net-game.md, \"A desync's parts\")\n"
+                 "# written %s by client %u (%s); seed %u, map %s\n"
+                 "# the lines: <beat> <tick> <total> <part>=<hash> ... (sim/fingerprint.h); pulses: <beat> <random draws> "
+                 "<units> <projectiles>\n",
+                 NowText().c_str(), n.local, self.c_str(), seed_, map_.c_str());
+  }
+  std::fprintf(f, "\n%s\n  ours   %s\n  theirs %s\n", text.c_str(), mine->second.c_str(), theirLine.c_str());
+  if (pulseAt) {
+    const Net::Pulse& o = n.pulses[pulseAt % n.pulses.size()];
+    const Net::Pulse& t = theirs[pulseAt - from];
+    std::fprintf(f, "  the first pulse that differs: ours %u %llu %u %u, theirs %u %llu %u %u\n", o.beat,
+                 static_cast<unsigned long long>(o.draws), o.units, o.projectiles, t.beat,
+                 static_cast<unsigned long long>(t.draws), t.units, t.projectiles);
+  } else if (!theirs.empty()) {
+    std::fprintf(f, "  the pulses of beats %u..%u are the same\n", std::max(lo, from), beat);
+  }
+  if (n.detailAt)
+    std::fprintf(f, "  this copy's full listing of beat %u: %s.desync.fp.detail.%u\n", n.detailAt, base.c_str(), n.detailAt);
+  std::fclose(f);
+}
+
+// The game's screen is up (main.cpp, after CreateGameInterface; the original sends READY at the end of DoInitializing,
+// 0x88c664 -> CClientManagerImpl slot 11, 0x53e4b0): READY to every client and the lockstep's start (beats 1 .. the
+// input delay, empty: the original closes them at once after its first sync).
+void GameSession::NetReady() {
+  if (!net_ || net_->readySent) return;
+  net_->readySent = true;
+  net_->lockstep->Start();
+  net_->exchange->SendReady();
+  Logf(LogLevel::Info, "moho64ui: this program's game screen is up: READY sent to the other players");
+}
+
+// Before each beat of a network game: true once every client is ready (READY, or ejected: IsEveryoneReady 0x53e560).
+// Until then no beat runs and the provider's StartWaitingDialog shows (DoPostInitializing 0x88c6d0 asks it when not
+// everyone is ready at once, DoWaiting 0x88c750 its StopWaitingDialog once they are; the disconnect dialog is updated
+// meanwhile, user_state.cpp).
+bool GameSession::NetEveryoneReady() {
+  Net& n = *net_;
+  if (n.everyoneReady) return true;
+  if (!n.readySent) return false;
+  if (n.exchange->EveryoneReady()) {
+    n.everyoneReady = true;
+    if (n.waitingShown) n.events.waiting = -1;
+    Logf(LogLevel::Info, "moho64ui: every player is ready: the network game's beats run");
+    return true;
+  }
+  if (!n.waitingShown) {
+    n.waitingShown = true;
+    n.events.waiting = 1;
+    Logf(LogLevel::Info, "moho64ui: waiting for the other players to be ready");
+  }
+  return false;
+}
+
+std::vector<GameSession::NetClient> GameSession::NetClients() const {
+  std::vector<NetClient> out;
+  if (!net_) return out;
+  out = net_->clients;
+  for (NetClient& c : out) {
+    const net::ClientLink l = net_->exchange->Link(c.client);
+    c.connected = l.connected, c.ping = l.ping, c.quiet = l.quiet, c.maxSP = l.maxSP;
+    c.ejectedBy.assign(l.ejectedBy.begin(), l.ejectedBy.end());
+  }
+  return out;
+}
+
+NetGameLink* GameSession::netLink() const { return net_ ? net_->link.get() : nullptr; }
+
+void GameSession::NetEject(int client) {
+  if (!net_) return;
+  for (const NetClient& c : net_->clients)
+    if (c.client == client && !c.local) {
+      Logf(LogLevel::Info, "moho64ui: this player votes to eject client %d (%s)", client, c.name.c_str());
+      net_->exchange->RequestEject(static_cast<uint8_t>(client));
+    }
+}
+
+void GameSession::NetChat(const std::vector<int>& clients, const std::string& message) {
+  if (!net_) return;
+  for (int c : clients) net_->exchange->SendChat(static_cast<uint8_t>(c), message);
+}
+
+void GameSession::NetSpeed(int rate) {
+  if (!net_) return;
+  net_->exchange->RequestRate(rate);
+  pace.asked = net_->exchange->Rate();  // (ours is taken here at once, as the original's own broadcast is: GetGameSpeed)
+  pace.rate = net_->exchange->RunRate();
+}
+
+NetEvents GameSession::NetTakeEvents() {
+  NetEvents out;
+  if (!net_) return out;
+  auto nameOf = [&](uint8_t client) {
+    for (const NetClient& c : net_->clients)
+      if (c.client == client) return c.name;
+    return std::string();
+  };
+  out = std::move(net_->events);
+  net_->events = NetEvents{};
+  for (auto& [client, message] : net_->exchange->TakeChats()) out.chats.emplace_back(nameOf(client), std::move(message));
+  for (const auto& [client, rate] : net_->exchange->TakeRateNotes()) out.speeds.emplace_back(client, rate);
+  for (uint8_t client : net_->exchange->TakeDisconnects()) {
+    Logf(LogLevel::Info, "moho64ui: client %u (%s) disconnected: ejected", client, nameOf(client).c_str());
+    out.disconnects.push_back(nameOf(client));
+  }
+  return out;
+}
+
+void GameSession::NetTestSwitch(const std::string& what, uint32_t beat, const std::string& arg) {
+  if (!net_) return;
+  if (what == "freeze") {
+    Logf(LogLevel::Info, "moho64ui: this program's network game is frozen (moho64ui_NetTestForTests)");
+    net_->exchange->FreezeForTests();
+  } else if (what == "corrupt") {
+    net_->corruptPart = arg;  // (before the beat: NetDigest reads it on the beats' thread once corruptAt is that beat)
+    net_->corruptAt = beat;
+  } else if (what == "move") {
+    net_->moveArmy = std::atoi(arg.c_str());
+    net_->moveAt = beat;
+  } else if (what == "draw") {
+    net_->drawAt = beat;
+  } else if (what == "maxsp") {  // (message 57: this value from now on in place of the measure; "": measured again)
+    measure_.forced = !arg.empty();
+    if (measure_.forced) {
+      measure_.sent = std::atoi(arg.c_str());
+      net_->exchange->SendMaxSimRate(measure_.sent);
+    }
+    Logf(LogLevel::Info, "moho64ui: our maxSP %s%s (moho64ui_NetTestForTests)", measure_.forced ? "is now " : "is measured again",
+         measure_.forced ? arg.c_str() : "");
+  } else if (what == "split") {  // (our next beat with orders to that client alone (0-based), then this program freezes)
+    net_->exchange->SplitForTests(static_cast<uint8_t>(std::atoi(arg.c_str())));
+    Logf(LogLevel::Info, "moho64ui: our next beat with orders goes to client %s alone (moho64ui_NetTestForTests)", arg.c_str());
+  }
 }
 
 void GameSession::RunAhead(uint32_t toTick) {
@@ -2294,6 +3080,10 @@ bool GameSession::RunningAhead() const { return aheadTo_ != 0; }
 
 void GameSession::Advance(double seconds) {
   if (!sim_) return;
+  if (net_) {  // (a network game's speed: the one its clients agreed on, held down by every client's maxSP)
+    pace.asked = net_->exchange->Rate();
+    pace.rate = net_->exchange->RunRate();
+  }
   if (aheadTo_) {  // (RunAhead: a beat as soon as the last is through, whatever the time; no time counts meanwhile)
     if (BeatRunning()) return;
     if (beatToFinish_) FinishBeat();
@@ -2375,6 +3165,8 @@ void GameSession::StartBeatOnThread() {
     using Clock = std::chrono::steady_clock;
     const auto ts = Clock::now();
     sim_->Tick();
+    NoteBeatTime();
+    NetDigest();  // (a network game's 50th beat: its digest here, right after the beat)
     const auto tp = Clock::now();
     NotePictureBeat();
     const auto tf = Clock::now();
@@ -2399,6 +3191,8 @@ void GameSession::FingerprintBeat() {  // (after each beat of a recorded live ga
 
 void GameSession::FinishBeat() {
   beatToFinish_ = false;
+  NetAfterBeat();
+  MaxSimRate();
   beatFinishedAt_ = std::chrono::steady_clock::now();
   FrameTimes& times = Times();
   times.simBeats += workerSimSeconds_;
@@ -2623,12 +3417,15 @@ void GameSession::ApplyBeatSounds(const std::vector<SoundAction>& actions) {
 void GameSession::RunFirstBeat() {
   if (worker_) worker_->Wait();
   if (!sim_ || sim_->tick() != 0) return;
+  if (net_) return;  // (a network game's beat 1 waits for every client's READY, after the game's screen: RunDueBeats)
   // (A replay's first beat is its stream's first: what came before the first Advance, then it.)
   if (play_ && !play_->AtEnd()) play_->ApplyUntilAdvance(*sim_);
   if (Fingerprinting()) fp_->Beat(*sim_, 0);  // (beat 0: the state Start left)
   sim_->Tick();
+  NetDigest();
   Record(CommandWriter::AdvanceMessage(1));
   FingerprintBeat();
+  NetAfterBeat();
   NoteBeat();
   for (std::string& sync : sim_->TakeSync()) {
     if (onSync) onSync(sync);
@@ -2640,13 +3437,14 @@ void GameSession::RunFirstBeat() {
 void GameSession::StartFirstBeat() {
   if (!beatsOnThread) return RunFirstBeat();
   if (worker_) worker_->Wait();
-  if (!sim_ || sim_->tick() != 0) return;
+  if (!sim_ || sim_->tick() != 0 || net_) return;  // (as RunFirstBeat)
   if (play_ && !play_->AtEnd()) play_->ApplyUntilAdvance(*sim_);  // (as RunFirstBeat)
   if (Fingerprinting()) fp_->Beat(*sim_, 0);
   if (!worker_) worker_ = std::make_unique<BeatWorker>();
   firstBeatToFinish_ = true;
   worker_->Start([this] {
     sim_->Tick();
+    NetDigest();
     NotePictureBeat();
     FingerprintBeat();  // (as StartBeatOnThread)
   });
@@ -2667,6 +3465,7 @@ void GameSession::FinishFirstBeat() {
   worker_->Wait();
   firstBeatToFinish_ = false;
   Record(CommandWriter::AdvanceMessage(1));  // (the rest of RunFirstBeat, in its order; its fingerprint ran on the thread)
+  NetAfterBeat();
   NoteBeatHere();
   for (std::string& sync : sim_->TakeSync()) {
     if (onSync) onSync(sync);

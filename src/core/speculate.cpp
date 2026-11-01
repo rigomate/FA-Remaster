@@ -8,10 +8,25 @@
 
 namespace moho {
 
-SpecMode SpecModeFromEnvironment(const char* name) {
+bool SpecModeGiven(const char* name) {
   const std::string var = std::string("MOHO64_PAR_") + name;
   const char* v = std::getenv(var.c_str());
-  if (!v || !*v || !std::strcmp(v, "0") || !std::strcmp(v, "off")) return SpecMode::kOff;
+  return v && *v;
+}
+
+size_t SpecMinFromEnvironment(const char* name, size_t dflt) {
+  const std::string var = std::string("MOHO64_PAR_") + name;
+  const char* v = std::getenv(var.c_str());
+  if (v && (!std::strcmp(v, "verify") || !std::strcmp(v, "redo"))) return 0;
+  if (v && !std::strncmp(v, "on:", 3)) return static_cast<size_t>(std::strtoull(v + 3, nullptr, 10));
+  return dflt;
+}
+
+SpecMode SpecModeFromEnvironment(const char* name, SpecMode unset) {
+  const std::string var = std::string("MOHO64_PAR_") + name;
+  const char* v = std::getenv(var.c_str());
+  if (!v || !*v) return unset;
+  if (!std::strcmp(v, "0") || !std::strcmp(v, "off")) return SpecMode::kOff;
   if (!std::strcmp(v, "verify")) return SpecMode::kVerify;
   if (!std::strcmp(v, "redo")) return SpecMode::kRedo;
   return SpecMode::kOn;
@@ -35,15 +50,18 @@ void ReadLog::Derived(Reader r, const void* obj, uint32_t n) {
   }
   std::memset(tmp, 0, n);
   r(obj, tmp);
-  e_.push_back({r, obj, static_cast<uint32_t>(bytes_.size()), n});
-  bytes_.insert(bytes_.end(), tmp, tmp + n);
+  Arena& A = a_ ? *a_ : own_;
+  A.e.push_back({r, obj, static_cast<uint32_t>(A.bytes.size()), n});
+  A.bytes.insert(A.bytes.end(), tmp, tmp + n);
+  ++n_;
 }
 
 bool ReadLog::Holds(size_t* first) const {
   unsigned char tmp[kMaxDerived];
-  for (size_t i = 0; i < e_.size(); ++i) {
-    const Entry& e = e_[i];
-    const unsigned char* was = bytes_.data() + e.off;
+  const Arena& A = a_ ? *a_ : own_;
+  for (size_t i = 0; i < n_; ++i) {
+    const Entry& e = A.e[e0_ + i];
+    const unsigned char* was = A.bytes.data() + e.off;
     bool same;
     if (!e.r) {
       same = std::memcmp(e.p, was, e.n) == 0;
@@ -68,6 +86,9 @@ std::string SpecCounts::Line(const char* name) const {
                 static_cast<unsigned long long>(changed), static_cast<unsigned long long>(none),
                 static_cast<unsigned long long>(thrown), static_cast<unsigned long long>(checked));
   std::string line = b;
+  if (rounds || below)
+    line += "; beats ahead " + std::to_string(rounds) + " (items " + std::to_string(items) + "), under the minimum " +
+            std::to_string(below);
   if (changed) {
     line += "; changed by first read:";
     for (size_t i = 0; i < kFirst; ++i)
