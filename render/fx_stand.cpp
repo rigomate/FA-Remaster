@@ -870,6 +870,10 @@ void FxStand::Update(World& world, double now, Vec3 right, const std::function<f
           if (u.id == b.id) belt = world.machinery.PoseUnit(u, *model, b.position, b.turn, UnitFaction(b.unit), &pose);
       world.meshes.Add(model, at, {0.2f, 0.45f, 1.0f}, b.built, &pose, heat);
       world.meshes.Belt(belt);
+      // [machinery] (its lamps, as a game's unit's: World::AddLamps, by its pose and with their pulse; a structure's by its
+      // id's third letter, as the game's)
+      if (!b.wreck && b.built >= 1)
+        world.AddLamps(model, b.position, b.turn, &pose, nullptr, b.id, b.unit.size() > 2 && (b.unit[2] == 'b' || b.unit[2] == 'B'));
       world.water.ripples.AddHull(b.id, b.position, b.turn, model->boundsMin * b.scale, model->boundsMax * b.scale);  // (ripples where it is in the water)
       world.water.AddAfloat(b.position, b.turn, model->boundsMin * b.scale, model->boundsMax * b.scale);  // [floatfoam] (no foam slab under its floats)
       if (!b.wreck)

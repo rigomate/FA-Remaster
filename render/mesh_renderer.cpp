@@ -1620,7 +1620,16 @@ void MeshRenderer::BuildRows(Entry* entry, float* rows) {
     auto turn = [&](const FrameBone* f) { return f ? Quat{f->orientation[0], f->orientation[1], f->orientation[2], f->orientation[3]} : rest.rotation; };
     const Quat q = Mul(Nlerp(turn(a), turn(b), pose.blend), Conjugate(rest.rotation));
     const Vec3 t = Lerp(place(a), place(b), pose.blend) - Rotate(q, rest.position);
-    const Mat4 m = Mat4::FromTRS(t, q);
+    Mat4 m = Mat4::FromTRS(t, q);
+    // [machinery] (a part scaled in its own axes at rest: about its joint, before it is turned to where it is)
+    if (pose.scales && i >= pose.scaleFrom && i < pose.scaleFrom + pose.scaleCount) {
+      const float* s = pose.scales + (i - pose.scaleFrom) * 3;
+      if (s[0] != 1 || s[1] != 1 || s[2] != 1) {
+        const Quat posed = Nlerp(turn(a), turn(b), pose.blend);
+        m = Mat4::Translation(Lerp(place(a), place(b), pose.blend)) * Mat4::FromTRS({}, posed) * Mat4::Scale({s[0], s[1], s[2]}) *
+            Mat4::FromTRS({}, Conjugate(rest.rotation)) * Mat4::Translation(rest.position * -1.0f);
+      }
+    }
     for (int r = 0; r < 3; ++r)
       for (int c = 0; c < 4; ++c) out[r * 4 + c] = m.m[r][c];
   }
