@@ -763,13 +763,15 @@ int TargetTypeOf(const UnitRating& r) {
 }  // namespace
 
 BattleResult EstimateBattle(const std::vector<ForceStack>& ours, const std::vector<ForceStack>& theirs,
-                            float startDistance, const std::map<std::pair<int, int>, float>& beats, bool kite) {
+                            float startDistance, const std::map<std::pair<int, int>, float>& beats, bool kite,
+                            bool soak) {
   struct Stack {
     const UnitRating* r;
     float hpEach, shEach, hp, sh;  // per unit and pooled; the shield takes hits first (from outside its bubble)
     int tt;                        // its target type
     bool mobile;
     float arrive;                  // when it joins (reinforcements)
+    bool fights = true;            // it can hurt the other side (or shields): what the fight is decided on (below)
   };
   std::vector<Stack> side[2];
   float pool0[2] = {0, 0};
@@ -780,6 +782,28 @@ BattleResult EstimateBattle(const std::vector<ForceStack>& ours, const std::vect
       side[k].push_back({f.r, hpEach, shEach, hpEach * f.count, shEach * f.count, TargetTypeOf(*f.r),
                          f.r->move != kMoveStatic, std::max(0.0f, f.arrive)});
       pool0[k] += (hpEach + shEach) * f.count;
+    }
+  // (phase 12) What fights: a stack with a weapon that can hit something of the other side, or a shield. The rest
+  // (factories, generators, extractors, engineers, walls) is fired on only when nothing that fights is left in a
+  // weapon's reach, and the result is read on what fights: the zone estimate of our base had counted every
+  // structure's health as ours, so 2,400 mass of known T2 bots against our army gave 0.97 while they killed it and the
+  // commander. A side with nothing that fights at all is read on everything, as before. With `soak`, everything
+  // fights (the estimate before phase 12: every unit takes fire by its health and counts in the result).
+  bool anyFights[2] = {false, false};
+  for (int k = 0; k < 2; ++k)
+    for (Stack& s : side[k]) {
+      bool f = s.shEach > 0;
+      for (const UnitRating::Weapon& w : s.r->weapons)
+        for (const Stack& e : side[1 - k])
+          f = f || (w.vs & (1u << e.tt)) != 0;
+      s.fights = soak || f;
+      anyFights[k] = anyFights[k] || f;
+    }
+  for (int k = 0; k < 2; ++k)
+    if (anyFights[k]) {
+      pool0[k] = 0;
+      for (const Stack& s : side[k])
+        if (s.fights) pool0[k] += s.hp + s.sh;
     }
   BattleResult res;
   if (pool0[0] <= 0 || pool0[1] <= 0) {
@@ -856,6 +880,7 @@ BattleResult EstimateBattle(const std::vector<ForceStack>& ours, const std::vect
     bool anyAlive[2] = {false, false}, anyLater[2] = {false, false};
     for (int k = 0; k < 2; ++k)
       for (const Stack& s : side[k]) {
+        if (anyFights[k] && !s.fights) continue;  // (phase 12: decided when what fights is gone)
         anyAlive[k] = anyAlive[k] || alive(s);
         anyLater[k] = anyLater[k] || (s.hp > 0 && s.arrive > t);
       }
@@ -868,9 +893,13 @@ BattleResult EstimateBattle(const std::vector<ForceStack>& ours, const std::vect
         const float n = s.hp / s.hpEach;  // units left (continuous)
         for (const UnitRating::Weapon& w : s.r->weapons) {
           if (d > w.range) continue;
+          // (phase 12: what fights first; the rest when nothing that fights is left to this weapon)
+          bool onlyFighters = false;
+          for (const Stack& e : side[1 - k])
+            onlyFighters = onlyFighters || (alive(e) && e.fights && (w.vs & (1u << e.tt)));
           float hittable = 0, room = 0;
           for (const Stack& e : side[1 - k])
-            if (alive(e) && (w.vs & (1u << e.tt))) {
+            if (alive(e) && (w.vs & (1u << e.tt)) && (e.fights || !onlyFighters)) {
               hittable += e.hp + e.sh;
               // the front: around each target only so many shooters fit within this weapon's range (its ring's area
               // at the group density); a swarm of short-range units cannot all fire at a few big targets at once
@@ -881,7 +910,7 @@ BattleResult EstimateBattle(const std::vector<ForceStack>& ours, const std::vect
           const float firing = std::min(n, room);
           for (size_t j = 0; j < side[1 - k].size(); ++j) {
             const Stack& e = side[1 - k][j];
-            if (!alive(e) || !(w.vs & (1u << e.tt))) continue;
+            if (!alive(e) || !(w.vs & (1u << e.tt)) || (onlyFighters && !e.fights)) continue;
             dmg[1 - k][j] += firing * dpsOn(s, w, e) * dt * ((e.hp + e.sh) / hittable);
           }
         }
@@ -930,7 +959,8 @@ BattleResult EstimateBattle(const std::vector<ForceStack>& ours, const std::vect
   float left[2] = {0, 0};
   for (int k = 0; k < 2; ++k)
     for (const Stack& s : side[k])
-      if (s.hp > 0) left[k] += s.hp + std::max(0.0f, s.sh);  // (reinforcements that never came still count)
+      if (s.hp > 0 && (s.fights || !anyFights[k]))
+        left[k] += s.hp + std::max(0.0f, s.sh);  // (reinforcements that never came still count)
   res.ours = left[0] / pool0[0];
   res.theirs = left[1] / pool0[1];
   res.margin = 0.5f + (res.ours - res.theirs) / 2;
@@ -1262,7 +1292,7 @@ int l_AIEnemyMix(lua_State* L) {
   return 1;
 }
 
-// Remastered.AIZoneEstimate(army, zone, horizon [, kite]) -> margin, oursLeft, theirsLeft, seconds, oursMass,
+// Remastered.AIZoneEstimate(army, zone, horizon [, kite [, soak]]) -> margin, oursLeft, theirsLeft, seconds, oursMass,
 // theirsMass: the battle estimate of a fight for the zone from what the army knows (phase 4): its index's units (fair
 // intel, the memory of lost contacts, unknown contacts left out) that can come to the zone within `horizon` world
 // units of travel or shoot into it, own + allied against enemy; a unit away from the zone joins after its travel
@@ -1303,7 +1333,7 @@ int l_AIZoneEstimate(lua_State* L) {
   std::vector<ForceStack> force[2];
   for (int k = 0; k < 2; ++k)
     for (const auto& [key, count] : stacks[k]) force[k].push_back({&rs.byEntity[key.first], count, key.second * 10.0f});
-  const BattleResult r = EstimateBattle(force[0], force[1], -1.0f, rs.beats, kite);
+  const BattleResult r = EstimateBattle(force[0], force[1], -1.0f, rs.beats, kite, lua_toboolean(L, 5) != 0);
   lua_pushnumber(L, r.margin);
   lua_pushnumber(L, r.ours);
   lua_pushnumber(L, r.theirs);

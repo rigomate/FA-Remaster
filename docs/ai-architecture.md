@@ -650,7 +650,7 @@ Without `all` it lists the mobile army only (land, hover, amphibious and air, no
 (phase 6), an enemy army's index, only that army's units (the index keeps them per enemy army as well, with the same
 weights, and its memory keeps each remembered unit's army), so the strategy layer reads each enemy on its own.
 
-**The estimate of a zone's fight (phase 4),** `Remastered.AIZoneEstimate(army, zone, horizon [, kite])`: from what
+**The estimate of a zone's fight (phase 4),** `Remastered.AIZoneEstimate(army, zone, horizon [, kite [, soak]])`: from what
 the army knows, own + allied units against the enemy's that can come to the zone within `horizon` world units of
 travel or shoot into it, fought out by the battle estimate (3.3).
 - The units come from the index, so fair intel holds: blips only, typed after sight, with the memory of lost
@@ -734,6 +734,16 @@ tank uel0201's (24 dps x 300 health = 1.0).
 - **The front:** around each target only as many shooters fit as stand in the weapon's range ring at the group
   density. A swarm of short-range units cannot all fire at a few big targets at once.
 - **Shields:** a shield takes hits first, except a bubble shield once the gap is inside its radius.
+- **What fights first (phase 12):** a unit fights when one of its weapons can hit something of the other side, or it
+  carries a shield. Weapons fire on what fights first and on the rest (factories, generators, extractors, engineers,
+  walls) only when nothing that fights is left in their reach, and the result (health left, the margin, the end) is
+  read on what fights. A side with nothing that fights is read on everything. Before, every unit took fire by its
+  health and counted: our base's structures soaked the enemy's fire in the model and stood as "ours left", so a zone
+  where M28's T2 bots and commander killed our army and commander in 13 seconds read 0.97 for us.
+  - `soak` (`AIZoneEstimate`'s fifth argument; `EstimateBattle`'s last) gives the estimate before phase 12. The
+    defence of our zones and the guard posts read it (operations.lua `kDefenceSoak`): with the fighters-only read
+    there the veteran duel against FAF was lost at minute 23.5-37.4 instead of 47.5 (defend bar 0.35 or 0.25). Attacks, pushes, raids, their commits, the navy and the defence picks
+    read what fights.
 - **Closing in:** a side whose main weapons (75% of its dps, longest range first) cannot all fire yet closes in, under
   fire, at its slowest unit's speed. It holds instead when those weapons already outrange everything the other side
   has: a Fatboy waits for the Percivals, while a Loyalist walks in to its cannon's range.
@@ -876,7 +886,7 @@ native core for numbers and spends its own time only on decisions.
   | `AIIndexInfo(army)` | `{tick, own, ally, enemy, unknown, outside, period}` |
   | `AISquareLaw(ours, theirs)` | `margin, survivors` (3.3) |
   | `AIBattleEstimate(ours, theirs [, startDistance [, kite]])` | `margin, oursLeft, theirsLeft, seconds`; a force is an array of `{blueprintId, count}` (3.3) |
-  | `AIZoneEstimate(army, zone, horizon [, kite])` | `margin, oursLeft, theirsLeft, seconds, oursMass, theirsMass`: the fight for the zone from what the army knows (3.2) |
+  | `AIZoneEstimate(army, zone, horizon [, kite [, soak]])` | `margin, oursLeft, theirsLeft, seconds, oursMass, theirsMass`: the fight for the zone from what the army knows (3.2); `soak`: the estimate before phase 12 (3.3) |
   | `AIBuildValue(blueprintId, enemy)` | `value, killed, lost`: enemy mass killed per own mass lost (3.3) |
   | `AIEnemyMix(army [, all [, enemy]])` | `{{id, count, mass}, ...}`: the enemy's mobile army as known (the counter-pick's enemy), or with `all` every known enemy unit and structure (phase 5, 3.2); with `enemy` (an army index, phase 6) only that army's units |
   | `AIRandom(army [, n])` | the army's own random stream: a float in [0, 1), or an integer 1..n (phase 3) |
@@ -1180,6 +1190,28 @@ both-modes check, multicore.md 1).
     before 11 come from the end tick alone and are not checked, except phase 10's recruit game against FAF (lost at
     minute 30.0, confirmed by the probe); the M28 games of every phase end with our units and income a fraction of
     M28's, losses beyond doubt.
+- **Phase 12a (2026-10-31), the battle estimate reads what fights,** against main f6b86d9 on the same engine.
+  - **Probes against M28** (20 minutes): every land unit of ours that died was idle (on a post, or after a defence's
+    move); a fifth to a third of them were killed by artillery, missile launchers or ships they never saw (seed 3003:
+    Seraphim T1 artillery 14,200 mass, T2 missile launchers 7,400, tactical missiles 3,300; seed 1001: gunships 8,600,
+    T2 assault bots 5,600, missile launchers 5,400, frigates 5,000). Near our commander M28 had 5,000-5,900 mass of
+    units, 0-2,200 of it in sight at that moment; the index held 2,400 (radar contacts seen before, 9 never-seen
+    contacts without mass).
+  - **20 minutes, 13 games:** against M28 alive in 6 of 7 (5 of 7), mass lost per mass killed 10.9 (11.9); against
+    FAF's AI all alive (both), 0.97 (0.99).
+  - **60-minute duels** (who won read from the armies' state):
+
+    | Game | Phase 12a | Main (phase 11) | Lost per killed (main) |
+    |---|---|---|---|
+    | recruit vs FAF adaptive | **won at minute 21.4** | won at minute 39.1 | 0.60 (2.31) |
+    | veteran (turtle) vs FAF adaptive | lost at minute 47.5 | lost at minute 50.5 | 1.09 (0.82) |
+    | recruit vs M28 | lost at minute 22.4 | lost at minute 22.1 | 8.4 (6.0) |
+    | veteran (turtle) vs M28 | lost at minute 22.5 | lost at minute 21.2 | 23.4 (12.0) |
+    | veteran (rusher) vs M28 without cheats | lost at minute 25.0 | lost at minute 23.2 | 9.0 (11.1) |
+
+  - The recruit game against FAF is won in half the time for a quarter of the losses; the three M28 games last 0.3-1.8
+    minutes longer; the veteran game against FAF is lost 3 minutes sooner. Faults: 0. The idle units under fire from
+    out of sight come next.
 - **Then Chris plays it** and judges the feel (decision 8), in the one big check after the UEF polish unless he asks
   sooner.
 
@@ -1193,6 +1225,7 @@ both-modes check, multicore.md 1).
 | 4 (first form built 2026-10-29) | Strategic and operation layers: aggression with hysteresis, objectives, gathering, push, retreat by estimate, raids, navy and air domains, combined arms timing. Built: the zone estimate from the index (fair intel, memory, reinforcements on the way, kiting), defend / attack / push / raid with commit rules and logged decisions, tech upgrades. Not yet: gathering, navy and air, combined arms | Ours vs M28 and FAF's AI, several seeds: the fight scores of section 6; "never fled a weaker force" at zero faults. First duels: 0 faults, 3 losses and one 60-minute game without a result (section 6) |
 | 5 (first form built 2026-10-29) | Economy in parallel with scouting, army and expansion (power ahead but not wasted, factory floor, engineers by distance and away from enemies, reclaim, storage, timed assists); counters by build value; defences as build candidates; investments by payback and danger with a planned dip; the strategy layer's read of the enemy and stances; attacks on armies and expansions with gathering and reinforcements via the staging zone; guard posts; the knobs in one place (decisions 13-16) | The five duels of section 6 (mass / s at 5 / 15 / 30 minutes, mass lost per enemy mass killed); the 16 + B1 / b8 identical; our-key sessions identical at 1 / 32 threads, shuffle, reverse |
 | 6a (first form built 2026-10-30) | Map control: the army kept against the enemy's known army, guard posts sized by the threat and lost zones taken back, reclaim fields; each enemy read on its own (the focus enemy); the player's two sliders (aggression, economy) with bounds; the duels with fog of war | The duels of section 6 with fog; the 16 + B1 / b8 identical; our-key fogged sessions identical at 1 / 32 threads, shuffle, reverse |
+| 12a (first form built 2026-10-31) | The battle estimate fires on and reads what fights (structures and engineers no longer soak the fire); the old read kept for the defence and the posts (`soak`) | The army set with more seeds (13 games, 20 minutes); the duels of section 6 with fog, won / lost read from the armies' state; our-key fogged sessions identical at 1 / 32 threads, shuffle, reverse; b8 identical |
 | 11 (first form built 2026-10-31) | Production capacity: base sites promised whole (the skirt, for the walk), power ahead of what the mass can spend (10 energy per mass, the cap on the smoothed income), the factory floor growing after the opening | The army set with factory tiers and more seeds (FAF 1001-6006, M28 1001-7007, 20 minutes); the duels of section 6 with fog; our-key fogged sessions identical at 1 / 32 threads, shuffle, reverse |
 | 10 (first form built 2026-10-31) | The navy (naval factories by our shore, ships by build value, defend / attack / hold), the air answer to ships, shelled zones, the commander's fallback inland | The army set (FAF and M28, seeds 1001-4004, 20 minutes); the duels of section 6 with fog; our-key fogged sessions identical at 1 / 32 threads, shuffle, reverse |
 | 9 (first form built 2026-10-30) | The economy into an army (the army kept by our income, investments halved while short, up to 20 factories), energy after the opening (short by income against asks, power capped first, more T2 engineers), the trade check on attacks | The army set (FAF and M28, three seeds each, 20 minutes: army mass at 10 / 15 minutes, energy stalls, survival, trades); the duels of section 6 with fog; our-key fogged sessions identical at 1 / 32 threads, shuffle, reverse |
