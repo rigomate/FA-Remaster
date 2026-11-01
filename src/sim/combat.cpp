@@ -641,9 +641,19 @@ void PoseRotate(Entity* e, int bone, const Quat& q) {
   ++e->poseVersion;
 }
 
+namespace {
+const SimCache<std::map<std::string, std::vector<bool>>> g_categoryMasks;  // (over the sim's blueprint indices)
+}  // namespace
+
+const std::vector<bool>* BpCategoryMaskIfMade(const Sim& sim, const char* name) {
+  const auto* cache = g_categoryMasks.Peek(sim);
+  if (!cache) return nullptr;
+  auto it = cache->find(name);
+  return it != cache->end() ? &it->second : nullptr;
+}
+
 const std::vector<bool>& BpCategoryMask(Sim& sim, const char* name) {
-  static const SimCache<std::map<std::string, std::vector<bool>>> cacheSlot;  // (over the sim's blueprint indices)
-  auto& cache = cacheSlot.For(sim);
+  auto& cache = g_categoryMasks.For(sim);
   auto it = cache.find(name);
   if (it == cache.end()) {
     std::vector<bool> bits(static_cast<size_t>(sim.blueprints().EntityCount()), false);

@@ -324,7 +324,14 @@ class HPathTables {
   struct PathSpec;
   std::unique_ptr<PathSpec> spec_;  // MOHO64_PAR_PATH
   ClusterMap* DryMap(const NamedFootprint& fp);
-  void PlayAhead(Search& s, const Search* from, PathTraveler* t, int start, int* steps, int* r, int* why = nullptr);
+  // (MOHO64_PAR_PATH) a stale cluster a search played ahead read with its data made ahead: Make at the take
+  struct StaleMade {
+    ClusterMap* m;
+    int L, cx, cz;
+  };
+  static thread_local std::vector<StaleMade>* tl_staleMade;
+  void PlayAhead(Search& s, const Search* from, PathTraveler* t, int start, int* steps, int* r, int* why = nullptr,
+                 std::vector<StaleMade>* made = nullptr);
   bool SameSearch(const Search& a, const Search& b, std::string* why) const;
 };
 

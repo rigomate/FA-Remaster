@@ -291,6 +291,8 @@ bool BpInCategory(Sim& sim, const BlueprintInfo* bp, const char* name);
 // BpInCategory's answer for every blueprint index at once (the same cached vector; the reference stays good for
 // the sim's life): BpInCategory(bp) == bp && bp->entityIndex >= 0 && index < size && mask[index].
 const std::vector<bool>& BpCategoryMask(Sim& sim, const char* name);
+// The mask if BpCategoryMask made it already (nothing made here)
+const std::vector<bool>* BpCategoryMaskIfMade(const Sim& sim, const char* name);
 
 // Called when a unit's weapon was created (after its OnCreate).
 void InitUnitWeapon(lua_State* L, UnitWeapon* w);

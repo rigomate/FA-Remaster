@@ -35,6 +35,8 @@ enum class SpecMode { kOff, kOn, kVerify, kRedo };
 
 // The worker a speculative task runs on (set by Speculation::Run for its tasks): a stage's own per-worker storage.
 inline thread_local int tl_specWorker = 0;
+// Set while a task plays a turn or a search ahead: lazily made caches are read, not stored (sim/steering.cpp Naval).
+inline thread_local bool tl_specDryReads = false;
 // MOHO64_PAR_<name>: unset -> unset (kOff unless given); 0 / off -> kOff; 1 / on -> kOn; verify; redo
 SpecMode SpecModeFromEnvironment(const char* name, SpecMode unset = SpecMode::kOff);
 // MOHO64_PAR_<name> is set (not empty): an explicit choice, which wins over a default (Sim::ParDefault)

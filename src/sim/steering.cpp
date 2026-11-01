@@ -38,13 +38,22 @@ bool St(const Unit* u, int i) { return u->unitStates.Has(i); }  // (i: US("Name"
 bool Naval(const Unit* u) {
   const MotionBlueprint* b = u->motion.bp;
   if (!b || !u->blueprint) return false;
-  if (b->naval < 0) b->naval = BpInCategory(*Sim::From(u->luaState()), u->blueprint, "NAVAL") ? 1 : 0;
+  if (b->naval < 0) {
+    // (a play-ahead reads the value without storing it: its caller made sure the mask is made, so this only reads)
+    const bool v = BpInCategory(*Sim::From(u->luaState()), u->blueprint, "NAVAL");
+    if (tl_specDryReads) return v;
+    b->naval = v ? 1 : 0;
+  }
   return b->naval == 1;
 }
 bool AirCat(const Unit* u) {
   const MotionBlueprint* b = u->motion.bp;
   if (!b || !u->blueprint) return false;
-  if (b->airCat < 0) b->airCat = BpInCategory(*Sim::From(u->luaState()), u->blueprint, "AIR") ? 1 : 0;
+  if (b->airCat < 0) {
+    const bool v = BpInCategory(*Sim::From(u->luaState()), u->blueprint, "AIR");
+    if (tl_specDryReads) return v;
+    b->airCat = v ? 1 : 0;
+  }
   return b->airCat == 1;
 }
 bool Mobile(const Unit* u) { return u->motion.bp && u->motion.bp->mobile(); }

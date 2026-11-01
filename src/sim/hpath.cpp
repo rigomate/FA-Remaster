@@ -21,6 +21,7 @@ namespace moho {
 bool PathUnitBlocked(Unit* u, int x, int z, int flags);  // sim/landnav.cpp (COGrid::UnitIsBlocked)
 
 thread_local bool tl_pathAheadDry = false;
+thread_local std::vector<HPathTables::StaleMade>* HPathTables::tl_staleMade = nullptr;
 
 // MOHO64_PAR_PATH's stage (SearchesAhead / WorkAll)
 struct HPathTables::PathSpec {
@@ -29,6 +30,7 @@ struct HPathTables::PathSpec {
     int steps = 0;  // work units its steps took (one per WorkOnce step: the cluster charges are never made ahead)
     int r = 0;      // WorkOnce's answer: 0 / 1 / 3 done, 2 cut by the work units (a carried search), 4 stopped
     int why = 0;    // (r 4: PathAheadStop::why)
+    std::vector<StaleMade> made;  // stale clusters read with their data made ahead: Make at the take
   };
   struct Item {
     int army;
@@ -45,6 +47,7 @@ struct HPathTables::PathSpec {
   uint64_t stopped = 0, serial = 0, whyN[6] = {};
   double stoppedS = 0, serialS = 0;
   Search ref;                     // (verify) the serial computation
+  std::vector<StaleMade> refMade;
   bool settled = false;           // SettleSearchesAhead ran
 };
 
@@ -293,7 +296,24 @@ bool HPathTables::Ready(ClusterMap& m, int L, int cx, int cz, int* budget, bool 
   size_t i = static_cast<size_t>(cz) * m.wc[L] + cx;
   if (tl_pathAheadDry) {  // (MOHO64_PAR_PATH: a clean cluster is read as it is; anything else would be written)
     if (m.dirty[L][i]) throw PathAheadStop{1};
-    if (make && m.stale[L][i]) throw PathAheadStop{2};
+    if (make && m.stale[L][i]) {
+      // (a stale cluster whose data was made ahead, and for a 32-cluster its stale 8-clusters' too: read as it is,
+      // Make called at the take; without data made ahead the play stops)
+      if (!m.grid || !m.ahead[L][i] || !tl_staleMade) throw PathAheadStop{2};
+      if (L == 2)
+        for (int j = 0; j < 4; ++j)
+          for (int k = 0; k < 4; ++k) {
+            const int sx = 4 * cx + k, sz = 4 * cz + j;
+            if (sx >= m.wc[1] || sz >= m.hc[1]) continue;
+            const size_t si = static_cast<size_t>(sz) * m.wc[1] + sx;
+            if (m.stale[1][si] && !m.dirty[1][si] && !m.ahead[1][si]) throw PathAheadStop{2};
+          }
+      std::vector<StaleMade>& v = *tl_staleMade;
+      bool have = false;
+      for (const StaleMade& x : v)
+        if (x.m == &m && x.L == L && x.cx == cx && x.cz == cz) have = true;
+      if (!have) v.push_back({&m, L, cx, cz});
+    }
     return true;
   }
   if (!m.dirty[L][i]) {
@@ -1113,9 +1133,13 @@ bool SameBits(float a, float b) { return std::memcmp(&a, &b, sizeof a) == 0; }
 
 // One search played as SearchesAhead does, on this thread (the stage's task, and verify's serial computation):
 // from a copy of the carried search `from`, or from t's Begin, with `start` work units.
-void HPathTables::PlayAhead(Search& s, const Search* from, PathTraveler* t, int start, int* steps, int* r, int* why) {
-  const bool was = tl_pathAheadDry;
+void HPathTables::PlayAhead(Search& s, const Search* from, PathTraveler* t, int start, int* steps, int* r, int* why,
+                            std::vector<StaleMade>* made) {
+  const bool was = tl_pathAheadDry, wasReads = tl_specDryReads;
   tl_pathAheadDry = true;
+  tl_specDryReads = true;
+  tl_staleMade = made;
+  if (made) made->clear();
   int budget = start;
   bool begun = false;
   try {
@@ -1138,6 +1162,8 @@ void HPathTables::PlayAhead(Search& s, const Search* from, PathTraveler* t, int 
     }
   }
   tl_pathAheadDry = was;
+  tl_specDryReads = wasReads;
+  tl_staleMade = nullptr;
 }
 
 bool HPathTables::SameSearch(const Search& a, const Search& b, std::string* why) const {
@@ -1197,7 +1223,7 @@ void HPathTables::SearchesAhead(WorkerPool& pool, uint32_t round) {
     const PathSpec::Item it = P.items[i];
     // (a carried search has the 2500 work units of its army's beat; a waiting one has at most those: one that would
     // need more is cut by them in any beat it begins, and is not kept)
-    PlayAhead(o.s, it.t ? nullptr : queues_.find(it.army)->second.active.get(), it.t, 2500, &o.steps, &o.r, &o.why);
+    PlayAhead(o.s, it.t ? nullptr : queues_.find(it.army)->second.active.get(), it.t, 2500, &o.steps, &o.r, &o.why, &o.made);
     return o.r != 5 && !(it.t && o.r == 2);
   });
 }
@@ -1251,7 +1277,7 @@ void HPathTables::WorkAll(int /*armies*/) {
           int steps = 0, rr = 0;
           const bool stopped = ahead->r == 4;
           PlayAhead(P->ref, carried ? q.active.get() : nullptr, ahead->s.t,
-                    stopped ? ahead->steps + 1 : 2500, &steps, &rr);
+                    stopped ? ahead->steps + 1 : 2500, &steps, &rr, nullptr, &P->refMade);
           if (stopped && rr == 2) {
             P->ref.expansions -= 1;
             steps -= 1;
@@ -1264,6 +1290,10 @@ void HPathTables::WorkAll(int /*armies*/) {
           P->spec.Checked(same, item, same ? std::string() : b + why);
         }
         std::swap(*q.active, ahead->s);
+        for (const StaleMade& x : ahead->made) {  // (as the steps' Ready calls would: same data, flags and counts)
+          const size_t i = static_cast<size_t>(x.cz) * x.m->wc[x.L] + x.cx;
+          if (x.m->stale[x.L][i] && !x.m->dirty[x.L][i]) Make(*x.m, x.L, x.cx, x.cz);
+        }
         budget -= ahead->steps;
         r = ahead->r;
         if (r == 4) {  // (on from where it stopped, serially)

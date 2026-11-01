@@ -127,6 +127,10 @@ class AiBrain : public ScriptObject {
 
 template <> struct ScriptTypeOf<AiBrain> { static constexpr uint32_t bit = kTypeBrain; };
 
+// The beat's order (docs/parallel-mode.md): the original's, bit for bit (every replay of the original, the gate), or
+// parallel order, our own (new games: the same result at any thread count). Sim::order, decided by Start.
+enum class SimOrder { kOriginal, kParallel };
+
 class Sim {
  public:
   Sim(Vfs* vfs, std::vector<std::string> hookDirs, std::vector<std::string> modUids);
@@ -548,6 +552,15 @@ class Sim {
   // game's Lua are the hook files of the repository's data/fixes/hook, given to the sim state only with `fixes`
   // (and to the rules state, loaded again, in a game with a mod a blueprint fix is for: RulesFixesWanted).
   bool fixes = false;
+  // The beat's order (docs/parallel-mode.md 5), decided by Start(SessionDescription) after `fixes`: the session's
+  // simOrder, else the scenario's Options.RemasterSimOrder (missing: the original's); MOHO64_SIM_ORDER=original |
+  // parallel overrides it. Parallel order needs the fixes (a session asking for it without them does not start).
+  // orderVersion: the parallel order's version the game was made with (Options.RemasterSimOrderVersion; 0 for the
+  // original's order); kSimOrderVersion is this engine's. (Step 1 of the plan: nothing reads the order yet.)
+  SimOrder order = SimOrder::kOriginal;
+  int orderVersion = 0;
+  static constexpr int kSimOrderVersion = 1;
+  bool ParallelOrder() const { return order == SimOrder::kParallel; }
   // The session's mod list as the lobby sent it (a replay's serialized mods): becomes
   // __active_mods in the rules and sim states. Empty: built from the mod uids instead.
   std::string sessionMods;

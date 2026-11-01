@@ -45,4 +45,10 @@ bool PushSerializedLua(lua_State* L, const std::string& blob);
 // the header holds it, serialized) carries it.
 bool ScenarioMarksFixes(const std::string& scenario);
 
+// The simulation order a game was launched with (docs/parallel-mode.md 5), in the scenario info of the header (the
+// host's launch writes it, the same on every client; the replay keeps it): Options.RemasterSimOrder = "parallel" or
+// "original", and Options.RemasterSimOrderVersion, an integer. 1 for "parallel"; 0 for "original", a missing field
+// or anything else (every recording of the original, every FAF replay). *version: the version, 0 when missing.
+int ScenarioSimOrder(const std::string& scenario, int* version);
+
 }  // namespace moho

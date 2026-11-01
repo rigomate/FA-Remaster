@@ -57,6 +57,37 @@
 
 namespace moho {
 namespace {
+// The entity pass's prefetch (e1, 2026-10-31): the pass asks the memory system for the unit d turns ahead (its object's
+// hot lines) and for the next unit's pose and aim arrays. A prefetch is only a hint: it reads nothing the program sees
+// and writes nothing, so the game is the same bit for bit whatever d is. d = 2 (MOHO64_PREFETCH=<d> overrides; 0: off).
+// Measured (quiet machine, same-moment pairs, 8 threads, 3 repeats): entity pass B3-16k -8.3% (tick -3.5%), B1 -3.0%
+// (-0.5%), b8 -3.3% (-0.4%); d = 4 the same on b8 and less on B3 (-7.5%).
+inline void PrefetchSpan(const void* p, size_t bytes) {
+  const char* c = static_cast<const char*>(p);
+  for (size_t o = 0; o < bytes; o += 64) __builtin_prefetch(c + o, 1, 3);
+}
+void PrefetchUnitObject(const Unit* u) {
+  PrefetchSpan(u, 128);
+  PrefetchSpan(&u->position, 64);
+  PrefetchSpan(&u->poseQ, 64);
+  PrefetchSpan(&u->motion, std::min<size_t>(sizeof(UnitMotion), 640));
+  PrefetchSpan(&u->lastPosition, 64);
+  PrefetchSpan(&u->weapons, 64);
+  PrefetchSpan(&u->aimControllers, 64);
+}
+void PrefetchUnitArrays(const Unit* u) {
+  if (!u->poseQ.empty()) PrefetchSpan(u->poseQ.data(), std::min<size_t>(u->poseQ.size() * sizeof(Quat), 1024));
+  if (!u->poseP.empty()) PrefetchSpan(u->poseP.data(), std::min<size_t>(u->poseP.size() * sizeof(Vec3), 768));
+  size_t k = 0;
+  for (const AimController* c : u->aimControllers) {
+    if (++k > 4) break;
+    PrefetchSpan(c, 192);
+  }
+  if (u->motion.bp) __builtin_prefetch(u->motion.bp, 0, 3);
+}
+}  // namespace
+
+namespace {
 
 const char kSimKey = 0;
 
@@ -1232,6 +1263,32 @@ bool Sim::Start(const SessionDescription& session) {
   focusArmy = session.focusArmy;
   isReplay = session.replay;
   fixes = FixesFor(session);
+  // The beat's order (docs/parallel-mode.md 5)
+  {
+    int version = 0;
+    int want = session.simOrder >= 0 ? session.simOrder : ScenarioSimOrder(session.header.scenario, &version);
+    if (session.simOrder >= 0) version = kSimOrderVersion;  // (asked by the host itself: this engine's order)
+    if (const char* o = getenv("MOHO64_SIM_ORDER"); o && *o) {
+      want = !std::strcmp(o, "parallel") ? 1 : 0;
+      version = kSimOrderVersion;
+    }
+    if (want && !fixes) {
+      Logf(LogLevel::Error, "moho64: parallel order needs the engine's script fixes, and this session has them off: not started "
+                            "(docs/parallel-mode.md 5)");
+      return false;
+    }
+    if (want && version > kSimOrderVersion) {
+      Logf(LogLevel::Error, "moho64: this game was made with parallel order version %d; this engine plays version %d: not "
+                            "started (a newer engine is needed)", version, kSimOrderVersion);
+      return false;
+    }
+    if (want && version < kSimOrderVersion)
+      Logf(LogLevel::Warning, "moho64: this game was made with parallel order version %d; this engine plays version %d: it "
+                              "may play differently from how it was played", version, kSimOrderVersion);
+    order = want ? SimOrder::kParallel : SimOrder::kOriginal;
+    orderVersion = want ? kSimOrderVersion : 0;
+    Logf(LogLevel::Info, "moho64: the beat's order: %s", want ? "parallel (docs/parallel-mode.md)" : "the original's");
+  }
   // The multicore switches' default, now that the fixes are known (ParDefault); one given in the environment stays as
   // it was read. (The intel stages' switches are settled at their first use in a beat, per sim: sim/intel.cpp.)
   {
@@ -2442,8 +2499,13 @@ void Sim::Tick() {
     while (entityProjAt < projectiles.size() && projectiles[entityProjAt]->handle < handle)
       ProjectileStep(*this, projectiles[entityProjAt++]);
   };
+  static const size_t prefetchAhead = getenv("MOHO64_PREFETCH") ? static_cast<size_t>(std::max(0, atoi(getenv("MOHO64_PREFETCH")))) : 2;
   for (size_t i = 0; i < motionOrder.size(); ++i) {
     Unit* u = motionOrder[i];
+    if (prefetchAhead) {  // (MOHO64_PREFETCH: hints only)
+      if (i + prefetchAhead < motionOrder.size()) PrefetchUnitObject(motionOrder[i + prefetchAhead]);
+      if (i + 1 < motionOrder.size()) PrefetchUnitArrays(motionOrder[i + 1]);
+    }
     beamsBefore(u->handle);
     projectilesBefore(u->orderHandle ? u->orderHandle : u->handle);
     // Entity::TaskTick 0x679c40, step 1 (0x679c51): the texture scroller, before the attached test below, so a

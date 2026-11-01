@@ -194,7 +194,7 @@ class UnitStateSet {
 };
 
 // A unit's or projectile's layer name ("Land", "Air", "Water", "Sub", "Seabed", ...): a std::string and nothing more (the
-// same object, the same bytes: landnav.cpp's read log takes them raw), whose compare with a string literal takes the
+// same object, the same bytes: landnav.cpp's read log packs its size and characters), whose compare with a string literal takes the
 // literal's length from its type: a length test and a compare of those bytes, instead of the library's strlen of the
 // literal before its compare. The same answer for every string (speed only, 2026-10-31: the layer tests' strlen and
 // compares were about 1% of B1's beat time). A compare with anything else (another layer, a const char* constant, a

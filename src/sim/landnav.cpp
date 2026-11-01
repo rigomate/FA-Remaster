@@ -113,14 +113,22 @@ void NavLogUnit(ReadLog& log, const Unit* e) {
 }
 // (the filters' category caches are made lazily from the sim's blueprints: a turn played ahead that would make one
 // stops; the serial turn makes it)
+// (a unit whose naval / airCat value is not cached: readable ahead when its category mask is made)
+bool CategoryCachesReadable(const Unit* w) {
+  const MotionBlueprint* b = w->motion.bp;
+  if (!b || !w->blueprint) return true;
+  const Sim& sim = *Sim::From(w->luaState());
+  if (b->naval < 0 && !BpCategoryMaskIfMade(sim, "NAVAL")) return false;
+  if (b->airCat < 0 && !BpCategoryMaskIfMade(sim, "AIR")) return false;
+  return true;
+}
 void NavDryCandidate(const Unit* e) {
   // (each unit once a turn: the turn played ahead changes nothing, so a unit's bytes are the same at every test)
   std::vector<const Unit*>& seen = *tl_navDry->logged;
   if (std::find(seen.begin(), seen.end(), e) != seen.end()) return;
   seen.push_back(e);
   NavLogUnit(*tl_navDry->log, e);
-  const MotionBlueprint* b = e->motion.bp;
-  if (b && e->blueprint && (b->naval < 0 || b->airCat < 0)) throw NavDryStop{};
+  if (!CategoryCachesReadable(e)) throw NavDryStop{};
 }
 // sim.EnsureUnitGrid() in the navigators' tests: a turn played ahead finds it made (LandNavAheadRun) or stops
 void NavEnsureUnitGrid(Sim& sim) {
@@ -304,10 +312,8 @@ static bool PathUnitBlockedCore(Unit* u, int x, int z, int flags) {
     if (!GridFindsInBox(sim, e, x0, z0, x1, z1)) return;
     if (tl_navDry) NavDryCandidate(e);
     if (tl_pathAheadDry) {  // (MOHO64_PAR_PATH: the filters' category caches are made lazily: there it stops)
-      for (const Unit* w : {static_cast<const Unit*>(u), static_cast<const Unit*>(e)}) {
-        const MotionBlueprint* b = w->motion.bp;
-        if (b && w->blueprint && (b->naval < 0 || b->airCat < 0)) throw PathAheadStop{5};
-      }
+      for (const Unit* w : {static_cast<const Unit*>(u), static_cast<const Unit*>(e)})
+        if (!CategoryCachesReadable(w)) throw PathAheadStop{5};
     }
     // 0x721488: a Land-layer unit counts for an IgnoreStructures footprint only when its own has the flag;
     // Air and Sub layer units never count
@@ -1465,11 +1471,13 @@ static void LandNavAheadRun(Sim& sim, const std::vector<Unit*>& all) {
              NavLogUnit(log, u);
              NavDry d{&log, &q, &logged};
              tl_navDry = &d;
+             tl_specDryReads = true;
              try {
                UpdateCurrentPosition(sim, u, scratch);
              } catch (const NavDryStop&) {
              }
              tl_navDry = nullptr;
+             tl_specDryReads = false;
              out.n = static_cast<uint32_t>(q.size()) - out.b;
              return out.n > 0;
            });

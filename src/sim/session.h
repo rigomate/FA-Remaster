@@ -31,6 +31,9 @@ struct SessionDescription {
   // replay whose scenario carries the mark of a game played with the fixes, Options.RemasterFixes = "on", gets
   // them too: Sim::Start reads it, replay.h ScenarioMarksFixes); 0 / 1 = as given. MOHO64_FIXES still wins.
   int fixes = -1;
+  // Sim::order (docs/parallel-mode.md 5): -1 = from the scenario's Options.RemasterSimOrder (replay.h ScenarioSimOrder;
+  // missing: the original's order); 0 = the original's order; 1 = parallel order. MOHO64_SIM_ORDER still wins.
+  int simOrder = -1;
   int focusArmy = -1;   // 0-based index into header.armies, -1 = none (launch info +0x68)
   // The GameSpeed option as the client manager gets it (0x53faf0): 'fast' -> 4, otherwise 0; 'adjustable' ->
   // the players may change the speed. The simulation does not use either.
