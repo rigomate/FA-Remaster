@@ -249,6 +249,74 @@ int l_MakeNavGridLeafXZ(lua_State* L) {
   return 1;
 }
 
+// The closure MakeCategoryChain returns: f(site, verify, ops, a, b, c, d, e, f, g, h), a category expression kept per
+// call site: the value a ops[1] b ops[2] c ... folded from the left (each step fOp(op, left, right), fOp the script's
+// own operator function, upvalue 2), kept under `site` with its operands (upvalue 1: site -> {[1..n] operands,
+// [9] value, [10] n}); while the same operands come again (the VM's `==`, lua_equal, for the first n of them, n as kept)
+// the kept value is handed back. What a script's
+//   local t = cache[site]; if not t then t = {}; cache[site] = t end
+//   if t.n and t[1] == a and ... then return t.r end; r = a; for each op: r = fOp(op, r, next operand); keep; return r
+// gives, with the same operands and the same answers (`verify`, the script's own test function, is not called here).
+int l_CategoryChain(lua_State* L) {
+  lua_settop(L, 11);
+  size_t len = 0;
+  const char* ops = luaL_checklstring(L, 3, &len);
+  if (len > 7) return luaL_error(L, "CategoryChain: at most 7 operators");
+  lua_pushvalue(L, 1);
+  lua_rawget(L, lua_upvalueindex(1));  // 12: the site's table
+  if (!lua_istable(L, 12)) {
+    lua_pop(L, 1);
+    lua_newtable(L);
+    lua_pushvalue(L, 1);
+    lua_pushvalue(L, 12);
+    lua_rawset(L, lua_upvalueindex(1));
+  }
+  lua_rawgeti(L, 12, 10);  // 13: n as kept
+  if (lua_type(L, 13) == LUA_TNUMBER) {
+    const int n = static_cast<int>(lua_tonumber(L, 13));
+    bool same = true;
+    for (int i = 1; i <= n && same; ++i) {
+      lua_rawgeti(L, 12, i);
+      same = lua_equal(L, -1, 3 + i) != 0;
+      lua_pop(L, 1);
+    }
+    if (same) {
+      lua_rawgeti(L, 12, 9);
+      return 1;
+    }
+  }
+  lua_settop(L, 12);
+  const int n = static_cast<int>(len) + 1;
+  lua_pushvalue(L, 4);  // 13: r = a
+  for (int i = 0; i < static_cast<int>(len); ++i) {
+    lua_pushvalue(L, lua_upvalueindex(2));
+    lua_pushlstring(L, ops + i, 1);
+    lua_pushvalue(L, 13);
+    lua_pushvalue(L, 5 + i);
+    lua_call(L, 3, 1);
+    lua_replace(L, 13);
+  }
+  for (int i = 1; i <= n; ++i) {
+    lua_pushvalue(L, 3 + i);
+    lua_rawseti(L, 12, i);
+  }
+  lua_pushnumber(L, n);
+  lua_rawseti(L, 12, 10);
+  lua_pushvalue(L, 13);
+  lua_rawseti(L, 12, 9);
+  lua_settop(L, 13);
+  return 1;
+}
+
+// Remastered.MakeCategoryChain(fOp): l_CategoryChain over a cache of its own and the script's operator function.
+int l_MakeCategoryChain(lua_State* L) {
+  luaL_checktype(L, 1, LUA_TFUNCTION);
+  lua_newtable(L);
+  lua_pushvalue(L, 1);
+  lua_pushcclosure(L, l_CategoryChain, 2);
+  return 1;
+}
+
 }  // namespace
 
 void RegisterRemasteredLib(lua_State* L) {
@@ -269,6 +337,9 @@ void RegisterRemasteredLib(lua_State* L) {
   lua_rawset(L, -3);
   lua_pushstring(L, "MakeNavGridLeafXZ");
   lua_pushcfunction(L, l_MakeNavGridLeafXZ);
+  lua_rawset(L, -3);
+  lua_pushstring(L, "MakeCategoryChain");
+  lua_pushcfunction(L, l_MakeCategoryChain);
   lua_rawset(L, -3);
   RegisterRemasteredReclaim(L);
   lua_rawset(L, LUA_GLOBALSINDEX);

@@ -468,6 +468,30 @@ function VariantCategoryChain(sSite, fVerify, sOps, a, b, c, d, e, f, g, h)
     return r
 end
 
+--FA Remastered variant: on FA Remastered with its script fixes on, the engine keeps the same per-site expressions in C
+--(Remastered.MakeCategoryChain over VariantCategoryOp: the same cache, the same `==` on the operands, the same operator
+--calls in the same order when they changed), and VariantCategoryChain is that, called directly. On any other engine
+--the Lua function above stays. bVariantVerifyNative runs both on every call (each with a cache of its own), compares
+--the two results' bits, uses the Lua one and logs any difference.
+if tVariantNative and tVariantNative.MakeCategoryChain then
+    local VariantNativeCategoryChain = tVariantNative.MakeCategoryChain(VariantCategoryOp)
+    if bVariantVerifyNative then
+        local VariantLuaCategoryChain = VariantCategoryChain
+        VariantCategoryChain = function(sSite, fVerify, sOps, a, b, c, d, e, f, g, h)
+            local rLua = VariantLuaCategoryChain(sSite, fVerify, sOps, a, b, c, d, e, f, g, h)
+            local rNative = VariantNativeCategoryChain(sSite, nil, sOps, a, b, c, d, e, f, g, h)
+            iVariantVerifyNativeChecks = iVariantVerifyNativeChecks + 1
+            if not(EntityCategoryEmpty(rLua - rNative)) or not(EntityCategoryEmpty(rNative - rLua)) then
+                iVariantVerifyNativeMismatches = iVariantVerifyNativeMismatches + 1
+                LOG('VERIFY MISMATCH native category chain '..sSite..' '..sOps..' mismatches='..iVariantVerifyNativeMismatches)
+            end
+            return rLua
+        end
+    else
+        VariantCategoryChain = VariantNativeCategoryChain
+    end
+end
+
 function ForkedDrawRectangle(rRect, iColour, iDisplayCount)
     --Only call via cork thread
     --Draws lines around rRect; rRect should be a rect table, with keys x0, x1, y0, y1
