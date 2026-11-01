@@ -1242,6 +1242,18 @@ bool KindOk(int t) { return t >= 0 && t <= 13; }
 int TypeArg(lua_State* L, int idx) { return EnumValue(L, kEnumIntel, luaL_checkstring(L, idx)); }
 
 // InitIntel(army, type, [radius]) 0x68ea20
+// The four intel calls move the entity to the newest end of the sim's dirty-entity list sim+0xa5c, whatever they
+// change: an unconditional unlink and head insertion of the node +0x60 once the entity's CIntel is there (EnableIntel
+// 0x68e267..0x68e29b, DisableIntel 0x68e523.., SetIntelRadius 0x68e798.., InitIntel 0x68ed17..), as SetHealth does.
+// The list's order is the order AdvanceCoords re-registers moved units in the entity grid (GridAdvanceCoords), which
+// decides who a steering's CheckCollisions asks first in a shared cell. Seen (oracle probes mp1_18050c / d): MP1
+// 17706, army 6's Aeon engineer 0x600104 takes the Water layer and FAF's OnLayerChange switches its vision to
+// WaterVision: the original walks it behind 0x600106 from then on (0x600106 did the same at 17696); ours kept the
+// order of their last health changes, so at 18045 0x600110 asked 0x600106 first, took another record and side-stepped
+// at 18050.
+static void IntelRelink(Sim& sim, Entity* e) {
+  if (e->kind == Entity::Kind::Unit) sim.MarkDirty(static_cast<Unit*>(e));
+}
 int l_InitIntel(lua_State* L) {
   Entity* e = CheckObject<Entity>(L, 1);
   Sim& sim = *S(L);
@@ -1287,13 +1299,17 @@ int l_InitIntel(lua_State* L) {
     }
     for (int s = 1; s <= 8; ++s) UpdatePos(IS(sim), ei.h[s], s, c, sim.tick(), false);
   }
+  IntelRelink(sim, e);
   return 0;
 }
 int l_EnableIntel(lua_State* L) {
   Entity* e = CheckObject<Entity>(L, 1);
   int t = TypeArg(L, 2);
   if (!KindOk(t)) return 0;
-  if (HasCIntel(e)) SetAttrEnabled(e, t, true);
+  if (HasCIntel(e)) {
+    SetAttrEnabled(e, t, true);
+    IntelRelink(*S(L), e);
+  }
   if (!e->intel) return 0;
   EntityIntel& ei = *e->intel;
   if (t <= 8) {
@@ -1311,7 +1327,10 @@ int l_DisableIntel(lua_State* L) {
   Entity* e = CheckObject<Entity>(L, 1);
   int t = TypeArg(L, 2);
   if (!KindOk(t)) return 0;
-  if (HasCIntel(e)) SetAttrEnabled(e, t, false);
+  if (HasCIntel(e)) {
+    SetAttrEnabled(e, t, false);
+    IntelRelink(*S(L), e);
+  }
   if (!e->intel) return 0;
   EntityIntel& ei = *e->intel;
   if (t <= 8) {
@@ -1339,7 +1358,10 @@ int l_SetIntelRadius(lua_State* L) {
   if (!KindOk(t)) return 0;
   double r = luaL_checknumber(L, 3);
   uint32_t R = r > 0 ? static_cast<uint32_t>(r) : 0;
-  if (HasCIntel(e)) SetAttrRadius(e, t, R);  // 0x68e76a..0x68e77a, with or without a circle of that kind
+  if (HasCIntel(e)) {
+    SetAttrRadius(e, t, R);  // 0x68e76a..0x68e77a, with or without a circle of that kind
+    IntelRelink(*S(L), e);
+  }
   if (!e->intel || t > 8) return 0;
   IntelHandle& h = e->intel->h[t];
   if (!h.exists || h.radius == R) return 0;
