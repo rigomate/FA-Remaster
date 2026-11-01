@@ -32,6 +32,10 @@ struct Pose {
   // a factory's parts: machinery.h); none: all at their size
   const float* scales = nullptr;
   uint32_t scaleFrom = 0, scaleCount = 0;
+  // [machinery] how strongly bones from `glowFrom` on glow (`glowCount` of them; 1: as their texture says): a structure's
+  // lit pieces pulsing with their lamp. Only for a model whose machinery has glows (MachinerySpec::glows)
+  const float* glows = nullptr;
+  uint32_t glowFrom = 0, glowCount = 0;
 };
 
 class MeshRenderer {
