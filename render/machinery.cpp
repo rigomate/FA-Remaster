@@ -42,6 +42,14 @@ int BoneNamed(const std::vector<ModelBone>& bones, const std::string& name) {
 
 float Fraction(double x) { return static_cast<float>(x - std::floor(x)); }
 
+// How strong a pulse is (1: full) at the unit's clock, in its state by how far the unit is at work (`w`).
+float Pulse(const MachinerySpec::Lamp& l, double clock, float offset, float w) {
+  const float in = l.state == MachinerySpec::State::Always ? 1.0f : l.state == MachinerySpec::State::Idle ? 1 - w : w;
+  const float u = Fraction(clock / l.period + l.phase + offset);
+  const float wave = l.beat ? (u < 0.15f ? u / 0.15f : 1 - (u - 0.15f) / 0.85f) : 0.5f - 0.5f * std::cos(u * 2 * kPi);
+  return 1 - in * (1 - (l.low + (1 - l.low) * wave));
+}
+
 MachinerySpec::State StateNamed(const std::string& s, MachinerySpec::State fallback) {
   if (s == "idle") return MachinerySpec::State::Idle;
   if (s == "always") return MachinerySpec::State::Always;
@@ -193,11 +201,22 @@ std::shared_ptr<const MachinerySpec> ReadMachinery(const std::string& text, cons
     lamp.state = StateNamed(l["state"].StringOr(""), MachinerySpec::State::Always);
     if (lamp.index >= 0) spec->lamps.push_back(lamp);
   }
+  for (const JsonValue& g : root["glow"].items) {
+    MachinerySpec::Glow glow;
+    glow.bone = BoneNamed(bones, g["bone"].StringOr(""));
+    glow.timing.period = std::max(0.05f, static_cast<float>(g["period"].NumberOr(2)));
+    glow.timing.phase = static_cast<float>(g["phase"].NumberOr(0));
+    glow.timing.low = std::clamp(static_cast<float>(g["low"].NumberOr(0.2)), 0.0f, 1.0f);
+    glow.timing.beat = g["ease"].StringOr("sine") == "beat";
+    glow.timing.state = StateNamed(g["state"].StringOr(""), MachinerySpec::State::Always);
+    if (glow.bone >= 0) spec->glowParts.push_back(glow);
+  }
+  spec->glows = !spec->glowParts.empty();
   for (const MachinerySpec::Part& part : spec->parts)
     for (const MachinerySpec::Motion* m : {&part.work, &part.idle})
       for (const MachinerySpec::Key& k : m->keys) spec->scales = spec->scales || k.scale.x != 1 || k.scale.y != 1 || k.scale.z != 1;
-  if (spec->parts.empty() && spec->lamps.empty()) {
-    *why = "no bones and no lamps";
+  if (spec->parts.empty() && spec->lamps.empty() && spec->glowParts.empty()) {
+    *why = "no bones, lamps or glows";
     return nullptr;
   }
   return spec;
@@ -225,6 +244,7 @@ void Machinery::Begin(double clock, bool first, Vec3 eye) {
   }
   lists_.clear();
   scaleLists_.clear();
+  glowLists_.clear();
   clock_ = clock;
   posed = 0;
 }
@@ -324,6 +344,14 @@ float Machinery::PoseUnit(const FrameUnit& unit, const Model& model, Vec3 at, co
       f.hidden = hidden[i];
       out.push_back(f);
     }
+    if (out.empty() && spec.glows && !model.bones.empty()) {  // (posed all the same, at rest: its glows ride on its rows)
+      FrameBone f;
+      const Vec3 p = model.bones[0].position * model.scale;
+      f.position[0] = p.x, f.position[1] = p.y, f.position[2] = p.z;
+      const Quat& q = model.bones[0].rotation;
+      f.orientation[0] = q.x, f.orientation[1] = q.y, f.orientation[2] = q.z, f.orientation[3] = q.w;
+      out.push_back(f);
+    }
     if (which == 0) pose->now = out.data(), pose->nowCount = out.size();
     else pose->next = out.data(), pose->nextCount = out.size();
   }
@@ -343,14 +371,18 @@ float Machinery::PoseUnit(const FrameUnit& unit, const Model& model, Vec3 at, co
   // its lamps' pulse: in their state by how far the unit is at work (outside it as the list has them)
   if (first_) {
     s.lamps.assign(model.lights.size(), 1.0f);
-    for (const MachinerySpec::Lamp& l : spec.lamps) {
-      if (static_cast<size_t>(l.index) >= s.lamps.size()) continue;
-      const float in = l.state == MachinerySpec::State::Always ? 1.0f : l.state == MachinerySpec::State::Idle ? 1 - w : w;
-      const float u = Fraction(clock_ / l.period + l.phase + offset);
-      const float wave = l.beat ? (u < 0.15f ? u / 0.15f : 1 - (u - 0.15f) / 0.85f) : 0.5f - 0.5f * std::cos(u * 2 * kPi);
-      const float pulse = l.low + (1 - l.low) * wave;
-      s.lamps[static_cast<size_t>(l.index)] = 1 - in * (1 - pulse);
-    }
+    for (const MachinerySpec::Lamp& l : spec.lamps)
+      if (static_cast<size_t>(l.index) < s.lamps.size()) s.lamps[static_cast<size_t>(l.index)] = Pulse(l, clock_, offset, w);
+  }
+  if (spec.glows) {  // its lit parts' glow, by bone from the first of them (MeshRenderer::BuildRows)
+    uint32_t lo = 0xffffffffu, hi = 0;
+    for (const MachinerySpec::Glow& g : spec.glowParts) lo = std::min(lo, static_cast<uint32_t>(g.bone)), hi = std::max(hi, static_cast<uint32_t>(g.bone));
+    glowLists_.emplace_back(static_cast<size_t>(hi - lo + 1), 1.0f);
+    std::vector<float>& gl = glowLists_.back();
+    for (const MachinerySpec::Glow& g : spec.glowParts) gl[static_cast<uint32_t>(g.bone) - lo] = Pulse(g.timing, clock_, offset, w);
+    pose->glows = gl.data();
+    pose->glowFrom = lo;
+    pose->glowCount = hi - lo + 1;
   }
   ++posed;
 
