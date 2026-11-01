@@ -7,6 +7,8 @@
 #include "script/fastlib.h"
 
 #include <cstdlib>
+#include <string>
+#include <vector>
 
 namespace moho {
 namespace {
@@ -317,6 +319,63 @@ int l_MakeCategoryChain(lua_State* L) {
   return 1;
 }
 
+// The closure MakeFieldTest returns: f(v), the value of the Lua expression `v and v.f1 and not v.f2 and ...` as a
+// boolean (spec "+f1 -f2 ...": + the field must be true, - it must be false or nil), for the script function
+// `if v and v.f1 and not(v.f2) ... then return true end return false`. The fields are read in the spec's order through
+// lua_gettable (the VM's own indexing: metamethods as `v.f`), stopping at the first that fails, as `and` stops. A v
+// that is neither false / nil nor a table goes to the script's own function (upvalue 1), so whatever the VM does
+// there (an indexing error, a string's fields) is what that function does.
+int l_FieldTest(lua_State* L) {
+  lua_settop(L, 1);
+  if (!lua_toboolean(L, 1)) {
+    lua_pushboolean(L, 0);
+    return 1;
+  }
+  if (!lua_istable(L, 1)) {
+    lua_pushvalue(L, lua_upvalueindex(1));
+    lua_pushvalue(L, 1);
+    lua_call(L, 1, 1);
+    return 1;
+  }
+  const char* signs = lua_tostring(L, lua_upvalueindex(2));
+  for (int i = 0; signs[i]; ++i) {
+    lua_pushvalue(L, lua_upvalueindex(3 + i));
+    lua_gettable(L, 1);
+    const bool truthy = lua_toboolean(L, -1) != 0;
+    lua_pop(L, 1);
+    if (truthy != (signs[i] == '+')) {
+      lua_pushboolean(L, 0);
+      return 1;
+    }
+  }
+  lua_pushboolean(L, 1);
+  return 1;
+}
+
+// Remastered.MakeFieldTest(spec, fallback): l_FieldTest over the spec's fields (at most 16) and the script's function.
+int l_MakeFieldTest(lua_State* L) {
+  const char* spec = luaL_checkstring(L, 1);
+  luaL_checktype(L, 2, LUA_TFUNCTION);
+  std::string signs;
+  std::vector<std::string> names;
+  for (const char* p = spec; *p;) {
+    while (*p == ' ') ++p;
+    if (!*p) break;
+    if (*p != '+' && *p != '-') return luaL_error(L, "MakeFieldTest: each field starts with + or -");
+    signs += *p++;
+    const char* s = p;
+    while (*p && *p != ' ') ++p;
+    if (p == s) return luaL_error(L, "MakeFieldTest: a field without a name");
+    names.emplace_back(s, p);
+  }
+  if (names.empty() || names.size() > 16) return luaL_error(L, "MakeFieldTest: 1 to 16 fields");
+  lua_settop(L, 2);
+  lua_pushstring(L, signs.c_str());
+  for (const std::string& n : names) lua_pushstring(L, n.c_str());
+  lua_pushcclosure(L, l_FieldTest, 2 + static_cast<int>(names.size()));
+  return 1;
+}
+
 }  // namespace
 
 void RegisterRemasteredLib(lua_State* L) {
@@ -340,6 +399,9 @@ void RegisterRemasteredLib(lua_State* L) {
   lua_rawset(L, -3);
   lua_pushstring(L, "MakeCategoryChain");
   lua_pushcfunction(L, l_MakeCategoryChain);
+  lua_rawset(L, -3);
+  lua_pushstring(L, "MakeFieldTest");
+  lua_pushcfunction(L, l_MakeFieldTest);
   lua_rawset(L, -3);
   RegisterRemasteredReclaim(L);
   lua_rawset(L, LUA_GLOBALSINDEX);
