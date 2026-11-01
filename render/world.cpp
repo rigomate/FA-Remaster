@@ -744,6 +744,7 @@ void World::AddLamps(const Model* model, Vec3 position, const Quat& orientation,
       }
     }
     float on = lampsOn_ * light.strength * 0.5f;  // (1 in the list: a strong lamp to an eye opened for the night)
+    if (model->machinery && id) on *= machinery.LampScale(id, static_cast<size_t>(&light - model->lights.data()));  // [machinery] (its pulse)
     if (light.blink > 0) {  // (each lamp on its own beat, by where it is)
       const float beat = time_ / light.blink + position.x * 0.37f + position.z * 0.53f;
       if (beat - std::floor(beat) > 0.5f) on *= 0.12f;

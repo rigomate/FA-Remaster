@@ -28,6 +28,10 @@ struct Pose {
   const FrameBone* next = nullptr;
   size_t nextCount = 0;
   float blend = 0;
+  // [machinery] bones from `scaleFrom` on (`scaleCount` of them) scaled in their own axes at rest by `scales` (x, y, z each;
+  // a factory's parts: machinery.h); none: all at their size
+  const float* scales = nullptr;
+  uint32_t scaleFrom = 0, scaleCount = 0;
 };
 
 class MeshRenderer {

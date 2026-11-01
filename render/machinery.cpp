@@ -42,6 +42,13 @@ int BoneNamed(const std::vector<ModelBone>& bones, const std::string& name) {
 
 float Fraction(double x) { return static_cast<float>(x - std::floor(x)); }
 
+MachinerySpec::State StateNamed(const std::string& s, MachinerySpec::State fallback) {
+  if (s == "idle") return MachinerySpec::State::Idle;
+  if (s == "always") return MachinerySpec::State::Always;
+  if (s == "building") return MachinerySpec::State::Building;
+  return fallback;
+}
+
 // One of a part's motions from the file ("building" or "idle"; none there: Still).
 void ReadMotion(const JsonValue& w, MachinerySpec::Motion* m) {
   const std::string mode = w["mode"].StringOr("");
@@ -56,7 +63,17 @@ void ReadMotion(const JsonValue& w, MachinerySpec::Motion* m) {
       key.t = Fraction(k.items[0].NumberOr(0));
       key.turn = Euler(k.items[1]);
       key.move = Vector(k.items[2]);
-      key.sine = k.items.size() > 3 ? k.items[3].StringOr(sine ? "sine" : "linear") != "linear" : sine;
+      // (a 4th: its scale, a number or [sx, sy, sz], or the ease; a 5th: the ease after a scale)
+      size_t ease = 3;
+      if (k.items.size() > 3 && k.items[3].kind == JsonValue::Number) {
+        const float v = static_cast<float>(k.items[3].number);
+        key.scale = {v, v, v};
+        ease = 4;
+      } else if (k.items.size() > 3 && k.items[3].kind == JsonValue::Array) {
+        key.scale = Vector(k.items[3], {1, 1, 1});
+        ease = 4;
+      }
+      key.sine = k.items.size() > ease ? k.items[ease].StringOr(sine ? "sine" : "linear") != "linear" : sine;
       m->keys.push_back(key);
     }
     std::sort(m->keys.begin(), m->keys.end(), [](const MachinerySpec::Key& a, const MachinerySpec::Key& b) { return a.t < b.t; });
@@ -74,10 +91,11 @@ void ReadMotion(const JsonValue& w, MachinerySpec::Motion* m) {
 
 // A motion at the point `u` (0..1) of its cycle: its turn and move, and whether it hides (a loop's jump back: then it
 // waits where it comes back, so that the frame it shows again it does not streak there).
-void Evaluate(const MachinerySpec::Motion& m, float u, Quat* r, Vec3* move, bool* hidden) {
+void Evaluate(const MachinerySpec::Motion& m, float u, Quat* r, Vec3* move, bool* hidden, Vec3* scale) {
   *r = Quat{};
   *move = Vec3{};
   *hidden = false;
+  *scale = {1, 1, 1};
   if (m.mode == MachinerySpec::Motion::Keys) {
     const std::vector<MachinerySpec::Key>& k = m.keys;
     size_t j = k.size() - 1;
@@ -95,6 +113,7 @@ void Evaluate(const MachinerySpec::Motion& m, float u, Quat* r, Vec3* move, bool
     }
     *r = Nlerp(a.turn, b.turn, along);
     *move = Lerp(a.move, b.move, along);
+    *scale = Lerp(a.scale, b.scale, along);
   } else if (m.mode == MachinerySpec::Motion::Loop) {
     const float run = 1 - m.gap;
     *hidden = u >= run;
@@ -160,13 +179,33 @@ std::shared_ptr<const MachinerySpec> ReadMachinery(const std::string& text, cons
       for (const JsonValue& w : e["on_keys"].items)
         if (w.items.size() >= 2)
           emitter.windows.push_back({static_cast<float>(w.items[0].NumberOr(0)), static_cast<float>(w.items[1].NumberOr(0))});
+      if (emitter.of < 0 && e["of"].kind == JsonValue::Null) emitter.of = static_cast<int>(i);  // (its own part's cycle)
+      emitter.state = StateNamed(e["state"].StringOr(""), MachinerySpec::State::Building);
       if (!emitter.blueprint.empty() && emitter.of >= 0) spec->parts[i].emitters.push_back(emitter);
     }
-  if (spec->parts.empty()) {
-    *why = "no bones";
+  for (const JsonValue& l : root["lamps"].items) {
+    MachinerySpec::Lamp lamp;
+    lamp.index = static_cast<int>(l["lamp"].NumberOr(-1));
+    lamp.period = std::max(0.05f, static_cast<float>(l["period"].NumberOr(2)));
+    lamp.phase = static_cast<float>(l["phase"].NumberOr(0));
+    lamp.low = std::clamp(static_cast<float>(l["low"].NumberOr(0.2)), 0.0f, 1.0f);
+    lamp.beat = l["ease"].StringOr("sine") == "beat";
+    lamp.state = StateNamed(l["state"].StringOr(""), MachinerySpec::State::Always);
+    if (lamp.index >= 0) spec->lamps.push_back(lamp);
+  }
+  for (const MachinerySpec::Part& part : spec->parts)
+    for (const MachinerySpec::Motion* m : {&part.work, &part.idle})
+      for (const MachinerySpec::Key& k : m->keys) spec->scales = spec->scales || k.scale.x != 1 || k.scale.y != 1 || k.scale.z != 1;
+  if (spec->parts.empty() && spec->lamps.empty()) {
+    *why = "no bones and no lamps";
     return nullptr;
   }
   return spec;
+}
+
+float Machinery::LampScale(uint32_t unit, size_t lamp) const {
+  auto it = units_.find(unit);
+  return it == units_.end() || lamp >= it->second.lamps.size() ? 1.0f : it->second.lamps[lamp];
 }
 
 void Machinery::Begin(double clock, bool first, Vec3 eye) {
@@ -185,6 +224,7 @@ void Machinery::Begin(double clock, bool first, Vec3 eye) {
     it = units_.erase(it);
   }
   lists_.clear();
+  scaleLists_.clear();
   clock_ = clock;
   posed = 0;
 }
@@ -230,16 +270,18 @@ float Machinery::PoseUnit(const FrameUnit& unit, const Model& model, Vec3 at, co
   std::vector<Vec3> placed(spec.parts.size());
   std::vector<Quat> turned(spec.parts.size());
   std::vector<bool> hidden(spec.parts.size(), false);
+  std::vector<Vec3> scaled(spec.parts.size(), Vec3{1, 1, 1});
   for (size_t i = 0; i < spec.parts.size(); ++i) {
     const MachinerySpec::Part& part = spec.parts[i];
     // its idle motion (or rest) and its work, blended by how far the factory is at work
     Quat r, workR;
-    Vec3 move, workMove;
+    Vec3 move, workMove, scale{1, 1, 1}, workScale{1, 1, 1};
     bool idleHidden = false, workHidden = false;
-    if (w < 1) Evaluate(part.idle, cycle(part.idle), &r, &move, &idleHidden);
-    if (w > 0) Evaluate(part.work, cycle(part.work), &workR, &workMove, &workHidden);
+    if (w < 1) Evaluate(part.idle, cycle(part.idle), &r, &move, &idleHidden, &scale);
+    if (w > 0) Evaluate(part.work, cycle(part.work), &workR, &workMove, &workHidden, &workScale);
     r = Nlerp(r, workR, w);
     move = Lerp(move, workMove, w);
+    scaled[i] = Lerp(scale, workScale, w);
     hidden[i] = w >= 0.5f ? workHidden : idleHidden;
     // the parent as posed now (the simulation's bone, or a part before this one), and this part on it as it stands to it
     // at rest, turned and moved about its head in the parent's axes at rest
@@ -285,6 +327,31 @@ float Machinery::PoseUnit(const FrameUnit& unit, const Model& model, Vec3 at, co
     if (which == 0) pose->now = out.data(), pose->nowCount = out.size();
     else pose->next = out.data(), pose->nextCount = out.size();
   }
+  if (spec.scales && !spec.parts.empty()) {  // (the parts' scales, by bone from the first part's: BuildRows)
+    uint32_t lo = 0xffffffffu, hi = 0;
+    for (const MachinerySpec::Part& part : spec.parts) lo = std::min(lo, static_cast<uint32_t>(part.bone)), hi = std::max(hi, static_cast<uint32_t>(part.bone));
+    scaleLists_.emplace_back(static_cast<size_t>(hi - lo + 1) * 3, 1.0f);
+    std::vector<float>& sc = scaleLists_.back();
+    for (size_t i = 0; i < spec.parts.size(); ++i) {
+      float* d = sc.data() + (static_cast<uint32_t>(spec.parts[i].bone) - lo) * 3;
+      d[0] = scaled[i].x, d[1] = scaled[i].y, d[2] = scaled[i].z;
+    }
+    pose->scales = sc.data();
+    pose->scaleFrom = lo;
+    pose->scaleCount = hi - lo + 1;
+  }
+  // its lamps' pulse: in their state by how far the unit is at work (outside it as the list has them)
+  if (first_) {
+    s.lamps.assign(model.lights.size(), 1.0f);
+    for (const MachinerySpec::Lamp& l : spec.lamps) {
+      if (static_cast<size_t>(l.index) >= s.lamps.size()) continue;
+      const float in = l.state == MachinerySpec::State::Always ? 1.0f : l.state == MachinerySpec::State::Idle ? 1 - w : w;
+      const float u = Fraction(clock_ / l.period + l.phase + offset);
+      const float wave = l.beat ? (u < 0.15f ? u / 0.15f : 1 - (u - 0.15f) / 0.85f) : 0.5f - 0.5f * std::cos(u * 2 * kPi);
+      const float pulse = l.low + (1 - l.low) * wave;
+      s.lamps[static_cast<size_t>(l.index)] = 1 - in * (1 - pulse);
+    }
+  }
   ++posed;
 
   const float belt = spec.beltBone >= 0 ? static_cast<float>(s.belt) : -1.0f;
@@ -297,9 +364,11 @@ float Machinery::PoseUnit(const FrameUnit& unit, const Model& model, Vec3 at, co
   for (size_t i = 0; i < spec.parts.size(); ++i)
     for (const MachinerySpec::Emitter& em : spec.parts[i].emitters) {
       uint32_t& handle = s.emitters[e++];
-      bool on = w >= 0.5f && !hidden[i];
-      if (on) {
-        const float u = cycle(spec.parts[em.of].work);
+      const bool atWork = w >= 0.5f;
+      bool on = !hidden[i] && (em.state == MachinerySpec::State::Always || (em.state == MachinerySpec::State::Building) == atWork);
+      if (on && !em.windows.empty()) {
+        const MachinerySpec::Part& of = spec.parts[em.of];
+        const float u = cycle(atWork || of.idle.mode == MachinerySpec::Motion::Still ? of.work : of.idle);
         bool in = false;
         for (const auto& win : em.windows) in = in || (u >= win.first && u <= win.second);
         on = in;
