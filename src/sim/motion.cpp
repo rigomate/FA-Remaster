@@ -1944,6 +1944,14 @@ void MotionTick(Sim& sim, Unit* u) {
     m.noMoveTo = true;
     return;
   }
+  // MotionTick 0x6b9d26: a unit being built (vt+0x34 IsBeingBuilt) takes no step at all (0x6ba1ca, no MoveTo), its
+  // ballistic state included. Seen: MP1 17803, army 6's unfinished sub 0x60004c let go by the Tempest's external
+  // factory with DetachAll(bone) falls (state 2, the Air layer) but stays where it was; ours dropped it onto the water
+  // in the same beat.
+  if (m.ballistic && u->beingBuilt) {
+    m.noMoveTo = true;
+    return;
+  }
   if (m.ballistic) {  // dropped from a transport: falls (also when dead)
     LandBallisticTick(sim, u);
     return;

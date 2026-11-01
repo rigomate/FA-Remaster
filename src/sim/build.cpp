@@ -4743,12 +4743,21 @@ int l_ShowHideBone(lua_State* L) {
   }
   return 0;
 }
-int l_DetachAll(lua_State* L) {  // entity:DetachAll(bone)
+// Entity:DetachAll(bone, [skipBallistic]) 0x68c6d0: every child on that bone goes through its own DetachFrom (vt+0x60,
+// 0x68c864) with the skip flag of arg 3 (lua_toboolean 0x90c740 / 0x415560 at 0x68c793..0x68c7bd: false when not
+// given), so a unit that cannot fly falls (DetachFromFalls), as with DetachFrom(). Seen: MP1 17803, army 6's
+// unfinished sub 0x60004c let go by the Tempest's external factory (DetachAll(bone)): the original's takes the Air
+// layer (the fall of a unit being built goes nowhere: it stays put), ours kept the Sub layer.
+int l_DetachAll(lua_State* L) {
   Entity* e = ToObject<Entity>(L, 1);
   if (!e) return 0;
   int bone = lua_isnoneornil(L, 2) ? -2 : BoneIndex(L, e, 2);
+  const bool skip = lua_toboolean(L, 3) != 0;
+  std::vector<Unit*> children;  // (a copy: a detach may run scripts)
   for (Unit* o : S(L)->units())
-    if (o->parentId == EntityRef(e) && (bone == -2 || o->parentBone == bone)) Detach(*S(L), o);
+    if (o->parentId == EntityRef(e) && (bone == -2 || o->parentBone == bone)) children.push_back(o);
+  for (Unit* o : children)
+    if (o->parentId == EntityRef(e) && (skip || !DetachFromFalls(*S(L), o))) Detach(*S(L), o);
   return 0;
 }
 int l_GetParent(lua_State* L) {
