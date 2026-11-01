@@ -3916,10 +3916,21 @@ int main(int argc, char** argv) {
         pose.now = pose.next = u.bones.data();
         pose.nowCount = pose.nextCount = u.bones.size();
       }
-      const bool posed = u.turned >= 0 || !u.bones.empty();
+      // [machinery] a remastered structure's or factory's parts (machinery.h), at rest or in its idle motion: it builds nothing
+      const uint32_t placedId = 0x40000000u | static_cast<uint32_t>(&u - placedUnits.data());
+      float belt = -1;
+      if (u.model->machinery && opt.built >= 1) {
+        if (u.bones.empty() && u.turned < 0) pose.now = pose.next = nullptr, pose.nowCount = pose.nextCount = 0;
+        FrameUnit fu;
+        fu.id = placedId;
+        fu.position[0] = u.position.x, fu.position[1] = u.position.y, fu.position[2] = u.position.z;
+        belt = world.machinery.PoseUnit(fu, *u.model, u.position, Quat{}, std::string(), &pose);
+      }
+      const bool posed = pose.nowCount > 0 || pose.nextCount > 0;
       meshes.Add(u.model, Mat4::FromTRS(u.position, Quat{}, u.model->scale), kArmyColors[0], opt.shielded ? 3.0f : opt.built, posed ? &pose : nullptr);
+      meshes.Belt(belt);
       if (const WearLook* w = world.WearOf(0x40000000u | static_cast<uint32_t>(&u - placedUnits.data()))) meshes.Wear(*w);  // (--wear-test)
-      world.AddLamps(u.model, u.position, Quat{}, posed ? &pose : nullptr, &kArmyColors[0]);
+      world.AddLamps(u.model, u.position, Quat{}, posed ? &pose : nullptr, &kArmyColors[0], placedId, u.building);
       world.water.AddAfloat(u.position, Quat{}, u.model->boundsMin * u.model->scale, u.model->boundsMax * u.model->scale);  // [floatfoam]
       world.MarkOutline(u.model, u.position, kArmyColors[0], u.building, static_cast<uint32_t>(&u - placedUnits.data()), u.icon);  // (as the player's own)
       icons.Add(u.icon, u.position, kArmyColors[0]);

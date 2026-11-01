@@ -1121,6 +1121,8 @@ void World::Begin(const Camera& cam, int width, int height, float time, double c
   particles.quality = effectsQuality;
   camera = cam;
   const Camera& placing = Placing();  // (photomode: a photo's tile places as the whole photo; else the camera itself)
+  // [machinery] once a view, before any of its units are posed (a game's in AddFrame, the viewer's placed units, the stand's)
+  machinery.Begin(clock, !extraView && !sidePicture, placing.Eye());
   {  // [decalfade] the decals' fade, measured from the camera the picture is placed by (decals.h, Decals::Lod)
     Vec3 right, up, back;
     placing.Axes(&right, &up, &back);
@@ -2386,7 +2388,6 @@ void World::AddFrame(const Frame& frame, const std::vector<Vec3>& armyColors) {
   rememberedGone.clear();
   dyingDrawn = 0;
   bool noFocus = false;
-  machinery.Begin(clock_, !extraView && !sidePicture, Placing().Eye());  // [machinery]
   for (const FrameUnit& u : frame.units) {
     if (u.recon == 0xff) noFocus = true;
     if (u.dead) {
