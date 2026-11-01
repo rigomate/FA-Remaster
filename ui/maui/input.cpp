@@ -304,7 +304,11 @@ void MouseMove(lua_State* L, UiManager& ui, UiEvent e) {
     CallDragger(L, "OnMove", 2, e.x, e.y);
     return;
   }
-  Control* target = Target(ui, e);
+  // Camera rotation holds the pointer while motion coordinates accumulate past
+  // the screen edges. Keep delivering those moves to the owning control; hit
+  // testing them would send MouseExit and cancel rotation over panels or outside
+  // the window. Button draggers above retain their own capture handling.
+  Control* target = ui.holdPointer && ui.hover && !ui.hover->dead() ? ui.hover : Target(ui, e);
   UpdateHover(L, ui, target, e);
   if (!target || target->dead()) return;
   e.type = EventType::MouseMotion;
