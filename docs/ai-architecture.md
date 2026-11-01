@@ -1161,17 +1161,25 @@ both-modes check, multicore.md 1).
 
     | Game | Phase 11 | Phase 10 | Lost per killed (phase 10) |
     |---|---|---|---|
-    | recruit vs FAF adaptive | lost at minute 39.5 | lost at minute 30.2 | 1.97 (2.10) |
-    | veteran (turtle) vs FAF adaptive | lost at minute 45.2 | **no result after 60 minutes** | 0.87 (0.84) |
+    | recruit vs FAF adaptive | **won at minute 39.4** | lost at minute 30.0 | 1.97 (2.10) |
+    | veteran (turtle) vs FAF adaptive | lost at minute 45.1 | **no result after 60 minutes** | 0.87 (0.84) |
     | recruit vs M28 | lost at minute 24.8 | lost at minute 20.5 | 5.2 (9.2) |
     | veteran (turtle) vs M28 | lost at minute 21.9 | lost at minute 28.2 | 8.4 (15.3) |
     | veteran (rusher) vs M28 without cheats | lost at minute 23.3 | lost at minute 23.7 | 11.1 (12.2) |
 
-  - Together 154.7 minutes against 162.6; two games longer, three shorter. Against M28 every game trades better (a
-    third to a half less lost per mass killed); our mass a second at minute 30 against FAF was 438 (recruit) and 153
-    (veteran) against 283 and 215. What decides the M28 games now is the fight at our base around minute 15-25: our index knew 2,400 mass of the
-    T2 bots and commander that killed ours (its zone estimate said 0.97 for us), so the land trades and what we see
-    of a push come next.
+  - Our first win in these duels: FAF's commander killed at minute 39.4. The veteran game against FAF is lost at
+    minute 45.1 where phase 10 had no result; one M28 game lasts longer, two shorter. Against M28 every game trades
+    better (a third to a half less lost per mass killed); our mass a second at minute 30 against FAF was 438
+    (recruit) and 153 (veteran) against 283 and 215. What decides the M28 games now is the fight at our base around
+    minute 15-25: our index knew 2,400 mass of the T2 bots and commander that killed ours (its zone estimate said 0.97
+    for us), so the land trades and what we see of a push come next.
+  - **Who won is read from the armies' state, not from the end tick** (corrected 2026-10-31): the duels log each
+    army's out-of-game state and commanders when they change (the end probe), and a game is won, lost or without a
+    result by which army went out first. This table first said "lost at minute 39.5" for the recruit game against
+    FAF, read from the tick the game ended; the probe showed FAF out first. The "lost at minute" rows of the phases
+    before 11 come from the end tick alone and are not checked, except phase 10's recruit game against FAF (lost at
+    minute 30.0, confirmed by the probe); the M28 games of every phase end with our units and income a fraction of
+    M28's, losses beyond doubt.
 - **Then Chris plays it** and judges the feel (decision 8), in the one big check after the UEF polish unless he asks
   sooner.
 
