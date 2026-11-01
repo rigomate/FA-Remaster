@@ -1,0 +1,52 @@
+// For format details, see https://aka.ms/devcontainer.json
+{
+  "name": "FA-Remaster",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+
+  "features": {
+    "ghcr.io/devcontainers/features/git:1": {}
+  },
+
+  "remoteUser": "vscode",
+
+  // Optional: mount your Supreme Commander: Forged Alliance / FAF install so the
+  // engine can load the game's files at run time (none are included in the repo).
+  // Set FA_GAME_DIR on the host first, then uncomment.
+  // "mounts": [
+  //   "source=${localEnv:FA_GAME_DIR},target=/game,type=bind,readonly"
+  // ],
+
+  // Configure the CMake build of the headless simulation (moho64).
+  "postCreateCommand": "cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release || true",
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-vscode.cpptools",
+        "ms-vscode.cmake-tools",
+        "twxs.cmake",
+        "ms-python.python",
+        "sumneko.lua",
+        "ms-vscode.hexeditor",
+        "EditorConfig.EditorConfig"
+      ],
+      "settings": {
+        "cmake.generator": "Ninja",
+        "cmake.buildDirectory": "${workspaceFolder}/build",
+        "cmake.configureOnOpen": false,
+        "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools",
+        "files.associations": {
+          "*.lua": "lua",
+          "*.SCFAReplay": "binary"
+        },
+        "files.watcherExclude": {
+          "**/build/**": true,
+          "**/build-*/**": true
+        },
+        "python.defaultInterpreterPath": "/usr/bin/python3"
+      }
+    }
+  }
+}
