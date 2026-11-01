@@ -44,6 +44,8 @@ local kTradeMin = 600      -- ... and at least this much mass, withdraws: the es
 local kTradeMemory = 3000  -- ticks a zone we withdrew from is not picked as a target again
 local kShellRange = 40     -- world units: an enemy land force reaching this far is artillery-like (phase 10)
 local kShellSlack = 60     -- ... and shells a neighbouring zone of ours whose centre is within its range + this
+local kDefenceSoak = true  -- (phase 12) the defence's and the posts' estimate counts our structures' health (soak);
+                           -- attacks, pushes, raids and their commits read what fights only (unit_index.cpp)
 local kPeakFade = 0.99     -- the enemy's strength seen fades by this a think (5 s): half in about 6 minutes
 
 -- Personalities (docs/ai-architecture.md 2.7) and their knobs: personality.lua. Teacher mode (2.8): never a push
@@ -284,7 +286,10 @@ local function Posts(R, K, units, ownEconomy, ratio, armyMass)
         if (econ[z] or lost) and z ~= R.startZone then
             local d = Remastered.AIZoneDistance(R.startZone, z, 'land')
             if d >= 0 then
-                local margin, _, _, _, _, theirsMass = Remastered.AIZoneEstimate(R.army, z, kPostHorizon)
+                -- (phase 12: the defence reads the estimate with soak, every unit of ours taking fire by its health,
+                -- as before phase 12; with the fighters-only read here the army held back far more often and the
+                -- veteran duel against FAF was lost at minute 23.5-37.4 instead of 47.5)
+                local margin, _, _, _, _, theirsMass = Remastered.AIZoneEstimate(R.army, z, kPostHorizon, false, kDefenceSoak)
                 if theirsMass <= 0 or margin >= K.defend then
                     table.insert(postList, { zone = z, d = d, threat = theirsMass, lost = lost })
                 end
@@ -427,7 +432,7 @@ function Think(brain)
     R.raided = R.raided or {}
     for _, z in ipairs(threatened) do
         if z ~= R.startZone then R.raided[z] = R.tick end
-        local margin, _, _, _, _, theirsMass = Remastered.AIZoneEstimate(R.army, z, kHorizon)
+        local margin, _, _, _, _, theirsMass = Remastered.AIZoneEstimate(R.army, z, kHorizon, false, kDefenceSoak)
         -- the base first (phase 7b): an enemy force of kRecallMass or more at a base zone recalls the army from its
         -- operation, and for kRecallTicks the base's defence takes every free unit. The no-cheat duel against M28
         -- was lost with the army away on an attack while M28's army reached the base and killed the commander.
